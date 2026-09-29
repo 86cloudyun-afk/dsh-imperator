@@ -1,8 +1,10 @@
 # 任务部队（taskforce）· DSH 多 agent 生产工具
 
-> **主会话只编排，子代理全执行。**
+> **主会话研究决策，子代理按需执行。**
 
-一个 DeepSeek Harness 的 **agent preset**（附带 host 插件）：把主会话变成**编排者** —— 它只做四件事（拆解 / 派活 / 核对 / 汇报），**自己不动手**；所有实际工作由子代理完成，结果落进共享事实库，主会话**读库核对**而不是听汇报。
+一个 DeepSeek Harness 的 **agent preset**（附带 host 插件）：主会话亲自做只读调查、方案比较、决策和验收，子代理负责有边界的执行任务。优先复用已有执行者，不再为每个信息缺口新建代理；写文件、命令执行和宿主变更的限制保持不变。
+
+详见 [研究型编排与思考保护](docs/ORCHESTRATION.md)：当前包含派发前决策、任务合并、复用与独立审查纪律、软预算，以及 STALL 观察模式；**不代表阶段 B 的全树硬调度额度已经实现**。
 
 ## 两个正交的问题，一次解决
 
@@ -15,10 +17,10 @@ redteam 解决"**谁干活**"，梁神解决"**干活时脑子还清不清醒**"
 
 ## 四个支柱
 
-1. **主会话不执行** —— persona 写死"只做四件事"，并且 `orchestrator-scope` 在运行时把它自己的执行类工具遮蔽掉。
+1. **主会话负责研究与决策** —— 用获准的只读工具亲自查证；`orchestrator-scope` 的工具过滤和执行守卫继续阻止命令、写入及宿主变更。
 2. **保持接收态** —— 派活走 `continuable`：工具**只返回 childId 不返回结果**；子代理结算由 runtime 作为**服务通知**投进父会话 turn stream。所以主会话天然不阻塞，且能在干别的活时收到结果。
-3. **全委派** —— 一切实际动作（读写 / 执行 / 检索 / 构建）发生在子代理的上下文里，不污染编排者。
-4. **上下文纪律** —— 防漂移 / 防幻觉 / 防"变笨"：切片、外化、机械校验、运行时熔断。
+3. **按需委派、优先复用** —— 执行任务按可验收产物组织，续作与补证据优先交给原执行者；独立复核聚焦变更和风险，不默认全量重做。
+4. **保护有效思考** —— 切片、外化、机械校验；默认仅观察 STALL，保留 ECHO 重复失败保护，不自动降低推理档位。
 
 ## 架构：双平面
 
@@ -49,9 +51,9 @@ agent 平面（lib/preset.js 的 28 行）
 
 | 项 | redteam | 任务部队 |
 |---|---|---|
-| 子代理层级 | `maxDepth: 1`（叶子） | **`maxDepth: 2`**（可再派一层） |
+| 子代理层级 | `maxDepth: 1`（叶子） | **`maxDepth: 2`**（保留能力，默认不主动嵌套） |
 | 委派工具可见性 | `toolFilter.deny [subagent_fork, workflow, ralph]` | **零 deny** |
-| 并发 | 自建闸门压到 3、默认顺序派 | **只读并行 ≤6 / 含写压到 2–3 / 同资源串行** |
+| 并发 | 自建闸门压到 3、默认顺序派 | **纪律上限：只读 ≤6 / 含写默认 ≤2 / 同资源串行；不是已实现的硬闸门** |
 
 > 数值依据（**经独立审计校准**）：Anthropic 的「3–5」是其 Research 系统在**复杂研究任务**上的配置经验，**没有并发扫参证据**，不构成"最优区间"；Claude Code 的「20 / 默认 3 层」属**那个产品的版本相关规则**，不能当 DSH 参数依据。本机 `dsh-purge` 把 `subagent` 的 maxDepth 默认值提到 **10**，故本包的 `2` 属主动收紧。
 
@@ -81,15 +83,15 @@ agent 平面（lib/preset.js 的 28 行）
 ## 上下文纪律三件
 
 - **`taskforce-working-context`**：每步把一行客观状态钉在最新消息尾部，**从持久事件流折叠**（resume / 压缩后结果一致），只在变化时重发布。
-- **`taskforce-guard`**：运行时退化断路器。两个信号 —— **STALL**（连续零输出长推理）与 **ECHO**（同工具同参数连续失败）—— 触发时注入熔断消息并把 reasoning effort 临时降一档，窗口耗尽自动恢复。**无信号时绝不改写任何请求**（保 prefix cache 与用户的显式选择）。
+- **`taskforce-guard`**：区分 **STALL**（零输出长推理的启发式信号）与 **ECHO**（同工具同参数连续失败）。本 preset 显式设置 `stallAction: 'observe'`、`stepDownRequests: 0`：STALL 只记录诊断、不注入打断消息；ECHO 仍提示停止重复失败调用；两者都不降低路由选定的 reasoning effort。独立使用 guard 且不提供新配置时，保留旧版打断与降档默认值。
 - **`taskforce-orchestrator-scope`**：用 `agent.ctx.tools.restrict({deny})` 遮蔽主会话的执行类工具，实测 deny 清单 = `[bash, write, edit, str_replace_editor]`，**只读与派活类保留**；判据是会话身份（`origin === 'subagent'` / `delegationDepth`），**子代理不被收窄**。
 
-> `guard` 的存在理由（梁神源码自陈）：persona 的熔断纪律**停不住**退化，因为"在那个状态下，纪律文本本身已经掉出有效上下文。唯一有效的是**外部力量**"。
+> 推理长度和没有可见输出不能证明思考无效。观察模式保护正常研究，但也不自动终止真实的零输出循环；宿主的超时、取消和预算控制仍然必要。
 
 ## 自测
 
 ```bash
-npm test                     # 六套独立脚本 + 五个 node:test 文件；宿主集成标 UNVERIFIED
+npm test                     # 六套独立脚本 + 六个 node:test 文件；宿主集成标 UNVERIFIED
 npm run test:integration     # 真实 DSH profile/安装目录；宿主缺失或结构校验器缺失会失败
 npm run test:all             # 两层都运行；必须全部通过才退出 0
 node tools/verify-preset.mjs [profileDir] --install-dir /opt/dsh/install/node_modules

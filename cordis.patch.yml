@@ -1,0 +1,26 @@
+# dsh-taskforce bundle patch
+#
+# 只插入一行：本包的 host 半边。它在激活时把包内定义的 `taskforce` 预设
+# 声明给宿主的 agent-preset registry（ctx.agentPresets.register），
+# 由 registry 立即挂载预设的行；disposer 归本插件（ctx.effect）所有。
+#
+# 与 dsh-redteam-mode 的差别（关键）：不往 $DSH_HOME/.agent-presets/ 写任何
+# 文件 —— 那条旧路径在当前 DSH 已无人读取。声明式注册是当前唯一正确做法。
+#
+# 行 id 带 taskforce- 前缀，且 insert 是追加语义（不按 id 去重），
+# 前缀用于避开与其它 bundle 的 id 撞车（撞上会 boot 失败）。
+- insert:
+    - id: taskforce
+      name: '@local/dsh-taskforce'
+
+    # 事实库（host 平面）：发布 `ctx.taskforceStore`（SQLite），供 preset 内的
+    # tools 行消费。数据默认落 $DSH_HOME/taskforce/taskforce.db；
+    # 需要改位置时加 `config: { root: <绝对路径> }`。
+    #
+    # 为什么在 host 平面而不是 preset 内：preset 是 standing mount、被 roster 挂
+    # 一次而覆盖每个 join 上来的 agent；服务若由 preset 行 provide()，该行**必须**
+    # 位于带 `isolate` 的 group 内，否则 mountPreset 直接抛
+    # "Preset services require isolate realms"（registry mountPreset 检查）。
+    # host 平面的行不受此约束，且 registry 明确要求跨会话服务落在 host。
+    - id: taskforce-store
+      name: '@local/dsh-taskforce/store'

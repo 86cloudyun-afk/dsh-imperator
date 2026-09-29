@@ -1,0 +1,31 @@
+{
+  "name": "@local/dsh-taskforce",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "任务部队：主会话只编排、子代理全执行的多 agent 生产工具（DSH agent preset）",
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "node tools/verify-all.mjs --mode=offline",
+    "test:integration": "node tools/verify-all.mjs --mode=integration",
+    "test:all": "node tools/verify-all.mjs --mode=all"
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./store": "./lib/store/index.js",
+    "./tools": "./lib/tools/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "engines": {
+      "dsh": ">=0.1.7-rc.2"
+    },
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

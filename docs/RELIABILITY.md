@@ -21,7 +21,7 @@
 `npm test` 顺序运行六套独立脚本和八个 node:test 文件。离线结果中的
 `host integration: UNVERIFIED` 表示完整宿主未参与；不能据此宣称可启动。
 `npm run test:integration` 运行原生预设契约、执行边界与完整 boot；`test:all` 同时要求离线成功。
-独立失败仍继续收集剩余结果，每个子进程最多 60 秒。
+独立失败仍继续收集剩余结果，每个子进程的截止时间是 60 秒，超时独立判失败；另给 1 秒终止宽限，必要时强制终止。
 
 ```bash
 npm run test:all -- --install-anchor /path/to/@deepseek-ai/dsh/package.json
@@ -33,7 +33,7 @@ npm run test:all -- --install-anchor /path/to/@deepseek-ai/dsh/package.json
 
 完整验收使用临时 DSH_HOME 和 profile，加载本包 bundle，并以回环地址、随机临时端口、关闭浏览器及 URL 输出的方式启动实际 web 宿主。
 验证真实 roster、store、Agent 工厂、子代理写文件、task 工具身份、证据提交/主控验收/重新指派，以及 Loader 卸载、重新启用和真实注册冲突恢复。
-退出前释放 Agent handle，关闭宿主并删除临时目录；现有 profile 和事实库不参与这笔验收。
+退出前释放 Agent handle，关闭宿主并删除临时目录；清理失败或卡住时保持非零退出码，强制退出的同步清理钩子仍删除临时 home；现有 profile 和事实库不参与这笔验收。
 不向 Agent 投入模型消息，不需要模型密钥；模型响应、实际长期委派和负载性能仍需另外验收。
 
 CI 的离线任务固定 Node 22.23.2 / 24.19.0；真实宿主任务固定 Node 24.19.0 和 DSH 0.2.0-rc.2。

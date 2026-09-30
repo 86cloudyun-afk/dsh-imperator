@@ -1,7 +1,7 @@
 # 子代理控制工具（task_child_send / task_child_stop）
 
 > 作用：把「**续作 / 停止本会话派出的子代理**」这件事，从**靠同名工具凑**改成**直接接原生生命周期服务**。
-> 版本：2026-09-29 · 实现 `lib/tools/index.js` · 自测 `tools/verify-child-control.mjs`
+> 版本：0.2.0 · 2026-09-30 · 实现 `lib/tools/index.js` · 自测 `tools/verify-child-control.mjs`
 
 ## 1. DSH 0.2 的控制入口
 

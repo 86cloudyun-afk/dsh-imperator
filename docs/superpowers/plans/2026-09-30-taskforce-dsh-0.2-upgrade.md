@@ -91,10 +91,10 @@
 
 **Interfaces:** `callSignature(event)` 稳定且不修改参数；`foldGuardSignal(events, options?)` 返回结构和灵敏度保持。
 
-- [ ] 写嵌套对象键重排、数组顺序变化、重复结果/surface replacement、同参并发乱序结果、不同调用和成功后旧失败的断言。
-- [ ] 运行 `node --test tools/tests/ptc-events.test.mjs`，预期漏检/误触发场景 FAIL。
-- [ ] 递归规范化对象键；按 id 保存调用所在错误链和结算状态，重复/陌生结果不推进失败次数。
-- [ ] 运行上述命令与 `npm test`，预期全部 PASS；提交 `fix: correlate and deduplicate echo failures`。
+- [x] 写嵌套对象键重排、数组顺序变化、重复结果/surface replacement、同参并发乱序结果、不同调用和成功后旧失败的断言。
+- [x] 运行 `node --test tools/tests/ptc-events.test.mjs`，预期漏检/误触发场景 FAIL。
+- [x] 递归规范化对象键；按 id 保存调用所在错误链和结算状态，重复/陌生结果不推进失败次数。
+- [x] 运行上述命令与 `npm test`，预期全部 PASS；提交 `fix: correlate and deduplicate echo failures`。
 
 ### Task 7: 原生日志验收、独立审查与 PR 更新
 

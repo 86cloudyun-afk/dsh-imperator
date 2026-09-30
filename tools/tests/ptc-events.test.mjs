@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { foldSubagentFlow } from '../../lib/plugins/working-context.mjs'
-import { foldGuardSignal } from '../../lib/plugins/guard.mjs'
+import { foldGuardSignal, callSignature } from '../../lib/plugins/guard.mjs'
 
 const start = (id, name = 'subagent', args = { prompt: 'work' }) => ({ type: 'tool/ptc-dispatch-start',
   data: { rootCallId: id.split(':')[0], parentCallId: id.split(':')[0], subCallId: id, name, arguments: args } })
@@ -116,3 +116,63 @@ test('standalone transport failures still count; mismatched results cannot incre
   assert.equal(foldGuardSignal([...attempts(2), result('unmatched:ptc:1', true, 'read', { path: 'missing' })],
     { echoFailures: 3 }).signal, undefined)
 })
+
+test('echo signatures treat reordered nested JSON object keys as the same arguments', () => {
+  const args = [
+    { file_path: 'missing', options: { offset: 0, limit: 20 } },
+    { options: { limit: 20, offset: 0 }, file_path: 'missing' },
+    { file_path: 'missing', options: { offset: 0, limit: 20 } },
+  ]
+  const events = args.flatMap((value, i) => [nativeCall(`n${i}`, 'read', value), nativeResult(`n${i}`, true)])
+  assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
+  const ptc = start('p:1', 'read', args[1])
+  assert.equal(callSignature(events[0]), callSignature(ptc))
+  assert.deepEqual(args[1], { options: { limit: 20, offset: 0 }, file_path: 'missing' })
+})
+
+test('signature normalization preserves array order, value types and malformed raw arguments', () => {
+  const signature = (args) => callSignature(nativeCall('call', 'read', args))
+  assert.notEqual(signature({ paths: ['a', 'b'] }), signature({ paths: ['b', 'a'] }))
+  assert.notEqual(signature({ offset: 1 }), signature({ offset: '1' }))
+  assert.notEqual(signature({ path: 'a' }), signature({ path: 'b' }))
+  assert.notEqual(callSignature({ data: { name: 'read', arguments: '{bad a' } }),
+    callSignature({ data: { name: 'read', arguments: '{bad b' } }))
+})
+
+for (const kind of ['native', 'ptc']) {
+  const call = kind === 'native' ? nativeCall : start
+  const settle = kind === 'native' ? nativeResult : (id, isError, args = { path: 'missing' }) => result(id, isError, 'read', args)
+  test(`${kind} duplicate failure results count one attempt rather than triggering echo`, () => {
+    const failed = settle('call', true)
+    const rewrite = { ...failed, surfaceOp: 'replace', shadowedSeqs: [1] }
+    assert.equal(foldGuardSignal([call('call', 'read', { path: 'missing' }), failed, failed, rewrite],
+      { echoFailures: 3 }).signal, undefined)
+  })
+
+  test(`${kind} same-argument parallel failures count despite out-of-order results`, () => {
+    const events = ['a', 'b', 'c'].map(id => call(id, 'read', { path: 'missing' }))
+    events.push(settle('b', true), settle('c', true), settle('a', true))
+    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
+  })
+
+  test(`${kind} old failure results cannot revive a chain after a different call`, () => {
+    const events = [call('old', 'read', { path: 'missing' }), call('different', 'read', { path: 'exists' }),
+      call('new', 'read', { path: 'missing' }), settle('old', true), settle('new', true)]
+    assert.equal(foldGuardSignal(events, { echoFailures: 2 }).signal, undefined)
+  })
+
+  test(`${kind} real success clears failures and ignores older pending failures`, () => {
+    const events = ['a', 'b', 'c'].map(id => call(id, 'read', { path: 'missing' }))
+    events.push(settle('b', true), settle('c', false), settle('a', true),
+      call('new', 'read', { path: 'missing' }), settle('new', true))
+    assert.equal(foldGuardSignal(events, { echoFailures: 2 }).signal, undefined)
+  })
+
+  test(`${kind} a late success from an older call clears the current failure chain`, () => {
+    const events = [call('old-success', 'read', { path: 'exists' })]
+    for (const id of ['a', 'b', 'c']) events.push(call(id, 'read', { path: 'missing' }), settle(id, true))
+    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
+    events.push(settle('old-success', false, { path: 'exists' }))
+    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, undefined)
+  })
+}

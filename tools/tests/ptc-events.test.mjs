@@ -15,7 +15,7 @@ const nativeResult = (id, isError = false) => ({ type: 'tool/result',
 
 test('failed or cancelled native delegation retires its in-flight placeholder', () => {
   const cancelled = nativeResult('cancelled', true)
-  cancelled.data.error = { name: 'AbortError', code: 'TOOL_ABORTED_BEFORE_DISPATCH' }
+  cancelled.data.error = { name: 'AbortError', code: 'ABORTED_BEFORE_DISPATCH' }
   const events = [nativeCall('failed'), nativeResult('failed', true),
     nativeCall('cancelled', 'subagent_fork'), cancelled]
   for (const settlement of ['settled-notice', 'tool-result']) {
@@ -144,7 +144,8 @@ for (const kind of ['native', 'ptc']) {
   const settle = kind === 'native' ? nativeResult : (id, isError, args = { path: 'missing' }) => result(id, isError, 'read', args)
   test(`${kind} duplicate failure results count one attempt rather than triggering echo`, () => {
     const failed = settle('call', true)
-    const rewrite = { ...failed, surfaceOp: 'replace', shadowedSeqs: [1] }
+    const rewrite = kind === 'native' ? { ...failed,
+      surfaceOp: { op: 'replace', startSeq: 2, endSeq: 2 }, sourceEventSeqs: [2] } : structuredClone(failed)
     assert.equal(foldGuardSignal([call('call', 'read', { path: 'missing' }), failed, failed, rewrite],
       { echoFailures: 3 }).signal, undefined)
   })

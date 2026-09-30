@@ -4,6 +4,8 @@ import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { TASKFORCE_DEFINITION } from '../lib/preset.js'
+import { foldSubagentFlow } from '../lib/plugins/working-context.mjs'
+import { foldGuardSignal } from '../lib/plugins/guard.mjs'
 import { controlledProfile, installationVersion, nativeModule, resolveInstallAnchor } from './host-runtime.mjs'
 import { option } from './verify-preset.mjs'
 
@@ -73,6 +75,45 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal(written.isError, false, written.error?.message)
     assert.equal(readFileSync(artifact, 'utf8'), 'verified artifact\n')
     pass('real root tool boundary and child file execution')
+
+    // A real provider call cancelled before dispatch cannot create a child or
+    // contact an LLM. Persist its outcome exactly as native AgentLoop does.
+    const { createToolResultMessage } = await nativeModule(anchor, '@deepseek-ai/dsh-llm')
+    const { TOOL_ABORTED_BEFORE_DISPATCH } = await nativeModule(anchor, '@deepseek-ai/dsh-tools')
+    const session = parent.agent.session
+    session.append('turn/start', { turn: 1 })
+    session.append('step/start', { turn: 1, step: 1 })
+    const callId = 'probe-cancelled-delegation'
+    const args = { description: 'cancelled delegation probe', prompt: 'must not dispatch' }
+    const callEvent = session.append('tool/call', { turn: 1, step: 1, callId,
+      name: 'subagent', arguments: JSON.stringify(args) })
+    const cancelled = await parent.agent.ctx.tools.execute({ agent: parent.agent, name: 'subagent',
+      callId, arguments: args, signal: AbortSignal.abort() })
+    assert.equal(cancelled.isError, true)
+    assert.equal(cancelled.error?.info?.code, TOOL_ABORTED_BEFORE_DISPATCH)
+    const data = { turn: 1, step: 1,
+      message: createToolResultMessage({ callId, content: cancelled.content, isError: cancelled.isError }),
+      error: cancelled.error.info }
+    let resultEvent = session.append('tool/result', data, { surfaceOp: 'append', sourceEventSeqs: [callEvent.seq] })
+    for (let i = 0; i < 2; i++) {
+      // Valid native replacements change content alone; all three durable
+      // result records still describe the same failed attempt.
+      resultEvent = session.append('tool/result', { ...data,
+        message: { ...data.message, content: [{ type: 'text', text: `cancelled result summary ${i}` }] } },
+      { surfaceOp: { op: 'replace', startSeq: resultEvent.seq, endSeq: resultEvent.seq },
+        sourceEventSeqs: [resultEvent.seq] })
+    }
+    session.append('step/end', { turn: 1, step: 1 })
+    session.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+    const events = session.snapshotEvents()
+    assert.equal(events.filter(event => event.type === 'tool/result').length, 3)
+    for (const replay of [events, JSON.parse(JSON.stringify(events))]) {
+      assert.deepEqual(foldSubagentFlow(replay), {
+        dispatched: 0, settledNotices: 0, delegatedResults: 0, settled: 0, inFlight: 0,
+      })
+      assert.equal(foldGuardSignal(replay, { echoFailures: 3 }).signal, undefined)
+    }
+    pass('native cancelled delegation and durable result replacement replay')
 
     const opened = await task(parent.agent, 'task_open', { title: 'native tool closure' })
     const id = opened.task_id

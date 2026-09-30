@@ -95,6 +95,8 @@ echoFailures:5}`（自测实测）。要更早介入的操作员显式改成 `ba
 
 **PTC 兼容**：按 `subCallId` 配对内层 start/dispatch；重复内层失败可触发 ECHO，成功的外层 run_code 不清空该链。没有内层派发的传输语法/执行失败仍按普通调用折叠。
 
+**回执配对与去重**：原生与 PTC 使用各自 id 空间，同一次调用的结果只消费一次，原生 surface replacement 不增加失败次数。参数签名递归排序对象键，保留数组顺序和实际值；同参并发失败可乱序结算。不同调用切断旧错误链；任何已配对的真实成功都清零，旧链迟到的错误不重新累积。缺少 id 或没有对应调用的结果不用于推断 ECHO。
+
 **无信号时绝不改写请求**：唯一被改的字段是 `reasoningEffort`（请求参数，不是提示词内容），
 所以 prefix cache 的唯一键面不受影响，用户显式选择的档位也不会被静默覆盖。信号本身每步从
 持久事件流重新折叠，所以 resume 不会继承过期判定。
@@ -143,8 +145,10 @@ echoFailures:5}`（自测实测）。要更早介入的操作员显式改成 `ba
   写出 —— 是 **continuation-managed（continuable）专属**的送达通知，**持久 user 消息**。
   本 preset 的两份派活工具（`subagent` / `subagent_fork`）都配了
   `backgroundMode: 'continuable'`，所以默认值正确。
-- `settlementChannel: 'tool-result'`：终结 = 派活调用各自收到的 `tool/result` 数
+- `settlementChannel: 'tool-result'`：终结 = 派活调用各自收到的成功 `tool/result` 数
   （按 `callId` 与派活调用配对）。用于 one-shot（block）部署 —— 那里没有结算通知。
+
+原生与 PTC 派发失败或取消均撤销其在飞占位，不计成功回执；有 id 的开始/结果按调用去重。原生孤立结果不配对其他派发；PTC 结果自带工具名，可从仅剩成功结算的历史恢复。无 id 的旧原生调用保留近似占位，无法确定其结果归属。
 
 选错的后果是单向的：用 `'settled-notice'` 跑 one-shot 会让"在飞"永久偏高；反过来会恒为 0。
 接上外部 store 时 store 值优先，直接绕开这个选择。
@@ -228,6 +232,6 @@ cd packages/dsh-taskforce && node tools/verify-p3.mjs
 
 1. DSH 0.2 的真实 boot 与 Agent 工厂已经验证首次请求前的主控收窄；晚注册/降级仍由 guard 与每步复核兜底。
 2. one-shot 部署需把 `settlementChannel` 改成 `'tool-result'`；本预设默认使用 continuable 结算通知。
-3. PTC 未结算 start 计为未决；失败或取消不证明子代理已创建，成功结算按 `subCallId` 去重。在飞数仍是提示性近似，不是调度器账本。
+3. 原生与 PTC 未结算调用计为未决；失败或取消撤销占位，开始与结果按各自 id 去重。在飞数仍是提示性近似，不是调度器账本。
 4. 三个插件已在真实 DSH `0.2.0-rc.2` 中加载并通过 roster、工具与生命周期检查，见 [验收记录](superpowers/research/2026-09-30-dsh-0.2-acceptance.md)。
 5. 行里暂不渲染未结任务总数；当前任务和事实计数仍从同一 run 的 store 读取。

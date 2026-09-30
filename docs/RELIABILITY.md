@@ -33,6 +33,7 @@ npm run test:all -- --install-anchor /path/to/@deepseek-ai/dsh/package.json
 
 完整验收使用临时 DSH_HOME 和 profile，加载本包 bundle，并以回环地址、随机临时端口、关闭浏览器及 URL 输出的方式启动实际 web 宿主。
 验证真实 roster、store、Agent 工厂、子代理写文件、task 工具身份、证据提交/主控验收/重新指派，以及 Loader 卸载、重新启用和真实注册冲突恢复。
+另通过真实委派工具执行前取消及原生 Session 的两次合法结果展示替换，核对失败派发无在飞占位、同一失败不重复触发熔断，并核对 JSON 回放一致。
 退出前释放 Agent handle，关闭宿主并删除临时目录；清理失败或卡住时保持非零退出码，强制退出的同步清理钩子仍删除临时 home；现有 profile 和事实库不参与这笔验收。
 不向 Agent 投入模型消息，不需要模型密钥；模型响应、实际长期委派和负载性能仍需另外验收。
 

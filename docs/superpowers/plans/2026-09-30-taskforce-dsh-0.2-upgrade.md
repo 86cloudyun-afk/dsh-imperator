@@ -100,9 +100,9 @@
 
 **Files:** `tools/verify-host.mjs`、`docs/CONTEXT.md`、验收记录、既有 PR 描述。
 
-**Interfaces:** `verifyHost()` 增加原生参数拒绝与 durable result 回放检查；所有宿主清理纪律保持。
+**Interfaces:** `verifyHost()` 增加原生执行前取消与 durable result 回放检查；所有宿主清理纪律保持。
 
-- [ ] 将真实委派参数拒绝的返回值按原生 AgentLoop 契约写入 Session；失败派发不留下在飞，展示替换不制造 ECHO。
-- [ ] 运行 `npm run test:all -- --install-anchor /home/agent/.local/opt/deepseek-harness/0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh/package.json`，预期全部 PASS / HOST_VERIFIED。
+- [x] 将真实委派执行前取消的返回值按原生 AgentLoop 契约写入 Session；失败派发不留下在飞，展示替换不制造 ECHO。
+- [x] 运行 `npm run test:all -- --install-anchor /home/agent/.local/opt/deepseek-harness/0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh/package.json`，预期全部 PASS / HOST_VERIFIED。
 - [ ] Fresh-context 独立审查全分支，重点核查 id 命名空间、孤立结果、迟到结果、数组语义、宿主替换日志；重要问题 RED→GREEN 后修复。
 - [ ] 更新说明及真实验收证据，提交并非强制更新原远程分支；核对 PR head、全部 CI 和自动审查状态。

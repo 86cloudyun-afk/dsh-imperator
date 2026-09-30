@@ -105,6 +105,8 @@
 - [x] 将真实委派执行前取消的返回值按原生 AgentLoop 契约写入 Session；失败派发不留下在飞，展示替换不制造 ECHO。
 - [x] 运行 `npm run test:all -- --install-anchor /home/agent/.local/opt/deepseek-harness/0.2.0-rc.2/lib/node_modules/@deepseek-ai/dsh/package.json`，预期全部 PASS / HOST_VERIFIED。
 - [x] Fresh-context 独立审查全分支，重点核查 id 命名空间、孤立结果、迟到结果、数组语义、宿主替换日志；重要问题 RED→GREEN 后修复。
-- [ ] 更新说明及真实验收证据，提交并非强制更新原远程分支；核对 PR head、全部 CI 和自动审查状态。
+- [x] 更新说明及真实验收证据，提交并非强制更新原远程分支；核对 PR head、全部 CI 和自动审查状态。
 
 复审修正：原生 provider id 可跨步骤复用。调用键包含 turn/step 与 id，PTC 继承所属步骤，外层 wrapper 同步限定步骤。八个离线反例和真实 Session/read 工具反例均失败→通过；延迟展示替换仍归原步骤。
+
+交付记录：后续修缮已同步 PR #6，首次更新 `03f3990` 的本地/远程 head 一致，GitHub Verify 已触发；最终 CI 与外部自动审查状态以 PR 实时显示为准。

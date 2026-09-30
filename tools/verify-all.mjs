@@ -12,7 +12,8 @@ const SCRIPTS = [
 ]
 const TESTS = [
   'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
-  'lifecycle.test.mjs', 'verify-runner.test.mjs',
+  'lifecycle.test.mjs', 'verify-runner.test.mjs', 'deliberate-orchestration.test.mjs',
+  'guard-causality.test.mjs',
 ]
 
 function defaultRunProcess(file, args, options) {

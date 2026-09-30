@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "任务部队：主会话只编排、子代理全执行的多 agent 生产工具（DSH agent preset）",
+  "description": "任务部队：主会话研究决策、子代理按需执行的多 agent 生产工具（DSH agent preset）",
   "main": "lib/index.js",
   "scripts": {
     "test": "node tools/verify-all.mjs --mode=offline",

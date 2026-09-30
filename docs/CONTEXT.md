@@ -16,7 +16,7 @@
 
 ## 1. `orchestrator-scope` — deny / keep 清单与名字来源
 
-**施加方式**：`agent.ctx.tools.restrict({ deny })`（不是 `pagedToolPatterns`）。
+**施加方式**：`agent.ctx.tools.restrict({ deny })` 收窄可见性，`agent.ctx.tools.guard()` 按真实调用者拒绝执行。预设显式选择 native 呈现。
 契约原话（`cordis_inspect_query(host, Service, listService{service:"tools"})` 实测）：
 
 > `restrict(filter: ToolRestriction): () => void` —— *"Restrict global tools for the calling agent
@@ -27,10 +27,11 @@
 还剩内容」，是为 `mcp__server__fn` 族名设计的；对 `bash` 这种扁平名写 `bash*` 会让 `rest` 为空 →
 被判定为常驻，**根本扣不掉**。
 
-### 遮蔽（deny，四个）
+### 标准执行工具与保留传输
 
 | 工具名 | 名字来源（本机实测） |
 |---|---|
+| `run_code` | DSH PTC 保留传输；可直接 import Node fs/subprocess，因此只交给 guard 拒绝，不交给 restrict |
 | `bash` | `@deepseek-ai/dsh-tool-bash/lib/index.js` → `name: "bash"` |
 | `write` | `@deepseek-ai/dsh-tool-fs/lib/` → `name: "write"` |
 | `edit` | `@deepseek-ai/dsh-tool-fs/lib/` → `name: "edit"` |
@@ -39,6 +40,8 @@
 交叉验证：`cordis_inspect_query(host, Tool, listTools)`（本机实际可调工具面）确认上述名字均为
 **独立扁平名**，非族名；`dsh-tool-fs` 一个包同时提供只读的 `read` / `read_image` 与可写的
 `write` / `edit`，所以遮蔽必须逐名列举，不能整包屏蔽。
+
+默认拒绝清单还包含插件安装/移除/更新、purge 和 spawn_teammate 等宿主变更入口，详见 `DEFAULT_DENY`。
 
 ### 保留（keep，主会话仍可用）
 
@@ -53,10 +56,8 @@
 
 - `origin === 'subagent'`（子代理产品的粗分类）
 - `delegationDepth > 0`（顶层缺省、子代理 = 父 + 1，落盘以便重启后预算不重置）
-- `parentSession` 存在（fork 血缘）
 
-**已知取舍**：手工从主会话 fork 的会话也带 `parentSession`，同样被判为子代理而跳过收窄。
-这是故意的 —— 判据宁可放宽也不要误伤正在干活的会话。
+`parentSession` 单独存在不证明是子代理；手工 fork 的主会话仍受限制。
 
 ### 容错（`restrict` 对不存在的名字会抛错）
 
@@ -64,7 +65,7 @@
 只把确实存在的名字交给 `restrict`（未知名根本不进去，整批就不会因一个名字全盘失败）；
 ② **空过滤器绝不提交**（`{deny: []}` 会抛）；③ **`try/catch` + 一次性告警** —— 注册表仍拒绝时
 限制就是不生效，绝不炸掉会话。工具面未就绪（`schemas()` 为空）时不标记完成，留给后续
-`agent/pre-step` 重试，上限 8 次。
+`agent/pre-step` 持续幂等复核，不永久放弃；执行 guard 不依赖工具面快照。
 
 **无条件施加**：刻意不照抄梁神「只在 `presentation === 'ptc'` 时才装限制」的闸门
 （`tool-catalog.mjs:652`）—— 那条闸门在出厂 `presentation: 'both'` 下永不触发，被扣留的工具在
@@ -92,6 +93,8 @@
 一半的推理链。默认下 `effort=max` 的实际阈值是 `{stallReasoningChars:12000, globalStallCap:6,
 echoFailures:5}`（自测实测）。要更早介入的操作员显式改成 `balanced` / `aggressive`。
 
+**PTC 兼容**：按 `subCallId` 配对内层 start/dispatch；重复内层失败可触发 ECHO，成功的外层 run_code 不清空该链。没有内层派发的传输语法/执行失败仍按普通调用折叠。
+
 **无信号时绝不改写请求**：唯一被改的字段是 `reasoningEffort`（请求参数，不是提示词内容），
 所以 prefix cache 的唯一键面不受影响，用户显式选择的档位也不会被静默覆盖。信号本身每步从
 持久事件流重新折叠，所以 resume 不会继承过期判定。
@@ -112,7 +115,7 @@ echoFailures:5}`（自测实测）。要更早介入的操作员显式改成 `ba
 | 字段 | 数据源 | 降级口径 |
 |---|---|---|
 | `波次 N` | 外部事实库（**当前 store 无此概念 ⇒ 字段省略**；将来 store 提供 `wave` 会自动接上） | 无 ⇒ 整个字段省略 |
-| `在飞 N` | **不来自 store** —— store 的任务 ≠ 子代理，硬映射会撒谎 | 事件折叠：派活 `tool/call` 数 − 终结数（下限 0） |
+| `在飞 N` | **不来自 store** —— store 的任务 ≠ 子代理，硬映射会撒谎 | 事件折叠：原生与 PTC 派发数 − 终结数（下限 0） |
 | `当前任务 …` | 外部事实库：`board().tasks` 里 `claimed` 优先、否则队首（带 id 才有 `#id`） | 最新 `todo/write` 的 in_progress 标题，被下一条 `turn/start` 清空 |
 | `最近事实 N 条` | 外部事实库：`stats().facts.total` | 已终结的派活数（= 本会话回收了多少份子代理产物） |
 
@@ -223,11 +226,8 @@ cd packages/dsh-taskforce && node tools/verify-p3.mjs
 
 ## 6. 已知边界（未决项）
 
-1. **`agent/created` 时工具面是否已稳定**未在真实宿主上验证 —— 已用"为空则不标记完成 +
-   `agent/pre-step` 重试"兜住，最坏情况是收窄晚一个请求生效。
-2. **one-shot 部署**需要把 `settlementChannel` 改成 `'tool-result'`（见 §3）。
-3. **手工 fork 的主会话**会被判为子代理而跳过收窄（见 §1 取舍）。
-4. **三个插件尚未在真实宿主里加载过** —— `preset.js` 已接线，但未跑过 `dsh web` 冒烟；
-   自测是在 Node 里直接 `import()` + 假 ctx 驱动监听器完成的。
-5. 行里目前不渲染"未结任务数"（`state.activeTasks` 已读出备用）—— 若主会话希望看到它，
-   是加一个字段的事。
+1. DSH 0.2 的真实 boot 与 Agent 工厂已经验证首次请求前的主控收窄；晚注册/降级仍由 guard 与每步复核兜底。
+2. one-shot 部署需把 `settlementChannel` 改成 `'tool-result'`；本预设默认使用 continuable 结算通知。
+3. PTC 未结算 start 计为未决；失败或取消不证明子代理已创建，成功结算按 `subCallId` 去重。在飞数仍是提示性近似，不是调度器账本。
+4. 三个插件已在真实 DSH `0.2.0-rc.2` 中加载并通过 roster、工具与生命周期检查，见 [验收记录](superpowers/research/2026-09-30-dsh-0.2-acceptance.md)。
+5. 行里暂不渲染未结任务总数；当前任务和事实计数仍从同一 run 的 store 读取。

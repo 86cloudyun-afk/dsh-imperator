@@ -3,26 +3,15 @@
 > 作用：把「**续作 / 停止本会话派出的子代理**」这件事，从**靠同名工具凑**改成**直接接原生生命周期服务**。
 > 版本：2026-09-29 · 实现 `lib/tools/index.js` · 自测 `tools/verify-child-control.mjs`
 
-## 1. 为什么要有这两个工具（被修的 P1）
+## 1. DSH 0.2 的控制入口
 
-独立审计记录过一个**接口错配**：
+在 DSH `0.2.0-rc.2` 中，原生 `@deepseek-ai/dsh-tool-subagent-control` 的
+`send_message` / `interrupt_agent` 已分别调用 `subagents.sendMessage` / `subagents.interrupt`。
+旧部署记录的 teammate 接口错配不能作为当前原生宿主的结论。
 
-- `send_message` 的模型可见描述是「向 **Team member** 发信」，参数是 `agent_id` / `message`；
-  `interrupt_agent` 是「中断 **teammate**」，参数是 `agent_id`。
-- 而同一份请求里的 `subagent` / `subagent_fork` 又告诉模型「可以用 `send_message` 继续子代理」。
-- 本包实际记录过：拿这两个工具去操作子代理时报 `active teammate not found`。
-
-**结论**：那对工具不是「原生 child-control 的普遍语义」，而是 Agent Teams 平面的适配器。
-把 childId 填进 `agent_id` 不能视为接通 —— 两套对象、两条注册路径、两套授权判据。
-
-**修法**：提供**不与既有工具同名**的子代理控制工具，直接调 `ctx.subagents.sendMessage()` / `ctx.subagents.interrupt()`。
-
-| 平面 | 工具 | 对象 | 授权判据 |
-|---|---|---|---|
-| Agent Teams（**保持不动**） | `send_message` / `interrupt_agent` | teammate | 由 teammate 平面负责 |
-| 本包子代理控制（**新增**） | `task_child_send` / `task_child_stop` | **本会话派出的 subagent** | `listChildren(调用者会话)` 直属目录 |
-
-两者**共存、不互相替代**。名字带 `task_child_` 前缀，与 `task_*` 事实库工具同一命名族。
+本包的 `task_child_send` / `task_child_stop` 继续直接调用同一生命周期服务，
+额外核对 `listChildren(调用者会话)` 的直属归属，并返回当前轮状态和稳定错误码。
+主控 persona 优先推荐这两个入口，不再声称原生控制工具只能操作 teammate。
 
 ## 2. 工具契约
 
@@ -89,7 +78,7 @@
 | `E_CHILD_SETTLED` | 目标是 one-shot / unknown，已结算 | 要再跑就重新派一个 |
 | `E_CHILD_MISSING` | 保留码：目标不存在（当前与 `E_CHILD_NOT_OWN` 合并，二者对调用方动作相同） | — |
 | `E_CHILD_NO_ID` | 无法核对归属（`listChildren` 读失败） | 服务问题，不冒险操作 |
-| `E_CHILD_SERVICE` | `ctx.subagents` 未挂载或**缺所需方法** | 部署/宿主集成问题，**不要改用 teammate 工具去凑** |
+| `E_CHILD_SERVICE` | `ctx.subagents` 未挂载或**缺所需方法** | 部署/宿主集成问题，核对原生 subagents 服务，不盲目换入口重试 |
 
 ## 5. 契约依据（实测，不是推测）
 

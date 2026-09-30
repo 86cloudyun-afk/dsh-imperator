@@ -14,21 +14,27 @@
 
 `@local/dsh-taskforce` 通过独立的进程级所有权 Map 防止多个模块副本重复声明预设，同时尊重宿主旧有 `dsh-web.mounted-plugins` Set 中的占位，不替换或清空该 Set。`ctx.effect` 的清理函数返回 Promise，宿主应等待它完成；注册尚未完成时卸载，会等待注册返回后再撤销声明。只有确认注册失败且没有有效声明，或成功执行了注册返回的 disposer，才释放当前挂载的所有权。随后重新启用可以显式再次尝试注册；不会在后台无限重试。
 
-注册返回值不是函数，或 disposer 执行失败时，可能仍有有效声明，因此保留占位并输出诊断，避免下一次启用造成重复声明。重复卸载不会释放后续实例的占位。模拟测试验证这些事件顺序；真实 DSH 宿主的重启用验收仍待执行。
+注册返回值不是函数，或 disposer 执行失败时，可能仍有有效声明，因此保留占位并输出诊断，避免下一次启用造成重复声明。重复卸载不会释放后续实例的占位。模拟测试覆盖事件顺序；真实 DSH 0.2 宿主也已验证卸载、重新启用和注册冲突后的恢复。
 
 ## 验证与真实宿主验收
 
-在包根目录运行 `npm test`，它顺序执行六套独立脚本和明确列出的五个 `node:test` 文件；输出中的 `host integration: UNVERIFIED` 表示宿主没有参与，独立项全通过时进程退出 0。`npm run test:integration` 仅运行宿主预设验证；`npm run test:all` 同时要求两层成功。每个子进程最多 60 秒，独立失败仍会继续收集剩余结果。集成模式缺 profile、registry、`entryListProblem` 或任何必需模块时必须退出非零。需要自定义宿主路径时直接执行：
+`npm test` 顺序运行六套独立脚本和八个 node:test 文件。离线结果中的
+`host integration: UNVERIFIED` 表示完整宿主未参与；不能据此宣称可启动。
+`npm run test:integration` 运行原生预设契约、执行边界与完整 boot；`test:all` 同时要求离线成功。
+独立失败仍继续收集剩余结果，每个子进程最多 60 秒。
 
 ```bash
-node tools/verify-all.mjs --mode=all --profile-dir /opt/dsh/home/profiles/web --install-dir /opt/dsh/install/node_modules
+npm run test:all -- --install-anchor /path/to/@deepseek-ai/dsh/package.json
 ```
 
-CI 在 Ubuntu 24.04 的 Node 22.23.2 和 24.19.0 上运行离线检查；它不代替真实 DSH 宿主验收。仅在可控真实宿主中完成以下步骤，并将本包提交 SHA、DSH 版本、Node 版本、执行时间、命令和原始日志路径记录在验收记录中：
+不提供安装路径时，从 PATH 的 dsh 可执行文件解析真实 npm 安装，支持版本目录与全局符号链接。
+保留旧 `--install-dir` 和 `--profile-dir`：显式路径缺失不会被其他安装覆盖；指定 profile 只参与预设契约检查。
+缺少原生安装、结构校验器、模块、必填 Config 或 boot 失败均退出非零。
 
-1. 运行 `npm run test:integration`，确认结构、模块解析与插件形状三层均通过；记录完整 stdout/stderr 与退出码。
-2. 安装候选包并重启 DSH web，读取实际 boot roster，确认本包 host 插件和 preset 均已挂载，所有行的 `broken` 为空；记录 roster 与 boot 日志。离线脚本不验证 Config schema 的必填字段。
-3. 在该实例创建任务、提交带有效依据的事实并由主会话验收；核对看板状态与数据库审计行一致，非法证据或未解决 blocker 被拒绝。记录匿名化任务 ID、动作结果和相关日志。
-4. 卸载插件后重新启用，确认注册一次、无残留占位或重复声明；人为使下一次注册失败并确认能在再次启用时恢复。分别记录 unload、失败、重启用和 boot 日志。
+完整验收使用临时 DSH_HOME 和 profile，加载本包 bundle，并以回环地址、随机临时端口、关闭浏览器及 URL 输出的方式启动实际 web 宿主。
+验证真实 roster、store、Agent 工厂、子代理写文件、task 工具身份、证据提交/主控验收/重新指派，以及 Loader 卸载、重新启用和真实注册冲突恢复。
+退出前释放 Agent handle，关闭宿主并删除临时目录；现有 profile 和事实库不参与这笔验收。
+不向 Agent 投入模型消息，不需要模型密钥；模型响应、实际长期委派和负载性能仍需另外验收。
 
-当前工作环境没有必需的真实宿主文件：上述 boot roster、提交验收、重启用和注册失败恢复仍是**未验证**，不能用模拟测试替代。
+CI 的离线任务固定 Node 22.23.2 / 24.19.0；真实宿主任务固定 Node 24.19.0 和 DSH 0.2.0-rc.2。
+本次真实验收的版本、候选提交、命令和结果见 [2026-09-30 验收记录](superpowers/research/2026-09-30-dsh-0.2-acceptance.md)。

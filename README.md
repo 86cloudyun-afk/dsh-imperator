@@ -1,6 +1,7 @@
 # 任务部队（taskforce）· DSH 多 agent 生产工具
 
 > **主会话只编排，子代理全执行。**
+> 版本 `0.2.0`，要求 DeepSeek Harness `>=0.2.0-rc.2`。
 
 一个 DeepSeek Harness 的 **agent preset**（附带 host 插件）：把主会话变成**编排者** —— 它只做四件事（拆解 / 派活 / 核对 / 汇报），**自己不动手**；所有实际工作由子代理完成，结果落进共享事实库，主会话**读库核对**而不是听汇报。
 
@@ -26,13 +27,14 @@ redteam 解决"**谁干活**"，梁神解决"**干活时脑子还清不清醒**"
 host 平面（cordis.patch.yml）
   taskforce        → lib/index.js    声明 agent preset 给 ctx.agentPresets.register
   taskforce-store  → lib/store/      SQLite 事实库，发布 ctx.taskforceStore
-agent 平面（lib/preset.js 的 28 行）
+agent 平面（lib/preset.js 的 29 行）
   persona                   编排者人设（本 preset 的全部系统提示词基底）
+  tool-presentation         native（主控保留实际编排工具）
   agent-instructions        工作区指令（AGENTS.md 链）
   tool-bash/fs/fs-search/str-replace-editor/jobs/skills/goal/plan/todo/web/ask-user
   delegation（isolate: workflowEngine）
-    subagent(subagent)        maxDepth: 2 · continuable · 不 deny 任何工具
-    subagent_fork(fork)       continuable
+    subagent(subagent)        maxDepth: 2 · continuable · 执行者 persona
+    subagent_fork(fork)       maxDepth: 2 · continuable · 执行者 persona
     subagent-control / list-agents
   compaction（isolate: compaction+toolResultPruner）
   taskforce-tools            ← 消费 ctx.taskforceStore，注册 10 个模型可见工具
@@ -53,7 +55,7 @@ agent 平面（lib/preset.js 的 28 行）
 | 委派工具可见性 | `toolFilter.deny [subagent_fork, workflow, ralph]` | **零 deny** |
 | 并发 | 自建闸门压到 3、默认顺序派 | **只读并行 ≤6 / 含写压到 2–3 / 同资源串行** |
 
-> 数值依据（**经独立审计校准**）：Anthropic 的「3–5」是其 Research 系统在**复杂研究任务**上的配置经验，**没有并发扫参证据**，不构成"最优区间"；Claude Code 的「20 / 默认 3 层」属**那个产品的版本相关规则**，不能当 DSH 参数依据。本机 `dsh-purge` 把 `subagent` 的 maxDepth 默认值提到 **10**，故本包的 `2` 属主动收紧。
+> 数值依据（**经独立审计校准**）：Anthropic 的「3–5」是其 Research 系统在**复杂研究任务**上的配置经验，**没有并发扫参证据**，不构成"最优区间"；Claude Code 的「20 / 默认 3 层」属**那个产品的版本相关规则**，不能当 DSH 参数依据。原生 DSH 0.2 默认委派深度为 1；本包为 spawn 和 fork 都显式指定 2，不依赖第三方宿主补丁。
 
 ## 事实库：跨子代理唯一的持久通道
 
@@ -63,7 +65,7 @@ agent 平面（lib/preset.js 的 28 行）
 - 表：`task` / `fact`（kind ∈ fact,artifact,decision,blocker；confidence ∈ CONFIRMED,PLAUSIBLE,REFUTED）/ `handoff` + 视图 `v_task_board`
 - 服务 API（`ctx.taskforceStore`）：`openTask` / `claimTask` / `recordFact` / `recordHandoff` / `closeTask` / `submitTask` / `acceptTask` / `rejectTask` / `taskOf` / `board` / `stats`
 - 模型可见工具（**10 个**）：`task_open` / `task_claim` / `task_fact` / `task_submit` / `task_accept` / `task_reject` / `task_close`（`submit` 的兼容别名）/ `task_board` / **`task_child_send`** / **`task_child_stop`**
-- 子代理控制是**独立平面**：`send_message` / `interrupt_agent` 属于 Agent Teams 的 teammate，**不能**用子代理 id 去填（会得 `active teammate not found`）。本包自带直连 `ctx.subagents` 的两个工具。详见 `docs/CONTROL.md`。
+- DSH 0.2 的原生 `send_message` / `interrupt_agent` 已接入子代理。本包的 `task_child_send` / `task_child_stop` 继续提供直属归属核对和状态回执。详见 [控制契约](docs/CONTROL.md)。
 
 **状态机与验收门槛**（`docs/STORE.md` 有完整的状态 × 动作表）
 
@@ -71,6 +73,7 @@ agent 平面（lib/preset.js 的 28 行）
 
 - **执行者不能自批**：子代理只能 `task_submit`（提交待验收）；**只有主会话**能 `task_accept` / `task_reject`（身份判据在工具层强制，不靠提示词）
 - **验收要有执行依据**：没有任何证据事实时 `task_accept` **被拒**（`E_EVIDENCE_MISSING`，不是 warning）；自动写入的验收记录是 `decision` + `PLAUSIBLE`，**不会**冒充 `CONFIRMED` 事实。合法的人工豁免走 `waiver_reason`，来源可辨
+- **驳回后换人**：主控可对 `rejected` 任务重新 `task_claim` 指定新执行者；owner、decision 与 handoff 原子写入，子代理不能借模型参数获得换人权限。
 - **终态冻结**：已验收的任务不能被旧子代理改写（`close(failed)` 先查原状态，对终态一律 `E_TERMINAL`）
 - **晚到结果不改写结论**：终态任务上的 `blocker` 允许落库并标 `late=true`，任务**出现在看板的 `late_blockers` 区**（不静默隐藏），但结论不变；要推翻已验收结论，走显式**重新复核**（主会话 `task_reject`，任务回到待办）
 - 未解 blocker 会**阻止** `accept`；解阻塞 = 落一条 `decision` 且带 `resolves_fact_id` 指向它
@@ -81,31 +84,32 @@ agent 平面（lib/preset.js 的 28 行）
 ## 上下文纪律三件
 
 - **`taskforce-working-context`**：每步把一行客观状态钉在最新消息尾部，**从持久事件流折叠**（resume / 压缩后结果一致），只在变化时重发布。
-- **`taskforce-guard`**：运行时退化断路器。两个信号 —— **STALL**（连续零输出长推理）与 **ECHO**（同工具同参数连续失败）—— 触发时注入熔断消息并把 reasoning effort 临时降一档，窗口耗尽自动恢复。**无信号时绝不改写任何请求**（保 prefix cache 与用户的显式选择）。
-- **`taskforce-orchestrator-scope`**：用 `agent.ctx.tools.restrict({deny})` 遮蔽主会话的执行类工具，实测 deny 清单 = `[bash, write, edit, str_replace_editor]`，**只读与派活类保留**；判据是会话身份（`origin === 'subagent'` / `delegationDepth`），**子代理不被收窄**。
+- **`taskforce-guard`**：支持原生与 PTC 内层事件，外层 `run_code` 成功不会抹掉内层的连续失败。运行时退化断路器。两个信号 —— **STALL**（连续零输出长推理）与 **ECHO**（同工具同参数连续失败）—— 触发时注入熔断消息并把 reasoning effort 临时降一档，窗口耗尽自动恢复。**无信号时绝不改写任何请求**（保 prefix cache 与用户的显式选择）。
+- **`taskforce-orchestrator-scope`**：用 `restrict` 收窄可见性、用 `guard` 拒绝真实执行，默认拦截 `run_code`、写工具和宿主变更入口；保留传输名不交给 `restrict`，**只读与派活类保留**；判据是会话身份（`origin === 'subagent'` / `delegationDepth`），**子代理不被收窄**。
 
 > `guard` 的存在理由（梁神源码自陈）：persona 的熔断纪律**停不住**退化，因为"在那个状态下，纪律文本本身已经掉出有效上下文。唯一有效的是**外部力量**"。
 
 ## 自测
 
 ```bash
-npm test                     # 六套独立脚本 + 五个 node:test 文件；宿主集成标 UNVERIFIED
-npm run test:integration     # 真实 DSH profile/安装目录；宿主缺失或结构校验器缺失会失败
-npm run test:all             # 两层都运行；必须全部通过才退出 0
-node tools/verify-preset.mjs [profileDir] --install-dir /opt/dsh/install/node_modules
+npm test                       # 六套独立脚本 + 八个 node:test 文件；宿主标 UNVERIFIED
+npm run test:integration        # 从 PATH 的真实 dsh 安装发现宿主
+npm run test:all                # 离线与真实宿主都必须通过
+npm run test:all -- --install-anchor /path/to/@deepseek-ai/dsh/package.json
+node tools/verify-preset.mjs [profileDir] --install-dir /path/to/node_modules
 ```
 
-以上离线检查只证明包内逻辑。`verify-preset.mjs` 保留原有 profileDir 位置参数，也接受 `--profile-dir`；安装目录默认 `/opt/dsh/install/node_modules`。从其他工作目录执行仍读取本包脚本。缺少 registry 的 `entryListProblem` 或宿主模块时，集成检查不会以三层全绿结案。真实 boot、插件重启用与注册失败恢复按 [可靠性验收](docs/RELIABILITY.md) 单独记录。
+显式路径缺失时失败，不回落到其他安装。预设检查使用 DSH 自己的 profile 解析和 Cordis Config 校验；完整宿主检查创建隔离的 `DSH_HOME`，只监听回环地址的临时端口，验证 roster、真实工具闭环、主子权限和插件生命周期，随后关闭并清理。`--profile-dir` 保留为指定 profile 的预设检查入口；完整 boot 始终使用隔离 profile，不重启现有实例。
+
+CI 包含 Node 22.23.2 / 24.19.0 的离线任务，以及固定 DSH `0.2.0-rc.2` 的真实宿主任务。验收步骤与边界见 [可靠性说明](docs/RELIABILITY.md)，本次实测见 [0.2 验收记录](docs/superpowers/research/2026-09-30-dsh-0.2-acceptance.md)。
 
 ## 已知限制
 
-1. **需要重启 dsh web 才生效** —— bundle 的层栈变更在 boot 时合成。本机 DSH 就是 PID 1，重启会中断当前会话。
-2. **事实库已按工作实例（run）隔离**：`task`/`fact`/`handoff` 带 `run_id`，由宿主从调用者身份推导（主会话用自身 sessionId、子代理用其**根会话** id ⇒ 同树共享一个 run）；**无参查询落在「未归属域」**（迁移之前的历史行），不是全局。⚠️ 这是**接口层**隔离，**不是文件层边界** —— 子代理有 bash 就能绕过服务直读同一个 SQLite 文件。单进程默认 rollback journal，多 profile 同写会 `SQLITE_BUSY`；需要时开 WAL。
-3. **工具结果剪枝在本机被禁用** —— `dsh-purge` 的 `#19 TOOL_RESULT_PRUNER_DISABLED` 把 `pruneContent()` 改成直接 `return null`，因此 preset 里 `tool-result-pruner` 行的阈值**不生效**。上下文膨胀压力落在 persona 的 Bounded Output 纪律 + `compaction-basic` 上。
-4. **`task_board` 对不存在的 task_id 抛错**（转成 `ok:false`），刻意防呆。
-5. 只读核对用的 `read` / `grep` / `glob` 是宿主工具；主会话能核对到什么，取决于它被允许读哪些路径。
-6. **真身 vs 兜底**：`taskforce-tools` 优先用宿主的 `defineTool`，解析不到时回落到自带的等价编译器（两者逐字段等价已有断言）。
-7. **离线校验有盲区**：`tools/verify-preset.mjs` 验的是模块形状（结构 / 解析 / 运行时），**不验 Config schema 的必填字段** —— 这类错误只有**真实 boot** 会在 roster 的 `broken` 字段里暴露。历史首次 boot 曾据此修掉三行（`tool-fs-search` / `tool-todo` / `plan-mode` 的必填配置）；阶段 A 修改后的真实 boot 尚未验收。判定本包可用，请以对应版本的真实 boot roster 为准。
+1. 新增 bundle 需在目标实例重新加载配置或重启后生效；本次验收使用独立临时实例。
+2. run 隔离在服务接口层：有文件执行权限的子代理仍可直接访问同一 SQLite 文件。默认保留现有 journal 模式，可按部署需要启用 WAL。
+3. 主控的只读核对范围取决于宿主允许的路径；执行守卫覆盖默认拒绝清单，部署修改清单会改变边界。
+4. `task_board` 对不存在的任务返回明确错误。工具编译器优先采用原生 `defineTool`，离线环境有等价兜底。
+5. 本次原生验收不发送模型请求；外部模型、真实长时委派与高并发负载尚未做端到端验收。持久调度器与自动化仍是后续阶段的设计，不属于本次实现。
 
 ## 借鉴与致谢
 

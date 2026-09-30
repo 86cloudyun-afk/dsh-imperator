@@ -28,6 +28,7 @@ test('offline runs six scripts and explicit test files, then marks host integrat
   assert.deepEqual(calls[6].args.slice(1).map((path) => path.split('/').at(-1)), [
     'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
     'lifecycle.test.mjs', 'verify-runner.test.mjs',
+    'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
   ])
   assert(calls.every(({ file, args, options }) => file === process.execPath
     && args.slice(args[0] === '--test' ? 1 : 0).every(isAbsolute)
@@ -72,6 +73,25 @@ test('integration and all fail closed when required host files are absent', asyn
     assert.equal(result.ok, false)
     assert.deepEqual(result.results.at(-1), { name: 'host integration', status: 'unverified', exitCode: null })
   }
+})
+
+test('integration runs actual boot separately and cannot hide a boot failure behind contract checks', async (t) => {
+  const fixture = mkdtempSync(join(tmpdir(), 'taskforce-runner-anchor-'))
+  t.after(() => rmSync(fixture, { recursive: true, force: true }))
+  const anchor = join(fixture, 'package.json')
+  writeFileSync(anchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
+  const calls = []
+  const result = await runVerification({ mode: 'integration', installAnchor: anchor,
+    runProcess: async (file, args, options) => {
+      calls.push({ file, args, options })
+      return { exitCode: args[0].endsWith('verify-host.mjs') ? 1 : 0 }
+    } })
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.results.map(row => [row.name, row.status]), [
+    ['preset contract', 'passed'], ['native boundaries', 'passed'], ['host integration', 'failed'],
+  ])
+  assert.equal(calls[1].options.env.DSH_INSTALL_ANCHOR, anchor)
+  assert.ok(calls[2].args[0].endsWith('verify-host.mjs'))
 })
 
 test('CLI locates its own package from an unrelated cwd and exits nonzero on missing host', (t) => {

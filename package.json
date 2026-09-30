@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-taskforce",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "任务部队：主会话只编排、子代理全执行的多 agent 生产工具（DSH agent preset）",
@@ -22,7 +22,7 @@
   ],
   "dsh": {
     "engines": {
-      "dsh": ">=0.1.7-rc.2"
+      "dsh": ">=0.2.0-rc.2"
     },
     "bundle": {
       "patch": "./cordis.patch.yml"

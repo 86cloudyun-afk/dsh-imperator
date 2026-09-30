@@ -16,6 +16,8 @@ const TESTS = [
   'guard-causality.test.mjs',
   'store-scope-integrity.test.mjs', 'sqlite-failure-safety.test.mjs',
   'working-state.test.mjs', 'process-runner.test.mjs',
+  'context-boundaries.test.mjs', 'board-batching.test.mjs',
+  'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

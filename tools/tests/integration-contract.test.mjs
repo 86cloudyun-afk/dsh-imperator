@@ -19,6 +19,8 @@ test('integration retains deliberate root policy, native presentation, depth two
   assert.equal(rows.find(row => row.id === 'tool-presentation')?.config.mode, 'native')
   const persona = rows.find(row => row.id === 'persona').config.prefix
   assert.match(persona, /研究|调查/)
+  assert.doesNotMatch(persona, /send_message \/ interrupt_agent 属于 Agent Teams/)
+  assert.match(persona, /DSH 0\.2.*send_message.*也支持子代理/)
   assert.doesNotMatch(persona, /不读写文件、不执行命令、不检索/)
   for (const row of rows.find(row => row.id === 'delegation').config.filter(row => row.name === '@deepseek-ai/dsh-tool-subagent')) {
     assert.equal(row.config.maxDepth, 2)

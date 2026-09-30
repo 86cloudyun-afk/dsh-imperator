@@ -86,13 +86,19 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
 
     // Hiding run_code in native presentation is not sufficient protection.
     const forbidden = join(fixture.root, 'root-ptc-must-not-write.txt')
-    try {
-      parent.agent.ctx.tools.presentAs('both')
-      const denied = await execute(parent.agent, 'run_code', { description: 'isolated boundary regression',
-        code: `await (await import('node:fs/promises')).writeFile(${JSON.stringify(forbidden)}, 'must not exist'); return 'done';` })
-      assert.equal(denied.isError, true)
-      assert.equal(existsSync(forbidden), false)
-    } finally { parent.agent.ctx.tools.presentAs('native') }
+    // Presentation is declared once per scope. Use another disposable root;
+    // do not mask a boundary assertion by attempting a conflicting reset.
+    const ptcRoot = await agents.create({ sessionId: 'taskforce-probe-ptc', meta: { cwd: fixture.root },
+      setup: async (agentCtx, agent) => {
+        await registry.mount(agentCtx, 'taskforce')
+        agent.session.append('agent-preset/selected', { agentPreset: 'taskforce' })
+      } })
+    handles.push(ptcRoot)
+    ptcRoot.agent.ctx.tools.presentAs('both')
+    const denied = await execute(ptcRoot.agent, 'run_code', { description: 'isolated boundary regression',
+      code: `await (await import('node:fs/promises')).writeFile(${JSON.stringify(forbidden)}, 'must not exist'); return 'done';` })
+    assert.equal(denied.isError, true)
+    assert.equal(existsSync(forbidden), false)
     pass('root PTC boundary survives presentation changes')
 
 

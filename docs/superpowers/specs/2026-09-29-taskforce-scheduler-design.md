@@ -1,10 +1,11 @@
 # TaskForce 阶段 B：持久化并发调度详细设计
 
-日期：2026-09-29。状态：**待用户审阅；尚未实现**。
+初稿：2026-09-29。修订：2026-09-30（DSH 0.2 契约对齐）。状态：**待用户审阅；尚未实现**。
 
 依赖：阶段 A，远端提交 `a75a89902de1c569330e12d55456dfb38d2f752b`（PR #2）。
+当前代码依据：PR #6 `19238ea539de8dd6d4e8f97f037ee4eda4a9f255`；阶段 A 提交仅保留为历史基础，宿主验证目标为 `@deepseek-ai/dsh@0.2.0-rc.2`。
 上位设计：[双线强化设计](2026-09-29-taskforce-strengthening-design.md)。
-配套：[自动开发设计](2026-09-29-taskforce-automation-design.md)、[目标宿主研究](../research/2026-09-29-dsh-host-contracts.md)。
+配套：[自动开发设计](2026-09-29-taskforce-automation-design.md)、[新版本宿主研究](../research/2026-09-30-dsh-0.2-bc-host-contracts.md)、[历史 0.1.7 宿主研究](../research/2026-09-29-dsh-host-contracts.md)（仅作历史证据，不作为 0.2 能力依据）。
 
 ## 1. 已确认目标与本次需要审阅的决定
 
@@ -51,9 +52,9 @@
 2. `task_schedule_state({task_id?})`：只返回当前 run 的队列、attempt、额度和阻塞原因。
 3. `task_schedule_control({task_id, action, expected_generation, request_key, reason?})`：root 的取消、暂停、恢复或明确重试。重试不覆盖原 attempt。
 
-受管入口使用 host 的 `ToolGuard`，覆盖原生 spawn/fork、`task_child_send`、相邻代理消息等重新激活入口。不能仅隐藏工具或拦截一个名称。未能封闭已安装的派发路线时返回 `E_SCHEDULER_CAPABILITY`。受管执行不支持任意 followup；需要继续工作时提交新的受管请求。
+受管入口使用 host 的 `ToolGuard`，覆盖原生 spawn/fork、`task_child_send`、相邻代理消息等重新激活入口。不能仅隐藏工具或拦截一个名称。B 的准入闭环还必须处理 `run_code` reserved transport：restrict 不覆盖它，不能借此阻止 PTC 内层派发或直接 fs/subprocess 旁路；必须在已验证的执行边界上封闭这些路径。未能封闭已安装的派发路线时返回 `E_SCHEDULER_CAPABILITY`。受管执行不支持任意 followup；需要继续工作时提交新的受管请求。
 
-agent scope 的 guard 只约束该发送者，不能阻止其他会话向受管 child 投递。独占输入还需要 host 范围按目标 session 检查的 guard，以及已安装工具/插件的完整输入路线清单；针对受管目标拒绝未获准的消息与恢复入口。无法检查的路线必须禁用或阻止受管模式启用，不能把 child setup 中装一个 guard 当成完整边界。
+agent scope 的 guard 只约束该发送者，不能阻止其他会话、UI、API、messages 或 resume 向受管 child 投递。独占输入还需要 host 范围按目标 session 检查的机制，以及已安装工具/插件的完整输入路线清单；针对受管目标拒绝未获准的消息与恢复入口。此 target ingress 能力尚未由 PR #6 证明。无法检查的路线必须禁用或阻止受管模式启用，不能把 child setup 中装一个 guard 当成完整边界。
 
 `task_child_list/status` 在受管模式读 TaskForce 的持久执行视图，标明 `managed_once`；原生目录不能被当成该视图。停止动作交由调度器保留 holds 后回收。混合子代理显示来源，不向原生 continuable manager 伪造 descriptor。
 
@@ -71,7 +72,7 @@ agent scope 的 guard 只约束该发送者，不能阻止其他会话向受管 
 | `request_resource` | request_id、canonical_key、mode、normalization_version；同键合并为更强权限。 |
 | `execution_attempt` | attempt_id、request_id、task_id、run_id、generation、state、owner_epoch、reserved_child_id、workspace_id、prompt_digest、outcome、proof_ref、timestamps。task/generation 唯一；同任务最多一个未释放 attempt。 |
 | `resource_hold` | attempt_id、canonical_key、mode、acquired_at、released_at；所有未释放行参与跨 run 冲突。 |
-| `scheduler_event` | event_id、run_id、attempt_id、source、source_event_key、payload_digest、timestamp；与状态变化一同提交，重复来源事件不重复生效。 |
+| `scheduler_event` | event_id、run_id、attempt_id、source、source_event_key、payload_digest、timestamp；原生/PTC 工具事件键绑定所属执行上下文（实际 session/turn/step）及可核验的 session-log seq、surfaceOp/原始事件引用（如实际提供 `sourceEventSeqs`），不能只取 callId/subCallId。展示 replacement 的新 seq 归回原始逻辑调用，不得成为新执行；缺少可靠来源关联则能力不明、不可采信。service、runner、PR 事件绑定 operation_key、attempt/generation 与 adapter receipt 身份。与状态变化一同提交，重复来源事件不重复生效。 |
 
 kind=effect 的 attempt 没有 child_id，用于 C 的测试进程或交付资源预约；它仍占用相同预算。C 的 `workflow_effect` 只引用该 attempt，不另建资源锁或子代理调度器。
 
@@ -105,7 +106,7 @@ reserved、dispatching、running、stopping、reconciling 均占额度，只有�
 
 成功嵌套后，父 attempt 即使模型回到 idle，也保留自身额度、holds 和 native handle，直到子树已结算。宿主适配器在子树清空前不得销毁父 handle。父子同一物理资源有写冲突时不能同时执行。此策略支持预算内、资源不冲突的深度 2 委派；不承诺自动挂起持锁父代理以等待将来额度。
 
-parent teardown、取消或插件卸载时先关闭子树新派发，再按子到父顺序停止/回收。原生 parentAgent 是真实关系，不自动承担递归回收；TaskForce 的 host/attempt scope 拥有各 handle。受管嵌套只能经本调度器创建，不允许混入原生 continuable；如发现此类后代，先调用已验证的 `drainContinuableDescendants([exactAgent])` 并记录边界违规，不能只销毁父 handle。任何不能证明回收完成的 attempt 进入 reconciling，保留占用。实际目标宿主无法维持此生命周期时，只阻止嵌套模式并报告能力缺失，不能悄悄将 maxDepth 改为 1 后称 B 验收完成。
+parent teardown、取消或插件卸载时先关闭子树新派发，再按子到父顺序停止/回收。原生 parentAgent 是真实关系，不自动承担递归回收；TaskForce 的 host/attempt scope 拥有各 handle。受管嵌套只能经本调度器创建，不允许混入原生 continuable；如发现此类后代，先确认 `ctx.agents.get(exactAgent.id) === exactAgent`，再调用已验证的 `drainContinuableDescendants([exactAgent])` 并记录边界违规，不能只销毁父 handle。exact parent 已失效时 drain 可能 no-op，返回不构成未知后代已停证明。任何不能证明回收完成的 attempt 进入 reconciling，保留占用。实际目标宿主无法维持此生命周期时，只阻止嵌套模式并报告能力缺失，不能悄悄将 maxDepth 改为 1 后称 B 验收完成。
 
 ## 7. 工作区和资源隔离
 
@@ -122,18 +123,33 @@ parent teardown、取消或插件卸载时先关闭子树新派发，再按子�
 
 ## 8. 原生适配与可信身份
 
-目标初次验证版本为 `@deepseek-ai/*@0.1.7-rc.2`；不把 upstream master 0.2 的接口当成 rc.2。能力检测和集成测试决定支持范围，包声明的最低版本不等于所有新版兼容。
+目标验证版本固定为官方 `@deepseek-ai/dsh@0.2.0-rc.2`；最低版本 `>=0.2.0-rc.2` 不表示所有后续版本均通过。旧 [0.1.7 宿主研究](../research/2026-09-29-dsh-host-contracts.md)只保留历史背景；实现细节不得直接外推为 0.2 事实。新 [0.2 B/C 宿主研究](../research/2026-09-30-dsh-0.2-bc-host-contracts.md)作为需核对来源的研究材料。
+
+PR #6 [已记录的原生验收](../research/2026-09-30-dsh-0.2-acceptance.md)范围限于基础 `agents.create/setup/parent meta` 与 composition、root PTC guard、persona、spawn/fork 配置和 depth helper 的 2/3 边界、现有任务工具、handle 释放，以及插件卸载重启用和注册恢复。它没有模型请求，也没有 B/C 产品代码或真实长时多层执行、崩溃恢复、严格 flush、后代 jobs 回收、target ingress 验收。本轮规格复核没有重跑该宿主验收。
+
+### 0.2.0-rc.2 源码核实结果
+
+下表是官方发布包的源码/类型证据，不等于宿主已加载这些实现或已完成运行验收。Agent create/setup/handle 类型与 0.1.7 相同；公开 delegation helpers 与 drain 也不是 0.2 新增能力。包内同名 API 不代表下游应用整体兼容。
+
+| 契约 | 已核实源码行为 | 对 B 的要求 |
+|---|---|---|
+| create/setup/handle | `CreateAgentOptions`、`AgentSetupCommit`、`AgentHandle` 类型在两版相同。setup commit 后，loop 仍异步执行 `appendUnstoredSuffix`，再 publication。 | setup commit 不是最终投递 fence；须等 create 返回/发布完成并复核持久 attempt fence，才允许首个输入。 |
+| `SessionStore.flush` | `dsh-session/lib/index.js:1832-1848`：无 `session/flush` listener 时返回 `false`；所有 listener 成功 settle 后返回 `true`；listener 失败则等所有 listener settle 后 reject。该 API 旧版已存在。 | 必须检查 `await sessions.flush(session) === true`，并确认参与 listener 实际连到预期持久 backend；`true` 不证明 backend 配置正确。 |
+| delegation 与 drain | 公开 delegation helpers 与基本 drain 能力在 0.1.7 已存在。 | 视为候选宿主接口，不得标成 0.2 新增；真实树回收仍需 spike 验证。 |
+| tool-call 恢复 | `dsh-agent-loop/lib/index.js:973-995` 新增失败 step 的 `ToolCallRecovery` 路径，为缺失结果调用追加保守 `tool/result` 后关闭 step；两个恢复错误码在 0.1.7 已存在。追加到 Session 事件流仍需严格 flush。 | 恢复结果不是成功回执、child 已创建证明或外部进程已停止证明；须独立核对 attempt 与外部操作证据，不能仅据恢复结果结算或释放 holds。 |
+
+实施前原生 spike 核实关键 API 与生命周期接线，包括持久 listener/backend、输入封锁和 handle/job 停止/回收。长时多层运行属于上线集成验收，不是开始核心实现的前置条件。比较仅覆盖已取证的 13 个官方发布包，不构成全包或消费应用兼容性结论。
 
 建议原生派发序列：
 
-1. 排队时只保存请求意图。实际准入/启动时，在任何异步准备之前同步捕获真实父代理的 delegated policy 和执行配置；随后在同一同步流程的 SQLite 事务中预留 child session UUID、attempt/generation、owner_epoch、工作区身份、初始输入摘要及该不可变策略快照/摘要。
+1. 排队时只保存请求意图。实际准入/启动时，在任何异步准备之前用公开 delegation helpers 同步取得真实父代理的 depth、agent options、child meta、delegated policy 及 composition 配置/版本；随后在同一同步流程的 SQLite 事务中预留 child session UUID、attempt/generation、owner_epoch、工作区身份、初始输入摘要及不可变快照/摘要。
 2. 在外部创建工作区并验证；未知创建结果保留 intent 进入对账。
-3. 用公开 delegation helper 计算真实 depth、agent options 和 composition；setup 始终使用步骤 1 的策略快照，不在异步准备后重新取得更宽权限替换它。
-4. 调用现有 `ctx.agents.create({sessionId, parentAgent, meta, setup, ...})`；meta 从 `childSessionMeta` 导出，只将 cwd 改为可信工作区。
-5. 未发布 setup 安装 inherited policy、composition、TaskForce guard 和实际 session → attempt 绑定；同步 setup commit 再核对 owner fence/工作区。任一步失败不得运行初始输入。
+3. 验证父仍为同一实际授权 Agent，策略、模型路由和 composition 版本与步骤 1 一致；变化则停止该次创建并按新 attempt 重新准入。使用步骤 1 保存的 helper 输出，不在异步准备后重新取值替换快照。`applyChildComposition` 仍从实际父 scope 继承，须在创建前后检测 composition 变化；不能假设 SDK 支持冻结 preset 的新参数。
+4. 调用现有 `ctx.agents.create({sessionId, parentAgent, meta, setup, ...})`；meta 使用步骤 1 的 `childSessionMeta` 输出，只将 cwd 改为可信工作区。
+5. 未发布 setup 安装 inherited policy、composition、TaskForce guard 和实际 session → attempt 绑定；setup commit 只完成同步 setup 变更，不代表最终发布或持久化 fence。宿主随后还会异步 appendUnstoredSuffix，再进行 publication。任一步失败不得运行初始输入。
 6. 创建返回后重新核对持久 fence 和父策略/配置摘要；父身份失效或可观察策略发生变化（包括变得更严格）时不投递，回收后以新 attempt 重新准入。关闭其他输入路线，仅投递一次初始输入。实际 session/输入/turn 与 attempt 分别记录，不能用 label 关联。
-7. 等原生会话和受管子树静止，检查输入确实被消费、turn 结果和失败状态；`whenIdle()` 本身不表示成功。
-8. 对活会话执行 `ctx.sessions.flush(session)`，要求确有持久化监听器且成功；再 await 原生 handle.dispose 及受管作业回收。
+7. 关闭新派发/输入，检查单次输入确实被消费、对应 turn 的完成/失败/取消状态；逐个处理受管子树，保留父 handle 直到后代回收。`whenIdle()` 本身不表示任务成功或 jobs/OS 进程已停止。
+8. 每个 handle 销毁前，对其活会话执行 `await ctx.sessions.flush(session)`，必须检查结果严格等于 `true`，并核对预期 backend 的该 session writer 和 checkpoint；listener reject、false 或成功但未实际写入均不得作为持久证明。随后按子到父 await 原生 handle.dispose 及受管作业回收，实际进程终止效果仍需 spike 验证。原生 close 后再用只读持久证据核对最终结果，不能对已 detached 的 session 调用 live flush。
 9. 将结果、持久 checkpoint 和回收证明 CAS 写入当前 attempt 后释放 holds。任何未知/失败清理均不能作为成功结算。
 
 使用原生 factory 的消费者，不注册替代 factory、不改 agent loop。TaskForce 自己持有创建返回的 handle；`ctx.agents.get()` 不能恢复 disposer。原生 subagent 的观察事件只用于诊断，不是准入或持久结算凭据。为保持真实策略继承，派发需要实际可用的授权父会话；父会话退出按取消/回收规则处理，重启后父会话未恢复则暂停新派发，不伪造 root 或自动恢复可能带有 pending input 的会话。
@@ -148,9 +164,9 @@ parent teardown、取消或插件卸载时先关闭子树新派发，再按子�
 
 初版每个协调域只允许一个具有**不依赖超时失效**的进程派发所有者。独占锁必须由操作系统进程持有并在进程退出时释放；无法提供这种锁的部署返回 capability error。租约/时间戳只供诊断，不能在旧进程仍可能恢复时抢占。跨机器/网络文件系统锁和多活派发不在初版支持范围。
 
-接管后先只读查询持久会话/TaskForce intent/工作区，禁止为“查看状态”调用 `agents.resume()`。`sessionQuery.readSession()` 的冷读会添加内存中的 interrupted 闭合事件，不能将其当作已持久化成功；需要原始证据时使用 `sessionPersistence.open(id, 'read')`、reader.read 和 finally close。找到可验证终态和回收证据可幂等结算；只有明确证明未启动且旧发送者不可能再发送，才能记 never_started。其余进入 unknown，保留资源和证据，等待有依据的人工/宿主对账。操作员点击重试也不能把未知旧写进程当成已停止。
+接管后先只读查询持久会话/TaskForce intent/工作区，禁止为“查看状态”调用 `agents.resume()`。0.2 的 `readColdSessionLog` 通过 `persistence.open(id, 'read') → read → close` 读取日志，读取异常也尝试 close，并在返回的内存 events 中追加 `interruptedTurnClosers`；该合成闭合不能当成已持久化成功或执行已停止证明。需要原始持久证据时直接只读打开 persistence handle、读取并在 finally 中 close；此路径仍须验证真实宿主接线。若宿主返回 `TOOL_NOT_STARTED` 或 `TOOL_OUTCOME_UNKNOWN`，前者只说明会话日志没有记录 tool call 已开始，后者说明已记录调用但结果未持久化；两者都不能证明没有外部副作用、child 未创建或进程已停止。只有持久结果和 quiescence 证明齐备时才可结算 succeeded/failed/cancelled 并释放 holds；单个观察事件不足。若不能证明终态或停止则进入 unknown 并保留 holds。操作员点击重试也不能把未知旧写进程当成已停止。
 
-插件卸载关闭新准入、停止后台 wakeup、等待所属原生 handles 和进程回收；无法回收时留持久诊断，不宣称卸载完成或释放所有资源。重新启用恢复同一数据库的 intents；不能凭内存空白创建重复执行。
+插件卸载关闭新准入、停止后台 wakeup、等待所属原生 handles 和进程回收；无法回收时留持久诊断，不宣称卸载完成或释放所有资源。持久失败/取消结果加可信静止证明可结算 failed/cancelled；只有证实从未运行才结算 never_started。单个观察事件不是准入或释放证据。展示状态替换不得触发新执行。重新启用恢复同一数据库的 intents；不能凭内存空白创建重复执行。
 
 ## 10. C 阶段共享端口
 
@@ -162,7 +178,7 @@ parent teardown、取消或插件卸载时先关闭子树新派发，再按子�
 - `settleAttempt(adapterContext, {attemptId, generation, outcome, proof})`：只接受持久结果及 quiescence 证明，释放一次。
 - `reconcileAttempt(adapterContext, attemptId)`：产生 running/settled/never_started/unknown 的可信观察，不自动重放。
 
-普通模型不能对 accepted 任务排队；C 已验收后的交付 effect 由 workflow policy 专门授权。每次测试/交付 effect 的资源预约与 C effect intent 在同一 SQLite 事务中建立，外部执行在提交后进行。
+普通模型不能对 accepted 任务排队；C 已验收后的交付 effect 由 workflow policy 专门授权。每次测试/交付 effect 的资源预约与 C effect intent 在同一 SQLite 事务中建立，外部执行在提交后进行。单个观察事件不授予准入、结算或释放 holds 的权限；持久结果与 quiescence 证明齐备时可结算 succeeded/failed/cancelled 并释放，无法证明终态或停止则维持 unknown 和占用。
 
 ## 11. 验收与交付顺序
 
@@ -177,5 +193,7 @@ parent teardown、取消或插件卸载时先关闭子树新派发，再按子�
 | 自动化协作 | effect 与 agent 共用预算；旧代际回执仅审计；交付资源互斥；accepted 例外只能由 workflow host policy 发起。 |
 
 实施分为可独立审查的持久核心、原生适配、模型工具/旧入口约束三部分；C 随后消费稳定端口。具体 TDD 任务及提交拆分在本规格获审阅后写入实施计划，沿用用户已选择的多代理执行方式。
+
+实施前能力阻断项及解除证据见 [0.2 宿主复核第 4 节](../research/2026-09-30-dsh-0.2-bc-host-contracts.md#4-实施前阻断项与解除条件) H01–H06。它们阻断对应适配器/部署方案定稿，不阻止离线核心实现；尚未解除时相应派发/嵌套/结算/恢复能力保持 blocked。完整真实宿主验收仍是启用前独立门槛。
 
 离线 fake adapter 验证与真实 rc.2 boot、工具权限、嵌套、作业清理、重启测试分别报告。没有后者只能称“核心通过、宿主未验证”，不能称并发调度已经完整上线。

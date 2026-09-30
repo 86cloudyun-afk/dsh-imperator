@@ -1,9 +1,10 @@
 # TaskForce 阶段 C：自动开发工作流详细设计
 
-日期：2026-09-29。状态：**草案，待用户审阅**。
+初稿：2026-09-29。修订：2026-09-30（DSH 0.2 契约对齐）。状态：**草案，待用户审阅；尚未实现**。
 既有“推进”确认覆盖总体范围和 A → B → C 顺序，不等于批准本详细规格或其实施。
 依据：`2026-09-29-taskforce-strengthening-design.md` 第 6、7 节；前置为阶段 A 可靠性和 `2026-09-29-taskforce-scheduler-design.md` 定义的阶段 B 持久调度。
 本文件确定架构、契约与验收标准，不是实施计划；不授权未来 PR 自动合并。
+当前代码依据：PR #6 `19238ea539de8dd6d4e8f97f037ee4eda4a9f255`，精确宿主验证目标为 `@deepseek-ai/dsh@0.2.0-rc.2`。
 
 ## 1. 目标与边界
 
@@ -13,7 +14,7 @@
 严格验收绑定规范仓库、完整 commit SHA、计划版本与实现修订；工作区路径和分支名只是定位信息。
 模型提交的是候选产物、审查判断或执行请求；测试执行与 PR 发布结果必须来自可信宿主适配器。
 能力缺失阻塞依赖该能力的阶段，不能退化成提示词约束后宣称自动开发已生效。
-本轮交付目标为可审查 PR，自动合并不纳入执行接口；分支就绪可以单独报告，但不算 PR 交付完成。
+阶段 C 交付目标为可审查 PR，自动合并不纳入执行接口；分支就绪可以单独报告，但不算 PR 交付完成。
 
 ## 2. 现有实现依据与方案选择
 
@@ -27,8 +28,14 @@
 | `lib/store/sqlite.js:53-85` | 已有 BEGIN IMMEDIATE/savepoint，拒绝异步事务；外部操作必须在事务外执行。 |
 | `tools/verify-all.mjs:18-54` | 验证 CLI 能真实启动进程并区分宿主未验证，但尚不是持久、SHA 绑定的工作流执行服务。 |
 
-以上行号对应阶段 A 本地 `f488ade`；阶段 B/C 从已发布等价树 `a75a899` 起步，行号随后续实施变化。
-目标宿主契约以 npm `0.1.7-rc.2` 为验证基线；不能把较新 upstream master 的接口混为该版本能力。
+以上行号对应阶段 A 本地 `f488ade`，其已发布等价树为 `a75a899`，仅保留作历史定位。本轮以 PR #6 的当前代码与原生验收为依据，新增契约/覆盖证据按下述 0.2 研究定位；不能将历史行号当当前源码行号。
+目标验证版本固定为官方 `@deepseek-ai/dsh@0.2.0-rc.2`；最低版本 `>=0.2.0-rc.2` 不表示所有后续版本均通过。旧 [0.1.7 宿主研究](../research/2026-09-29-dsh-host-contracts.md)仅为历史背景；新 [0.2 B/C 宿主研究](../research/2026-09-30-dsh-0.2-bc-host-contracts.md)是本规格的核对材料，需区分实测、源码候选与实施前原生 spike。
+
+PR #6 [已记录的原生验收](../research/2026-09-30-dsh-0.2-acceptance.md)只覆盖基础 agents.create/setup/parent meta 与 composition、root PTC guard、persona、spawn/fork 配置和 depth helper 的 2/3 边界、现有任务工具、handle 释放、插件卸载重启用与注册恢复。没有模型请求，没有 B/C 产品代码或真实长时多层执行、崩溃恢复、严格 flush、后代 jobs 回收或 target ingress 验收。本轮没有重跑该宿主验收。
+
+已核实的 0.2.0-rc.2 源码契约：`CreateAgentOptions`、`AgentSetupCommit`、`AgentHandle` 类型与 0.1.7 相同；公开 delegation helpers 与基本 drain 也已在旧版存在，均不得表述为 0.2 新增。`SessionStore.flush` 在两版均存在，0.2 实现无 listener 返回 false、所有 listener settle 后返回 true、失败则 reject；使用方须检查 true 并确认 listener 连接预期持久 backend。create 的 setup commit 之后仍异步 appendUnstoredSuffix，再 publication，所以 commit 不是最终发布/投递 fence。
+
+0.2 新增失败 step 的共享 `ToolCallRecovery` 路径，在 step 异常时给缺结果调用补记保守 tool/result 再关闭 step，补记到 Session 事件流仍需严格 flush。`TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 在旧版已存在，是恢复状态，不是成功证明、child 创建证明或外部进程停止证明。`readColdSessionLog` 通过 persistence `open(id, 'read')`、read、close 获取日志，并在返回的内存 events 中追加 `interruptedTurnClosers`；合成闭合不得冒充持久事件或终态证明，原始证据应直接只读打开 persistence handle、read、finally close。以上为 13 个已取证官方包的源码证据；PR #6 未覆盖的实际 backend 持久保证、进程终止与 B/C 接线仍需关键 API/生命周期 spike。比较不构成全包/provider 兼容性结论。长时多层运行属于上线集成验收，不是开始核心实现的前置条件。
 比较三种方案：普通 fact 编码阶段改动小但身份和验收旁路难封闭；独立通用 DAG 引擎重复调度职责；同库类型化工作流可复用事务和生命周期。
 **采用同库类型化工作流 + 宿主适配端口**。普通 fact 只保存可读摘要，不是严格工作流的事实源。
 
@@ -36,7 +43,7 @@
 
 B 唯一拥有 `execution_attempt`、run/generation/实际 session 身份、原子资源占用、准入与子代理派发。
 C 的 assignment 只引用 B 的 attempt，并绑定“这次执行承担哪个阶段和修订”，不复制调度器。
-B 每次受管 attempt 用 `ctx.agents.create` 创建全新实际子会话，使用预留 id、meta.cwd、setup 和原生 disposal。
+B 每次受管 attempt 目标为用 `ctx.agents.create` 创建全新实际子会话，使用预留 id、meta.cwd、setup 和原生 disposal。delegation helper 输出/权限及 composition 版本在首次 await 前快照，异步准备或创建期间父策略/配置变化则停止该次投递。setup commit 后仍有异步 appendUnstoredSuffix 与 publication；必须等 create 发布完成并复核持久 fence，才能投递初始输入。活会话 flush 必须严格返回 true 且验证实际 backend writer/checkpoint；按子到父 dispose，并只读核对最终持久结果和作业/进程静止。具体回收效果仍须 spike 验证。
 受管范围不重启 continuable 旧会话；返工和失败重试分别创建新 attempt、新 session，历史身份永久保留。
 保留实际父链和 `maxDepth: 2`，不将孙会话压平为主会话子代；深度不足时返回明确阻塞。
 父会话、兄弟会话及非受管旧原生工具保持独立兼容边界；C 不凭标签接管它们，也不宣称约束整个宿主所有 shell。
@@ -68,6 +75,7 @@ JSON 只存已校验的结构化载荷；核心状态、关联 id、完整 SHA�
 `effect.state` 为 `pending|dispatched|succeeded|failed|unknown`；unknown 必须对账，不表示可重试。
 `evidence.producer_kind` 为 `host_execution|agent_claim|agent_review`；后两者不能伪装执行回执。
 `evidence.result` 为 `pass|fail|unverified`；未运行、缺日志、无法确认版本均是 unverified。
+原生/PTC 工具事件去重键须关联所属执行上下文（实际 session/turn/step）及可核验的 session-log seq、surfaceOp/原始事件引用（如实际提供 `sourceEventSeqs`），不能仅用 callId/subCallId。展示 replacement 的新 seq 归回原始逻辑调用，不得记作新调用；缺乏可靠来源关联时能力不明、不可采信。service、runner、PR 事件绑定 operation_key、attempt/generation 与 adapter receipt 身份。`TOOL_NOT_STARTED` / `TOOL_OUTCOME_UNKNOWN` 只能作为保守恢复状态，不得转为 pass、成功 receipt 或 quiescence 证明。
 accept 决策冻结采信证据集和 SHA；之后追加新证据不能悄悄改写旧决定。
 
 ## 5. 六阶段转换
@@ -96,7 +104,7 @@ C 写入测试 effect 意图，B 原子预约资源，runner 在指定修订的�
 
 ### 5.4 独立审查
 
-B 分配全新实际审查会话，其 session 不得出现在当前修订实现者集合；同会话换 persona/轮次不构成独立。
+B 分配全新实际审查会话，其 session 不得出现在当前修订实现者集合；同会话换 persona/轮次不构成独立。B 的 agent scope guard 只保护发送者，不能单独封闭外部会话、UI、API、messages 或 resume 的 target ingress；C 的验收资格依赖 B 与宿主入口封锁能力已被核实。
 审查只读当前完整 SHA 的快照，分别提交需求符合性、代码质量结论和逐项 findings，并保留可定位审查产物。
 两个结论都通过且为已确认审查结论才能进入 lead_acceptance；host 身份戳证明提交者，不保证模型判断正确。
 审查者若写入修复即成为实现者，产生新 revision 并重新测试、另派独立审查；不能先改后自批。
@@ -158,7 +166,7 @@ approve_plan、request_tests、request_delivery、resume、accept/reject 的模�
 | `scheduler.reserveEffect(auth,{effectId,taskId,requestKey,profile,resources})` | B 创建/查回 kind=effect 的 request/attempt；返回 requestId/attemptId/generation，未获准入时仅 requestId，排队不得执行。 |
 | `scheduler.settleAttempt(adapterContext,{attemptId,generation,outcome,proof})` | 仅宿主凭持久结果和可信 quiescence 证明结算并释放 holds；C 保存效果结果不能直接释放，unknown 保留占用。 |
 
-上述为待实现内部端口名，不宣称 DSH 已原生提供这些方法；真实适配器须按目标版本契约验证。
+上述为待实现内部端口名，不宣称 DSH 已原生提供这些方法；真实适配器须按 `@deepseek-ai/dsh@0.2.0-rc.2` 契约验证。工作流 receipt、runner 和 PR 适配器仍待实现；B capability blocker 与新会话均是 C 的前置接口条件。不能要求尚未实现的整个 B 已通过全部上线验收才能开始 C 核心实现，但开始前必须明确稳定端口和阻断能力清单；端口未具备时将依赖该能力的集成阶段标记 blocked。
 子代理实现/审查派发仅使用 B host 服务；workflow 不再暴露 create-child/send-message 执行路径。
 错误码固定含 E_WORKFLOW_CONFLICT、E_WORKFLOW_STAGE、E_WORKFLOW_CAPABILITY、E_REVISION_STALE、E_EVIDENCE_UNTRUSTED、E_REVIEW_NOT_INDEPENDENT、E_REWORK_LIMIT、E_EFFECT_UNKNOWN。
 继续复用既有身份、跨 run、SQLite busy/transaction 错误码；任何错误都不降低证据门槛。
@@ -173,7 +181,7 @@ approve_plan、request_tests、request_delivery、resume、accept/reject 的模�
 B/C 共用同一 SQLite；阶段转换、C effect 意图、B reserveEffect 创建的资源预约/request 及 C request 引用在同一写事务提交，不存在两次提交之间的关联缺口。
 立即准入时 attempt 引用也在该事务写入；排队后的异步准入按稳定 effectId 在同一准入事务补齐 C attemptId/generation，关联完成后才可派发。
 外部 runner/PR 调用在数据库提交后进行；数据库与外部系统仍不承诺 exactly-once。
-C 只在 B 返回当前有效准入后驱动 effect 适配器；回执同时绑定 effect、attemptId/generation，旧回执不能结算新 attempt。
+C 只在 B 返回当前有效准入后驱动 effect 适配器；回执同时绑定 effect、attemptId/generation，旧回执不能结算新 attempt。原生/PTC 工具事件的 source_event_key 绑定实际 session/turn/step 及可核验的 session-log seq、surfaceOp/原始事件引用（如实际提供 `sourceEventSeqs`），不能仅依赖 callId/subCallId；展示 replacement 的新 seq 归回原始逻辑调用，不得触发新执行/effect。缺少可靠来源关联时能力不明、不可采信。service/runner/PR 事件绑定 operation_key、attempt/generation 与 adapter receipt 身份。单个失败/取消观察事件不能结算或释放 holds，但持久结果和 quiescence 证明齐备时可结算 failed/cancelled 并释放，否则保持 unknown 与占用。
 恢复先读取 workflow/effect，再对账 B attempt/资源、runner job 和 PR；已落盘成功回执只折叠一次。
 unknown 不自动重发、不提前释放资源；没有可靠 lookup 时阻塞并交主代理确认外部状态。
 PR 对账同时使用操作标记、仓库、base/head 身份；仅分支同名不足以证明是同一次发布。
@@ -199,6 +207,7 @@ PR 对账同时使用操作标记、仓库、base/head 身份；仅分支同名�
 | C12 | 真宿主重启/卸载重启用、深度 2 身份恢复、日志持久化、授权测试仓库 PR 发布闭环可追溯。 |
 
 独立状态机/假适配器测试与真实 DSH 集成分别报告；前者通过不能表述为自动执行/交付已完成。
+实施前接口阻断项及解除证据见 [0.2 宿主复核第 4 节](../research/2026-09-30-dsh-0.2-bc-host-contracts.md#4-实施前阻断项与解除条件) H01–H06、C01–C02：创建/setup 身份关联、持久事件与 flush、输入封锁、子树回收、冷恢复、隔离资源，以及 B 端口和可信 runner/PR 协议。未解除时阻断对应适配器/部署方案定稿，离线核心可先实现；相应集成阶段保持 blocked。B 的完整真实上线验收与 C 的生产启用验收仍是独立门槛。工作流 receipt/runner/PR 适配器实现和端到端授权测试仓库验收均尚未完成。
 生产启用需要已验证 B 适配器、身份恢复、隔离仓库快照、持久 runner 回执、产物存储和 PR provider 适配器。
 先在数据库副本验证迁移与读写兼容，准备应用/数据库成对恢复；运行升级库后运维禁止旧程序继续写入。
 新代码拒绝未知未来 schema；不能声称新增迁移会使历史旧二进制自动拒绝新库，回滚必须恢复匹配的旧应用与旧数据库备份。

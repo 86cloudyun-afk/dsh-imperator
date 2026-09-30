@@ -29,6 +29,8 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
     'lifecycle.test.mjs', 'verify-runner.test.mjs', 'deliberate-orchestration.test.mjs',
     'guard-causality.test.mjs',
+    'store-scope-integrity.test.mjs', 'sqlite-failure-safety.test.mjs',
+    'working-state.test.mjs', 'process-runner.test.mjs',
   ])
   assert(calls.every(({ file, args, options }) => file === process.execPath
     && args.slice(args[0] === '--test' ? 1 : 0).every(isAbsolute)

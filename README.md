@@ -63,7 +63,7 @@ agent 平面（lib/preset.js 的 28 行）
 
 - 位置：`$DSH_HOME/taskforce/taskforce.db`（`config.root` > `$TASKFORCE_HOME` > `$DSH_HOME/taskforce` > `$HOME/.dsh/taskforce`）
 - 表：`task` / `fact`（kind ∈ fact,artifact,decision,blocker；confidence ∈ CONFIRMED,PLAUSIBLE,REFUTED）/ `handoff` + 视图 `v_task_board`
-- 服务 API（`ctx.taskforceStore`）：`openTask` / `claimTask` / `recordFact` / `recordHandoff` / `closeTask` / `submitTask` / `acceptTask` / `rejectTask` / `taskOf` / `board` / `stats`
+- 服务 API（`ctx.taskforceStore`）：`openTask` / `claimTask` / `recordFact` / `recordHandoff` / `closeTask` / `submitTask` / `acceptTask` / `rejectTask` / `taskOf` / `board` / `stats` / `workingState`
 - 模型可见工具（**10 个**）：`task_open` / `task_claim` / `task_fact` / `task_submit` / `task_accept` / `task_reject` / `task_close`（`submit` 的兼容别名）/ `task_board` / **`task_child_send`** / **`task_child_stop`**
 - 子代理控制是**独立平面**：`send_message` / `interrupt_agent` 属于 Agent Teams 的 teammate，**不能**用子代理 id 去填（会得 `active teammate not found`）。本包自带直连 `ctx.subagents` 的两个工具。详见 `docs/CONTROL.md`。
 
@@ -88,10 +88,14 @@ agent 平面（lib/preset.js 的 28 行）
 
 > 推理长度和没有可见输出不能证明思考无效。观察模式保护正常研究，但也不自动终止真实的零输出循环；宿主的超时、取消和预算控制仍然必要。
 
+## 整仓可靠性补强
+
+见 [整仓补强与验收边界](docs/PROJECT_HARDENING.md)：事实与任务双重归属过滤、异常验收保护、回滚失败的连接清理、单查询工作投影、派发估计去重和超时判定。CI 保留与实际检出版本绑定的源码及日志验证包 7 天；不是部署记录或真实模型效果报告。
+
 ## 自测
 
 ```bash
-npm test                     # 六套独立脚本 + 六个 node:test 文件；宿主集成标 UNVERIFIED
+npm test                     # 六套独立脚本 + 显式列出的 node:test 回归套件；宿主集成标 UNVERIFIED
 npm run test:integration     # 真实 DSH profile/安装目录；宿主缺失或结构校验器缺失会失败
 npm run test:all             # 两层都运行；必须全部通过才退出 0
 node tools/verify-preset.mjs [profileDir] --install-dir /opt/dsh/install/node_modules

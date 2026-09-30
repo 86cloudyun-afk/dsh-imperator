@@ -135,7 +135,7 @@ export async function verifyIsolation({ installAnchor, installDir } = {}) {
     })
     await check('a standard-selected session resumes from persistence without TaskForce policy', async () => {
       const id = switching.agent.id
-      assert.equal(await switching.agent.session.flush(), true)
+      assert.equal(await switching.agent.ctx.sessions.flush(switching.agent.session), true)
       await dispose(switching)
       const handle = await agents.resume({ resumeSessionId: id, setup: async (ctx, agent) => {
         const selected = app.ctx.sessionProjections.stateOf(agent.session, 'agentPreset')

@@ -18,7 +18,7 @@
 
 ## 验证与真实宿主验收
 
-在包根目录运行 `npm test`，它顺序执行六套独立脚本和明确列出的五个 `node:test` 文件；输出中的 `host integration: UNVERIFIED` 表示宿主没有参与，独立项全通过时进程退出 0。`npm run test:integration` 仅运行宿主预设验证；`npm run test:all` 同时要求两层成功。每个子进程最多 60 秒，独立失败仍会继续收集剩余结果。集成模式缺 profile、registry、`entryListProblem` 或任何必需模块时必须退出非零。需要自定义宿主路径时直接执行：
+在包根目录运行 `npm test`，它顺序执行六套独立脚本和明确列出的 `node:test` 回归套件；输出中的 `host integration: UNVERIFIED` 表示宿主没有参与，独立项全通过时进程退出 0。`npm run test:integration` 仅运行宿主预设验证；`npm run test:all` 同时要求两层成功。每个直接子进程的执行期限为 60 秒，超时先发 SIGTERM，500 毫秒宽限后仍未退出则发 SIGKILL；退出码为零也不能把已超时的结果判成通过。该控制不是任意后代进程树的回收保证。独立失败仍会继续收集剩余结果。集成模式缺 profile、registry、`entryListProblem` 或任何必需模块时必须退出非零。需要自定义宿主路径时直接执行：
 
 ```bash
 node tools/verify-all.mjs --mode=all --profile-dir /opt/dsh/home/profiles/web --install-dir /opt/dsh/install/node_modules
@@ -32,3 +32,5 @@ CI 在 Ubuntu 24.04 的 Node 22.23.2 和 24.19.0 上运行离线检查；它不�
 4. 卸载插件后重新启用，确认注册一次、无残留占位或重复声明；人为使下一次注册失败并确认能在再次启用时恢复。分别记录 unload、失败、重启用和 boot 日志。
 
 当前工作环境没有必需的真实宿主文件：上述 boot roster、提交验收、重启用和注册失败恢复仍是**未验证**，不能用模拟测试替代。
+
+补充：已知 async / generator 回调在调用前被拒绝；普通回调返回原生 Promise 时同步拒绝并消费其拒绝结果，不能取消用户预先安排的异步副作用。回滚失败先清理连接，再添加诊断；原始抛出值不可修改时以 cause 保留。完整范围与验收见 [整仓补强](PROJECT_HARDENING.md)。

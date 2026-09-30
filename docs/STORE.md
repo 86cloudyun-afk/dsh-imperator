@@ -25,6 +25,12 @@
 | E 零执行证据也能验收 | `task_open → task_submit → task_accept`（无认领者 / 无事实 / 无产物 / 无证据）仍得 `accepted` | **验收门槛**：至少一条属于该任务的 `fact` / `artifact`（或带 `evidence_path` 的产物指针），否则**拒绝**（`E_EVIDENCE_MISSING`）；无法产出证据时走 `waiver_reason` 显式人工豁免 |
 | F 系统记录冒充已验证事实 | 自动写入的「验收通过：（无附注）」是 `CONFIRMED`，`evidence` 为 null | 验收 / 打回记录统一为 **`decision` + `PLAUSIBLE`**，`evidence` 如实为空，并列出被采信的依据事实 id；豁免记录标「人工豁免」 |
 
+## 归属一致性补充（2026-09-30）
+
+任务详情、事实摘要、交接记录、计数、证据筛选、晚到阻塞与 `v_run_board` 同时校验附属行和任务的 run。`NULL` 与具体 run 不混用。默认看板和详情板新增 `scope_integrity`，只列本 run 任务 ID 及归属异常行数，不暴露异域内容；包括已验收任务的异常，不会因任务离开待办而隐去。原始数据和历史结论不自动修改。验收遇到异常报 `E_STORE_INTEGRITY`，`waiver_reason` 不能绕过。应先备份并人工核对数据归属，不能自动重试。旧 `v_task_board` 保留历史形状与口径，不是 run 隔离接口。
+
+`workingState(runId)` 是供每步投影使用的只读服务方法（不是新增模型工具）：单个 SQL 快照返回 `factCount`、全部待办状态的 `activeTasks` 和可选的 `{id,title}` 当前任务，不展开事实正文。详见 [整仓补强](PROJECT_HARDENING.md)。
+
 ## 一、数据位置与时序
 
 | 项 | 值 |

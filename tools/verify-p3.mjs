@@ -320,12 +320,12 @@ eq('选错通道（tool-result）会低估为在飞 0（文档已标注的单向
 eq('两条通道的原始计数都在（便于核对）', [byNotice.settledNotices, byResult.delegatedResults], [1, 2])
 
 const lineNoStore = wc.renderWorkingContext(wcEvents)
-eq('无 store 降级（事实数 = 结算通知数 = 1）', lineNoStore, '[任务部队: 在飞 2 · 当前任务 #7 "重构解析器" · 最近事实 1 条]')
+eq('无 store 降级（结算通知不是证据事实）', lineNoStore, '[任务部队: 未结算派发估计 2 · 当前任务 #7 "重构解析器" · 已收结算通知 1 条]')
 
 const lineWithStore = wc.renderWorkingContext(wcEvents, {
   store: { wave: 3, facts: ['a', 'b', 'c'] },
 })
-eq('带 store（波次 3 / 事实 3 条）', lineWithStore, '[任务部队: 波次 3 · 在飞 2 · 当前任务 #7 "重构解析器" · 最近事实 3 条]')
+eq('带 store（波次 3 / 事实 3 条）', lineWithStore, '[任务部队: 波次 3 · 未结算派发估计 2 · 当前任务 #7 "重构解析器" · 事实 3 条]')
 check('空状态不注入（返回 undefined）', wc.renderWorkingContext([]) === undefined, String(wc.renderWorkingContext([])))
 check('坏 store 不抛错、降级到事件折叠', (() => {
   try {
@@ -572,7 +572,7 @@ section('I. 真机端到端：真实事实库 → 行渲染')
       check('波次：store 无此概念 ⇒ 字段缺席', state.wave === undefined, String(state.wave))
 
       const line = wc.renderWorkingContext(wcEvents, { store })
-      eq('真实 store 下的整行', line, `[任务部队: 在飞 2 · 当前任务 #${t1.task_id} "重构解析器" · 最近事实 2 条]`)
+      eq('真实 store 下的整行', line, `[任务部队: 未结算派发估计 2 · 当前任务 #${t1.task_id} "重构解析器" · 事实 2 条]`)
       console.log(`       渲染结果: ${line}`)
       console.log(`       store 读取: ${JSON.stringify(state)}`)
     } finally {

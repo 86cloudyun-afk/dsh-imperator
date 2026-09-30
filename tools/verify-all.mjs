@@ -14,13 +14,36 @@ const TESTS = [
   'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
   'lifecycle.test.mjs', 'verify-runner.test.mjs', 'deliberate-orchestration.test.mjs',
   'guard-causality.test.mjs',
+  'store-scope-integrity.test.mjs', 'sqlite-failure-safety.test.mjs',
+  'working-state.test.mjs', 'process-runner.test.mjs',
+  'context-boundaries.test.mjs', 'board-batching.test.mjs',
+  'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
 ]
 
-function defaultRunProcess(file, args, options) {
+/** Run one direct child with an explicit deadline and bounded termination grace. */
+export function defaultRunProcess(file, args, options = {}) {
+  const { timeout = 60_000, ...spawnOptions } = options
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647) {
+    throw new TypeError('Process timeout must be a positive 32-bit millisecond integer')
+  }
   return new Promise((resolveResult, reject) => {
-    const child = spawn(file, args, { ...options, stdio: 'inherit' })
-    child.once('error', reject)
-    child.once('close', (exitCode) => resolveResult({ exitCode }))
+    const child = spawn(file, args, { ...spawnOptions, stdio: 'inherit' })
+    let timedOut = false
+    let forceTimer
+    const timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) return
+      timedOut = true
+      child.kill('SIGTERM')
+      forceTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      }, 500)
+    }, timeout)
+    const cleanup = () => { clearTimeout(timer); clearTimeout(forceTimer) }
+    child.once('error', error => { cleanup(); reject(error) })
+    child.once('close', (exitCode, signal) => {
+      cleanup()
+      resolveResult({ exitCode, signal, timedOut })
+    })
   })
 }
 
@@ -33,7 +56,10 @@ export async function runVerification({ mode = 'offline', profileDir = '/opt/dsh
     try {
       const outcome = await runProcess(process.execPath, args, { cwd: ROOT, shell: false, timeout: 60_000 })
       const exitCode = Number.isInteger(outcome?.exitCode) ? outcome.exitCode : null
-      results.push({ name, status: exitCode === 0 ? 'passed' : 'failed', exitCode })
+      const interrupted = outcome?.timedOut === true || Boolean(outcome?.signal)
+      results.push({ name, status: exitCode === 0 && !interrupted ? 'passed' : 'failed', exitCode,
+        ...(outcome?.timedOut === true ? { timedOut: true } : {}),
+        ...(outcome?.signal ? { signal: outcome.signal } : {}) })
     } catch (error) {
       results.push({ name, status: 'failed', exitCode: Number.isInteger(error?.code) ? error.code : null })
     }
@@ -64,8 +90,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   try {
     const { ok, results } = await runVerification({ mode: value('--mode') ?? 'offline',
       profileDir: value('--profile-dir'), installDir: value('--install-dir') })
-    for (const { name, status, exitCode } of results) {
-      console.log(`${name}: ${status.toUpperCase()}${exitCode === null ? '' : ` (exit ${exitCode})`}`)
+    for (const { name, status, exitCode, timedOut, signal } of results) {
+      console.log(`${name}: ${status.toUpperCase()}${exitCode === null ? '' : ` (exit ${exitCode})`}${timedOut ? ' (timeout)' : ''}${signal ? ` (${signal})` : ''}`)
     }
     process.exitCode = ok ? 0 : 1
   } catch (error) {

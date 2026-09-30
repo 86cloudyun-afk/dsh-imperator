@@ -10,6 +10,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     strategy:
+      fail-fast: false
       matrix:
         node: ['22.23.2', '24.19.0']
     steps:
@@ -19,4 +20,27 @@ jobs:
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
-      - run: npm test
+      - name: Record verification inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/taskforce-verification"
+          mkdir -p "$evidence"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$evidence/tree.txt"
+          git ls-tree -r HEAD > "$evidence/tracked-tree.txt"
+          git archive --format=tar.gz --output="$evidence/source.tar.gz" HEAD
+          { node --version; npm --version; } > "$evidence/runtime.txt"
+      - name: Run npm test
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm test 2>&1 | tee "$RUNNER_TEMP/taskforce-verification/offline.log"
+      - name: Preserve verification evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: taskforce-verify-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.node }}
+          path: ${{ runner.temp }}/taskforce-verification/
+          if-no-files-found: error
+          retention-days: 7

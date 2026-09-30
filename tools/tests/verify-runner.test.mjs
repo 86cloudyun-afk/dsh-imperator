@@ -34,7 +34,7 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'context-boundaries.test.mjs', 'board-batching.test.mjs',
     'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
     'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
-    'integration-contract.test.mjs', 'package-delivery.test.mjs',
+    'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
   ])
   assert(calls.every(({ file, args, options }) => file === process.execPath
     && args.slice(args[0] === '--test' ? 1 : 0).every(isAbsolute)
@@ -125,7 +125,7 @@ test('integration runs actual boot separately and cannot hide a boot failure beh
     } })
   assert.equal(result.ok, false)
   assert.deepEqual(result.results.map(row => [row.name, row.status]), [
-    ['preset contract', 'passed'], ['native boundaries', 'passed'], ['host integration', 'failed'],
+    ['preset contract', 'passed'], ['native boundaries', 'passed'], ['host integration', 'failed'], ['preset isolation', 'passed'],
   ])
   assert.equal(calls[1].options.env.DSH_INSTALL_ANCHOR, anchor)
   assert.ok(calls[2].args[0].endsWith('verify-host.mjs'))

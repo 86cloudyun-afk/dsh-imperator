@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-taskforce",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "description": "任务部队：主会话研究决策、子代理按需执行的多 agent 生产工具（DSH agent preset）",

@@ -2,23 +2,23 @@
 
 ## 交付目标
 
-本版将 PR #4/#5 的研究型主会话、思考保护、归属隔离、快照读取与恢复补强，与 PR #6 的 DSH 原生兼容、PTC 执行守卫、两层委派和审计换人整合。包版本为 0.2.0，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
+本版将 PR #4/#5 的研究型主会话、思考保护、归属隔离、快照读取与恢复补强，与 PR #6 的 DSH 原生兼容、PTC 执行守卫、两层委派和审计换人整合。包版本为 0.2.1，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
 
 可交付口径是：完整离线测试、原生契约与执行边界、实际隔离 web boot、任务工具闭环、卸载恢复、异常清理以及打包后验收通过。不是“没有任何未知缺陷”的保证，也不包含生产服务器部署或外部模型效果验收。
 
 ## 包含内容与核验
 
-`local-dsh-taskforce-0.2.0.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
+`local-dsh-taskforce-0.2.1.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
 
 ```sh
 mkdir taskforce-candidate
-tar -xzf local-dsh-taskforce-0.2.0.tgz -C taskforce-candidate
+tar -xzf local-dsh-taskforce-0.2.1.tgz -C taskforce-candidate
 cd taskforce-candidate/package
 npm test
 npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.json
 ```
 
-anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省略时可从 PATH 的 dsh 查找。显式错误路径会失败。`test:all` 的三个原生结果必须均为 PASSED，并出现 HOST_VERIFIED；单独的离线退出 0、SKIP 或 UNVERIFIED 不代表原生通过。
+anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省略时可从 PATH 的 dsh 查找。显式错误路径会失败。`test:all` 的四个原生结果必须均为 PASSED，并出现 HOST_VERIFIED 和 ISOLATION_VERIFIED；单独的离线退出 0、SKIP 或 UNVERIFIED 不代表原生通过。
 
 验证会创建独立临时 DSH_HOME，绑定回环地址临时端口，关闭浏览器和访问 URL 输出，并完成清理；不向模型投入消息，不读取已有实例的任务数据。只读元数据及测试结果在日志中出现，不输出模型密钥或访问令牌。
 
@@ -29,7 +29,7 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 在确认目标 profile 后，以其管理员身份安装经校验的本地包，例如 web profile：
 
 ```sh
-dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.2.0.tgz
+dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.2.1.tgz
 dsh --profile web --dump-config
 ```
 
@@ -48,3 +48,5 @@ ECHO 采用调用发起顺序，晚到旧成功不清空新失败；native/PTC �
 阶段 B/C 持久调度器与自动开发仍未实现；执行者的文件权限也不由服务层 run 隔离代替。实际模型输出、长时并发、费用、其他宿主版本和用户生产环境不在隔离无模型验收范围内。历史报告记录其候选版本；新版本状态以精确提交对应的 CI 与验收记录为准。
 
 CLI 机制参考：[官方 DSH 包说明](https://www.npmjs.com/package/@deepseek-ai/dsh)。固定版本实际安装与运行证据由 CI 记录。
+
+0.2.1 补充修复 issue #7：退出 TaskForce 后撤销本插件作用域限制，并阻止等待中的 TaskForce 钩子向已切换的会话注入消息。标准模式隔离是本版交付门槛；历史 0.2.0 包不包含此修复。见 `PRESET_ISOLATION.md`。

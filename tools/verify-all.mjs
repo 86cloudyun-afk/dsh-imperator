@@ -20,7 +20,7 @@ const TESTS = [
   'context-boundaries.test.mjs', 'board-batching.test.mjs',
   'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
   'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
-  'integration-contract.test.mjs', 'package-delivery.test.mjs',
+  'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */
@@ -85,6 +85,7 @@ export async function runVerification({ mode = 'offline', profileDir,
     await run('native boundaries', ['--test', join(HERE, 'tests/host-boundaries.test.mjs'), join(HERE, 'tests/host-runtime.test.mjs')],
       { ...process.env, DSH_INSTALL_ANCHOR: anchor })
     await run('host integration', [join(HERE, 'verify-host.mjs'), '--install-anchor', anchor])
+    await run('preset isolation', [join(HERE, 'verify-isolation.mjs'), '--install-anchor', anchor])
   }
   return { ok: results.every(({ status }) => status === 'passed' || (mode === 'offline' && status === 'unverified')),
     results }

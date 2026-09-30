@@ -1,7 +1,7 @@
 # 任务部队（taskforce）· DSH 多 agent 生产工具
 
 > **主会话研究决策，子代理按需执行。**
-> TaskForce `0.2.0`；验收目标为官方 DSH `0.2.0-rc.2`，Node 22/24。
+> TaskForce `0.2.1`；验收目标为官方 DSH `0.2.0-rc.2`，Node 22/24。
 
 一个 DeepSeek Harness 的 **agent preset**（附带 host 插件）：主会话亲自做只读调查、方案比较、决策和验收，子代理负责有边界的执行任务。优先复用已有执行者，不再为每个信息缺口新建代理；写文件、命令执行和宿主变更的限制保持不变。
 
@@ -106,7 +106,7 @@ npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.
 ```
 
 不传 anchor 时可从 PATH 的 dsh 安装发现；显式路径错误时不会悄悄回退。
-`npm test` 中的宿主 UNVERIFIED 和仅宿主用例 SKIP 不算原生通过；`test:all` 要求预设契约、原生边界和真实 web boot 均成功。
+`npm test` 中的宿主 UNVERIFIED 和仅宿主用例 SKIP 不算原生通过；`test:all` 要求预设契约、原生边界、真实 web boot 和 standard/TaskForce 切换隔离均成功。
 
 ## 已知边界
 
@@ -119,3 +119,7 @@ npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.
 - 编排骨架：`dsh-redteam-mode`（github.com/Jueze-2019）—— 主会话只指挥、事实落库、汇报节流。
 - 上下文经济与退化熔断：`@linxin666/dsh-liangshen`（MIT）—— 本包的 `working-context` / `guard` / 工具面策略为**机制照搬、代码自研**。
 - preset 声明范式：bundle 插件在激活时读取包内定义并交给 `ctx.agentPresets.register`，**不往 harness home 写任何文件**（旧式 `$DSH_HOME/.agent-presets/` 目录在当前 DSH 已无人读取）。
+
+### 模式隔离（0.2.1）
+
+TaskForce 只作用于选择该预设的会话。切换回 standard/minimal 时撤销本插件自己的 guard/restrict；不会删除宿主或其他插件的安全限制。新建、并存、反复切换、持久恢复及预设重载由原生隔离验收覆盖。详见 `docs/PRESET_ISOLATION.md`。

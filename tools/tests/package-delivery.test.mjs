@@ -16,7 +16,7 @@ test('the actual npm archive includes its verification commands and delivery gui
   assert.equal(packed.name, '@local/dsh-taskforce')
   const files = packed.files.map(file => file.path)
   for (const path of ['lib/index.js', 'lib/plugins/tool-events.mjs', 'cordis.patch.yml',
-    'tools/verify-all.mjs', 'tools/verify-host.mjs', 'tools/tests/integration-contract.test.mjs', 'docs/DELIVERY.md']) {
+    'tools/verify-all.mjs', 'tools/verify-host.mjs', 'tools/verify-isolation.mjs', 'lib/plugins/scope-membership.mjs', 'tools/tests/integration-contract.test.mjs', 'docs/DELIVERY.md']) {
     assert(files.includes(path), `package is missing ${path}`)
   }
   assert(!files.some(path => /(^|\/)(\.git|node_modules|\.env)(\/|$)/.test(path)))

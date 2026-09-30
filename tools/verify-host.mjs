@@ -113,7 +113,32 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
       })
       assert.equal(foldGuardSignal(replay, { echoFailures: 3 }).signal, undefined)
     }
-    pass('native cancelled delegation and durable result replacement replay')
+    // Provider IDs may repeat in later steps. Use real failing reads with the
+    // same ID, then a real successful read to verify both sides of the chain.
+    session.append('turn/start', { turn: 2 })
+    const read = async (step, file) => {
+      session.append('step/start', { turn: 2, step })
+      const callId = 'probe-reused-id'
+      const args = { file_path: file }
+      const called = session.append('tool/call', { turn: 2, step, callId,
+        name: 'read', arguments: JSON.stringify(args) })
+      const result = await parent.agent.ctx.tools.execute({ agent: parent.agent, name: 'read',
+        callId, arguments: args, signal: new AbortController().signal })
+      session.append('tool/result', { turn: 2, step,
+        message: createToolResultMessage({ callId, content: result.content, isError: result.isError }),
+        ...(result.error?.info ? { error: result.error.info } : {}) },
+      { surfaceOp: 'append', sourceEventSeqs: [called.seq] })
+      session.append('step/end', { turn: 2, step })
+      return result
+    }
+    for (let step = 1; step <= 3; step++) {
+      assert.equal((await read(step, join(fixture.root, 'missing-replay.txt'))).isError, true)
+    }
+    assert.equal(foldGuardSignal(session.snapshotEvents(), { echoFailures: 3 }).signal, 'echo')
+    assert.equal((await read(4, artifact)).isError, false)
+    assert.equal(foldGuardSignal(session.snapshotEvents(), { echoFailures: 3 }).signal, undefined)
+    session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
+    pass('native cancelled delegation, scoped IDs and result replacement replay')
 
     const opened = await task(parent.agent, 'task_open', { title: 'native tool closure' })
     const id = opened.task_id

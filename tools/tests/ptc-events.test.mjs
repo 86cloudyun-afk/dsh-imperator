@@ -12,6 +12,14 @@ const nativeCall = (id, name = 'subagent', args = { prompt: 'work' }) => ({ type
   data: { callId: id, name, arguments: JSON.stringify(args) } })
 const nativeResult = (id, isError = false) => ({ type: 'tool/result',
   data: { message: { source: { callId: id }, isError, content: [] } } })
+const step = (turn, number, events) => [
+  { type: 'step/start', data: { turn, step: number } },
+  ...events.map(event => ['tool/call', 'tool/result'].includes(event.type)
+    ? { ...event, data: { turn, step: number, ...event.data } } : event),
+  { type: 'step/end', data: { turn, step: number } },
+]
+const turn = (number, steps) => [{ type: 'turn/start', data: { turn: number } }, ...steps.flat(),
+  { type: 'turn/end', data: { turn: number, reason: { kind: 'completed' } } }]
 
 test('failed or cancelled native delegation retires its in-flight placeholder', () => {
   const cancelled = nativeResult('cancelled', true)
@@ -176,4 +184,43 @@ for (const kind of ['native', 'ptc']) {
     events.push(settle('old-success', false, { path: 'exists' }))
     assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, undefined)
   })
+
+  test(`${kind} reused IDs in separate steps identify distinct delegation attempts`, () => {
+    const settled = kind === 'native' ? nativeResult : result
+    const events = turn(1, [step(1, 1, [call('same', 'subagent'), settled('same', true)]),
+      step(1, 2, [call('same', 'subagent'), settled('same', false)])])
+    assert.deepEqual(foldSubagentFlow(events), {
+      dispatched: 1, delegatedResults: 1, settledNotices: 0, settled: 0, inFlight: 1,
+    })
+  })
+
+  test(`${kind} same-argument failures with reused IDs across steps still trigger echo`, () => {
+    const events = turn(1, [1, 2, 3].map(number => step(1, number,
+      [call('same', 'read', { path: 'missing' }), settle('same', true)])))
+    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
+  })
+
+  test(`${kind} same-argument failures with reused IDs across turns still trigger echo`, () => {
+    const events = [1, 2, 3].flatMap(number => turn(number, [step(number, 1,
+      [call('same', 'read', { path: 'missing' }), settle('same', true)])]))
+    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
+  })
 }
+
+test('late native surface replacements stay attached to the original attempt', () => {
+  const first = step(1, 1, [nativeCall('same'), nativeResult('same', true)])
+  const rewrite = { ...first[2], surfaceOp: { op: 'replace', startSeq: 2, endSeq: 2 }, sourceEventSeqs: [2] }
+  const events = turn(1, [first, step(1, 2, [nativeCall('same'), rewrite, nativeResult('same')])])
+  assert.deepEqual(foldSubagentFlow(events), {
+    dispatched: 1, delegatedResults: 1, settledNotices: 0, settled: 0, inFlight: 1,
+  })
+  assert.equal(foldGuardSignal(events, { echoFailures: 2 }).signal, undefined)
+})
+
+test('an older PTC wrapper ID does not hide standalone run_code failures in later steps', () => {
+  const events = turn(1, [step(1, 1, [nativeCall('r', 'run_code', { code: 'wrapped tool' }),
+    start('r:ptc:1', 'read', { path: 'missing' }), result('r:ptc:1', true, 'read', { path: 'missing' }), nativeResult('r')]),
+  ...[2, 3, 4].map(number => step(1, number,
+    [nativeCall('r', 'run_code', { code: 'bad syntax' }), nativeResult('r', true)]))])
+  assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
+})

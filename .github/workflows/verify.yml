@@ -67,8 +67,8 @@ jobs:
           git ls-tree -r HEAD > "$evidence/tracked-tree.txt"
           git archive --format=tar.gz --output="$evidence/source.tar.gz" HEAD
           npm pack --offline --ignore-scripts --json --pack-destination "$evidence" > "$evidence/pack.json"
-          tar -xzf "$evidence/local-dsh-taskforce-0.2.0.tgz" -C "$RUNNER_TEMP/taskforce-unpacked"
-          (cd "$evidence" && sha256sum local-dsh-taskforce-0.2.0.tgz source.tar.gz > SHA256SUMS)
+          tar -xzf "$evidence/local-dsh-taskforce-0.2.1.tgz" -C "$RUNNER_TEMP/taskforce-unpacked"
+          (cd "$evidence" && sha256sum local-dsh-taskforce-0.2.1.tgz source.tar.gz > SHA256SUMS)
           { node --version; npm --version; } > "$evidence/runtime.txt"
           npm view @deepseek-ai/dsh@0.2.0-rc.2 version dist.integrity --json > "$evidence/dsh-package.json"
       - name: Full acceptance of unpacked deliverable (no model requests)

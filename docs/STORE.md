@@ -201,7 +201,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | 工具 | 参数 | 谁能调 | 行为 |
 |---|---|---|---|
 | `task_open` | `title`(必), `note?` | 主/子 | 开任务，归属 = 调用者的 run |
-| `task_claim` | `task_id`(必), `child_id`(必) | 主/子 | 认领（`open`/`rejected` 可认领，同 owner 幂等；**终态不可认领**，报 `E_TERMINAL`） |
+| `task_claim` | `task_id`(必), `child_id`(必) | 主/子 | `open`/`rejected` 可认领，同 owner 幂等；仅主控可在 `rejected` 时换 owner，原子写 decision 与 handoff；**终态不可认领** |
 | `task_fact` | `task_id`(必), `kind`(必, enum), `statement`(必), `evidence_path?`, `evidence_line?`, `confidence?`(enum), `resolves_fact_id?`, `child_id?` | 主/子 | 落一条事实；**终态任务上只有 `kind=blocker` 允许**（标 `late`，进 `late_blockers`），其余 `E_TERMINAL` |
 | `task_submit` | `task_id`(必), `note?` | 主/子 | **提交待验收** → `submitted` |
 | `task_accept` | `task_id`(必), `note?`, `waiver_reason?` | **仅主会话** | **验收通过** → `accepted`；有未解 blocker 一律拒绝；**无执行依据也拒绝**（`waiver_reason` = 显式人工豁免） |
@@ -228,6 +228,14 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `E_STORE_BUSY` | SQLite 写锁正忙，写事务未开始 | 稍后有限次数重试；持续繁忙则报告 |
 
 所有写动作的检查与多条写入在同一 `BEGIN IMMEDIATE` 写事务中完成；组合动作使用 savepoint。写入失败时状态、事实、时间戳和 run 归属一起回滚，认领竞争串行化后仅一个 owner 成功。同 owner 重复认领仍是幂等调用。
+
+### 驳回后的重新指派（0.2）
+
+原执行者不可用时，主会话先 `task_reject` 写明原因，再亲自调用 `task_claim` 指定新 `child_id`。
+`claimTask(input, runId, actor?)` 的第三个参数只由可信工具层根据真实调用者派生；模型参数里的 `actor` 不生效。
+只有同一 run 的 `rejected` 任务允许主控换 owner，`claimed`/`submitted` 和终态仍拒绝换人。
+换人会同时写入主控 decision 和 old→new handoff；任一写入失败整笔回滚。重复认领不会重复写审计。
+原来的两参数调用仍禁止换 owner，`recordHandoff` 仍只记录交接，不改变任务认领者。
 
 `code` 的命名**刻意避开 `E_NO_` 前缀**：工具层把 `E_NO_*` 一律当作"身份不可得"（宿主集成问题），
 用 `E_NO_EVIDENCE` 会把模型引到错误方向。

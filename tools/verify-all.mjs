@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { resolveInstallAnchor } from './host-runtime.mjs'
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
@@ -18,6 +19,8 @@ const TESTS = [
   'working-state.test.mjs', 'process-runner.test.mjs',
   'context-boundaries.test.mjs', 'board-batching.test.mjs',
   'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
+  'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
+  'integration-contract.test.mjs', 'package-delivery.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */
@@ -48,13 +51,13 @@ export function defaultRunProcess(file, args, options = {}) {
 }
 
 /** Runs independent checks and reports host checks separately. No work starts on import. */
-export async function runVerification({ mode = 'offline', profileDir = '/opt/dsh/home/profiles/web',
-  installDir = '/opt/dsh/install/node_modules', runProcess = defaultRunProcess } = {}) {
+export async function runVerification({ mode = 'offline', profileDir,
+  installDir, installAnchor, runProcess = defaultRunProcess } = {}) {
   if (!['offline', 'integration', 'all'].includes(mode)) throw new TypeError(`Unknown verification mode: ${mode}`)
   const results = []
-  async function run(name, args) {
+  async function run(name, args, env) {
     try {
-      const outcome = await runProcess(process.execPath, args, { cwd: ROOT, shell: false, timeout: 60_000 })
+      const outcome = await runProcess(process.execPath, args, { cwd: ROOT, shell: false, timeout: 60_000, ...(env ? { env } : {}) })
       const exitCode = Number.isInteger(outcome?.exitCode) ? outcome.exitCode : null
       const interrupted = outcome?.timedOut === true || Boolean(outcome?.signal)
       results.push({ name, status: exitCode === 0 && !interrupted ? 'passed' : 'failed', exitCode,
@@ -70,12 +73,18 @@ export async function runVerification({ mode = 'offline', profileDir = '/opt/dsh
     await run('node:test', ['--test', ...TESTS.map((file) => join(HERE, 'tests', file))])
   }
 
-  const registry = join(installDir, '@deepseek-ai/dsh-agent-preset-registry/lib/index.js')
-  if (mode === 'offline' || !existsSync(profileDir) || !existsSync(registry)) {
+  let anchor
+  if (mode !== 'offline' && (profileDir === undefined || existsSync(profileDir))) {
+    try { anchor = resolveInstallAnchor({ installAnchor, installDir }) } catch { /* fail closed below */ }
+  }
+  if (mode === 'offline' || anchor === undefined) {
     results.push({ name: 'host integration', status: 'unverified', exitCode: null })
   } else {
-    await run('host integration', [join(HERE, 'verify-preset.mjs'), '--profile-dir', resolve(profileDir),
-      '--install-dir', resolve(installDir)])
+    await run('preset contract', [join(HERE, 'verify-preset.mjs'), '--install-anchor', anchor,
+      ...(profileDir === undefined ? [] : ['--profile-dir', resolve(profileDir)])])
+    await run('native boundaries', ['--test', join(HERE, 'tests/host-boundaries.test.mjs'), join(HERE, 'tests/host-runtime.test.mjs')],
+      { ...process.env, DSH_INSTALL_ANCHOR: anchor })
+    await run('host integration', [join(HERE, 'verify-host.mjs'), '--install-anchor', anchor])
   }
   return { ok: results.every(({ status }) => status === 'passed' || (mode === 'offline' && status === 'unverified')),
     results }
@@ -89,7 +98,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   }
   try {
     const { ok, results } = await runVerification({ mode: value('--mode') ?? 'offline',
-      profileDir: value('--profile-dir'), installDir: value('--install-dir') })
+      profileDir: value('--profile-dir'), installDir: value('--install-dir'), installAnchor: value('--install-anchor') })
     for (const { name, status, exitCode, timedOut, signal } of results) {
       console.log(`${name}: ${status.toUpperCase()}${exitCode === null ? '' : ` (exit ${exitCode})`}${timedOut ? ' (timeout)' : ''}${signal ? ` (${signal})` : ''}`)
     }

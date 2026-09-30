@@ -44,3 +44,45 @@ jobs:
           path: ${{ runner.temp }}/taskforce-verification/
           if-no-files-found: error
           retention-days: 7
+  native-host:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '24.19.0'
+      - name: Install pinned official DSH
+        run: npm install --global --prefix "$RUNNER_TEMP/dsh-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.0-rc.2
+      - name: Pack exact deliverable and record inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/taskforce-native"
+          mkdir -p "$evidence" "$RUNNER_TEMP/taskforce-unpacked"
+          git rev-parse HEAD > "$evidence/commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$evidence/tree.txt"
+          git ls-tree -r HEAD > "$evidence/tracked-tree.txt"
+          git archive --format=tar.gz --output="$evidence/source.tar.gz" HEAD
+          npm pack --offline --ignore-scripts --json --pack-destination "$evidence" > "$evidence/pack.json"
+          tar -xzf "$evidence/local-dsh-taskforce-0.2.0.tgz" -C "$RUNNER_TEMP/taskforce-unpacked"
+          (cd "$evidence" && sha256sum local-dsh-taskforce-0.2.0.tgz source.tar.gz > SHA256SUMS)
+          { node --version; npm --version; } > "$evidence/runtime.txt"
+          npm view @deepseek-ai/dsh@0.2.0-rc.2 version dist.integrity --json > "$evidence/dsh-package.json"
+      - name: Full acceptance of unpacked deliverable (no model requests)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/taskforce-unpacked/package"
+          npm run test:all -- --install-anchor "$RUNNER_TEMP/dsh-host/lib/node_modules/@deepseek-ai/dsh/package.json" \
+            2>&1 | tee "$RUNNER_TEMP/taskforce-native/acceptance.log"
+      - name: Preserve deliverable and native acceptance evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: taskforce-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/taskforce-native/
+          retention-days: 14
+          if-no-files-found: error

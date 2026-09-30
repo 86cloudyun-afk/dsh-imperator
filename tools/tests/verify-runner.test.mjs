@@ -5,17 +5,11 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { defaultRunProcess, runVerification } from '../verify-all.mjs'
+import { runVerification } from '../verify-all.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const missingProfile = join(tmpdir(), 'taskforce-runner-no-profile')
 const missingInstall = join(tmpdir(), 'taskforce-runner-no-install')
-
-test('a real timed out child that handles SIGTERM with exit zero is still a failure', async () => {
-  await assert.rejects(defaultRunProcess(process.execPath, ['-e',
-    "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)"],
-  { cwd: root, shell: false, timeout: 200 }), { code: 'ETIMEDOUT' })
-})
 
 test('offline runs six scripts and explicit test files, then marks host integration unverified', async () => {
   const calls = []
@@ -33,8 +27,14 @@ test('offline runs six scripts and explicit test files, then marks host integrat
   assert.equal(calls[6].args[0], '--test')
   assert.deepEqual(calls[6].args.slice(1).map((path) => path.split('/').at(-1)), [
     'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
-    'lifecycle.test.mjs', 'verify-runner.test.mjs',
+    'lifecycle.test.mjs', 'verify-runner.test.mjs', 'deliberate-orchestration.test.mjs',
+    'guard-causality.test.mjs',
+    'store-scope-integrity.test.mjs', 'sqlite-failure-safety.test.mjs',
+    'working-state.test.mjs', 'process-runner.test.mjs',
+    'context-boundaries.test.mjs', 'board-batching.test.mjs',
+    'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
     'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
+    'integration-contract.test.mjs', 'package-delivery.test.mjs',
   ])
   assert(calls.every(({ file, args, options }) => file === process.execPath
     && args.slice(args[0] === '--test' ? 1 : 0).every(isAbsolute)
@@ -81,25 +81,6 @@ test('integration and all fail closed when required host files are absent', asyn
   }
 })
 
-test('integration runs actual boot separately and cannot hide a boot failure behind contract checks', async (t) => {
-  const fixture = mkdtempSync(join(tmpdir(), 'taskforce-runner-anchor-'))
-  t.after(() => rmSync(fixture, { recursive: true, force: true }))
-  const anchor = join(fixture, 'package.json')
-  writeFileSync(anchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
-  const calls = []
-  const result = await runVerification({ mode: 'integration', installAnchor: anchor,
-    runProcess: async (file, args, options) => {
-      calls.push({ file, args, options })
-      return { exitCode: args[0].endsWith('verify-host.mjs') ? 1 : 0 }
-    } })
-  assert.equal(result.ok, false)
-  assert.deepEqual(result.results.map(row => [row.name, row.status]), [
-    ['preset contract', 'passed'], ['native boundaries', 'passed'], ['host integration', 'failed'],
-  ])
-  assert.equal(calls[1].options.env.DSH_INSTALL_ANCHOR, anchor)
-  assert.ok(calls[2].args[0].endsWith('verify-host.mjs'))
-})
-
 test('CLI locates its own package from an unrelated cwd and exits nonzero on missing host', (t) => {
   const cwd = mkdtempSync(join(tmpdir(), 'taskforce-runner-cwd-'))
   t.after(() => rmSync(cwd, { recursive: true, force: true }))
@@ -129,4 +110,23 @@ test('preset CLI accepts positional profile and install flag, rejecting missing 
     assert.doesNotMatch(error.stdout, /全绿/)
     return true
   })
+})
+
+test('integration runs actual boot separately and cannot hide a boot failure behind contract checks', async (t) => {
+  const fixture = mkdtempSync(join(tmpdir(), 'taskforce-runner-anchor-'))
+  t.after(() => rmSync(fixture, { recursive: true, force: true }))
+  const anchor = join(fixture, 'package.json')
+  writeFileSync(anchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
+  const calls = []
+  const result = await runVerification({ mode: 'integration', installAnchor: anchor,
+    runProcess: async (file, args, options) => {
+      calls.push({ file, args, options })
+      return { exitCode: args[0].endsWith('verify-host.mjs') ? 1 : 0 }
+    } })
+  assert.equal(result.ok, false)
+  assert.deepEqual(result.results.map(row => [row.name, row.status]), [
+    ['preset contract', 'passed'], ['native boundaries', 'passed'], ['host integration', 'failed'],
+  ])
+  assert.equal(calls[1].options.env.DSH_INSTALL_ANCHOR, anchor)
+  assert.ok(calls[2].args[0].endsWith('verify-host.mjs'))
 })

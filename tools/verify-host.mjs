@@ -75,6 +75,26 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal(written.isError, false, written.error?.message)
     assert.equal(readFileSync(artifact, 'utf8'), 'verified artifact\n')
     pass('real root tool boundary and child file execution')
+    // Verify the live service, not an assumed global depth default.
+    const { Config: subagentConfig } = await nativeModule(anchor, '@deepseek-ai/dsh-tool-subagent')
+    const runtime = parent.agent.ctx.get('subagents')
+    for (const row of TASKFORCE_DEFINITION.plugins.find(row => row.id === 'delegation').config
+      .filter(row => row.name === '@deepseek-ai/dsh-tool-subagent')) {
+      assert.equal(runtime.resolveMaxDepth(subagentConfig(row.config).maxDepth), 2, row.id)
+    }
+    pass('live spawn and fork depth are both two')
+
+    // Hiding run_code in native presentation is not sufficient protection.
+    const forbidden = join(fixture.root, 'root-ptc-must-not-write.txt')
+    try {
+      parent.agent.ctx.tools.presentAs('both')
+      const denied = await execute(parent.agent, 'run_code', { description: 'isolated boundary regression',
+        code: `await (await import('node:fs/promises')).writeFile(${JSON.stringify(forbidden)}, 'must not exist'); return 'done';` })
+      assert.equal(denied.isError, true)
+      assert.equal(existsSync(forbidden), false)
+    } finally { parent.agent.ctx.tools.presentAs('native') }
+    pass('root PTC boundary survives presentation changes')
+
 
     // A real provider call cancelled before dispatch cannot create a child or
     // contact an LLM. Persist its outcome exactly as native AgentLoop does.
@@ -109,7 +129,7 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal(events.filter(event => event.type === 'tool/result').length, 3)
     for (const replay of [events, JSON.parse(JSON.stringify(events))]) {
       assert.deepEqual(foldSubagentFlow(replay), {
-        dispatched: 0, settledNotices: 0, delegatedResults: 0, settled: 0, inFlight: 0,
+        dispatched: 1, settledNotices: 0, delegatedResults: 1, failedDispatches: 1, settled: 0, inFlight: 0,
       })
       assert.equal(foldGuardSignal(replay, { echoFailures: 3 }).signal, undefined)
     }

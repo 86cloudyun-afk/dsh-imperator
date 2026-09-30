@@ -1,9 +1,9 @@
 #!/usr/bin/env node
+import { resolveInstallAnchor } from './host-runtime.mjs'
 import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { resolveInstallAnchor } from './host-runtime.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
@@ -13,28 +13,39 @@ const SCRIPTS = [
 ]
 const TESTS = [
   'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
-  'lifecycle.test.mjs', 'verify-runner.test.mjs',
+  'lifecycle.test.mjs', 'verify-runner.test.mjs', 'deliberate-orchestration.test.mjs',
+  'guard-causality.test.mjs',
+  'store-scope-integrity.test.mjs', 'sqlite-failure-safety.test.mjs',
+  'working-state.test.mjs', 'process-runner.test.mjs',
+  'context-boundaries.test.mjs', 'board-batching.test.mjs',
+  'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
   'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
+  'integration-contract.test.mjs', 'package-delivery.test.mjs',
 ]
 
-export function defaultRunProcess(file, args, options) {
+/** Run one direct child with an explicit deadline and bounded termination grace. */
+export function defaultRunProcess(file, args, options = {}) {
+  const { timeout = 60_000, ...spawnOptions } = options
+  if (!Number.isSafeInteger(timeout) || timeout < 1 || timeout > 2_147_483_647) {
+    throw new TypeError('Process timeout must be a positive 32-bit millisecond integer')
+  }
   return new Promise((resolveResult, reject) => {
-    const { timeout, ...launch } = options
-    const child = spawn(file, args, { ...launch, stdio: 'inherit' })
+    const child = spawn(file, args, { ...spawnOptions, stdio: 'inherit' })
     let timedOut = false
-    let forceKill
-    const deadline = timeout === undefined ? undefined : setTimeout(() => {
+    let forceTimer
+    const timer = setTimeout(() => {
+      if (child.exitCode !== null || child.signalCode !== null) return
       timedOut = true
       child.kill('SIGTERM')
-      // A stuck shutdown must not keep the verification runner alive forever.
-      forceKill = setTimeout(() => child.kill('SIGKILL'), 1000)
+      forceTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+      }, 500)
     }, timeout)
-    const clear = () => { clearTimeout(deadline); clearTimeout(forceKill) }
-    child.once('error', (error) => { clear(); reject(error) })
-    child.once('close', (exitCode) => {
-      clear()
-      if (timedOut) reject(Object.assign(new Error('Verification child timed out'), { code: 'ETIMEDOUT' }))
-      else resolveResult({ exitCode })
+    const cleanup = () => { clearTimeout(timer); clearTimeout(forceTimer) }
+    child.once('error', error => { cleanup(); reject(error) })
+    child.once('close', (exitCode, signal) => {
+      cleanup()
+      resolveResult({ exitCode, signal, timedOut })
     })
   })
 }
@@ -48,7 +59,10 @@ export async function runVerification({ mode = 'offline', profileDir,
     try {
       const outcome = await runProcess(process.execPath, args, { cwd: ROOT, shell: false, timeout: 60_000, ...(env ? { env } : {}) })
       const exitCode = Number.isInteger(outcome?.exitCode) ? outcome.exitCode : null
-      results.push({ name, status: exitCode === 0 ? 'passed' : 'failed', exitCode })
+      const interrupted = outcome?.timedOut === true || Boolean(outcome?.signal)
+      results.push({ name, status: exitCode === 0 && !interrupted ? 'passed' : 'failed', exitCode,
+        ...(outcome?.timedOut === true ? { timedOut: true } : {}),
+        ...(outcome?.signal ? { signal: outcome.signal } : {}) })
     } catch (error) {
       results.push({ name, status: 'failed', exitCode: Number.isInteger(error?.code) ? error.code : null })
     }
@@ -61,7 +75,7 @@ export async function runVerification({ mode = 'offline', profileDir,
 
   let anchor
   if (mode !== 'offline' && (profileDir === undefined || existsSync(profileDir))) {
-    try { anchor = resolveInstallAnchor({ installAnchor, installDir }) } catch { /* report unverified below */ }
+    try { anchor = resolveInstallAnchor({ installAnchor, installDir }) } catch { /* fail closed below */ }
   }
   if (mode === 'offline' || anchor === undefined) {
     results.push({ name: 'host integration', status: 'unverified', exitCode: null })
@@ -85,8 +99,8 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   try {
     const { ok, results } = await runVerification({ mode: value('--mode') ?? 'offline',
       profileDir: value('--profile-dir'), installDir: value('--install-dir'), installAnchor: value('--install-anchor') })
-    for (const { name, status, exitCode } of results) {
-      console.log(`${name}: ${status.toUpperCase()}${exitCode === null ? '' : ` (exit ${exitCode})`}`)
+    for (const { name, status, exitCode, timedOut, signal } of results) {
+      console.log(`${name}: ${status.toUpperCase()}${exitCode === null ? '' : ` (exit ${exitCode})`}${timedOut ? ' (timeout)' : ''}${signal ? ` (${signal})` : ''}`)
     }
     process.exitCode = ok ? 0 : 1
   } catch (error) {

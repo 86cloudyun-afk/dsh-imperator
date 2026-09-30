@@ -60,6 +60,10 @@ test('malformed historical resolutions never hide blockers in readers or accepta
   assert.equal(store.stats(run).blockers_open, 1)
   assert.equal(store.statsAllRuns().blockers_open, 1)
   assert.equal(store.handle.prepare('SELECT blockers_open FROM v_run_board WHERE id = ?').get(id).blockers_open, 1)
+  assert.throws(() => store.acceptTask({ task_id: id }, run, 'lead'), { code: 'E_STORE_INTEGRITY' })
+  // Correcting only the foreign association must not make the other malformed
+  // resolutions valid. The genuine same-run blocker still prevents acceptance.
+  store.handle.prepare('DELETE FROM fact WHERE task_id = ? AND run_id = ?').run(id, 'run-b')
   assert.throws(() => store.acceptTask({ task_id: id }, run, 'lead'), /未解 blocker/)
   // The legacy view deliberately reports the historical total, independent of resolution validity.
   assert.equal(store.handle.prepare('SELECT blockers FROM v_task_board WHERE id = ?').get(id).blockers, 1)

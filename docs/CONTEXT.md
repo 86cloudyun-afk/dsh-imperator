@@ -1,4 +1,8 @@
+> 0.2 整合说明：当前策略以 ORCHESTRATION.md 与 DELIVERY.md 为准；下文旧宿主诊断为历史机制说明，不是当前推理降档配置。
+
 # 任务部队 · P3 上下文纪律三件（一页说明）
+
+> **历史设计记录提示（2026-09-30）**：本页含早期 P3 现场记录，不代表当前配置。当前主会话允许只读研究；权限收窄由过滤与执行守卫共同完成，单独 `parentSession` 不再视作子代理，失败重试不设旧版八次上限。TaskForce 默认 STALL 观察、不降档；工作投影使用单查询、派发估计与事实计数分列。现行说明见 [研究型编排](ORCHESTRATION.md) 和 [整仓补强](PROJECT_HARDENING.md)。
 
 三个 preset-local 插件，零依赖、零构建、纯 ESM。全部只监听宿主事件，**不 `provide()` 任何服务**
 （那会要求 isolate realm，而它们不在 group 里）。
@@ -95,7 +99,7 @@ echoFailures:5}`（自测实测）。要更早介入的操作员显式改成 `ba
 
 **PTC 兼容**：按 `subCallId` 配对内层 start/dispatch；重复内层失败可触发 ECHO，成功的外层 run_code 不清空该链。没有内层派发的传输语法/执行失败仍按普通调用折叠。
 
-**回执配对与去重**：原生与 PTC 使用各自 id 空间，并按 turn/step 区分不同调用；宿主允许后续步骤复用 provider id。同一次调用的结果只消费一次，原生 surface replacement 保留原结果的 turn/step，不增加失败次数。PTC 的步骤从包围它的生命周期/外层调用取得，外层传输也按步骤判断，不能因旧步骤同名 id 而被忽略。参数签名递归排序对象键，保留数组顺序和实际值；同参并发失败可乱序结算。不同调用切断旧错误链；任何已配对的真实成功都清零，旧链迟到的错误不重新累积。缺少 id 或没有对应调用的结果不用于推断 ECHO。
+**回执配对与去重**：原生与 PTC 使用各自 id 空间，并按 turn/step 区分不同调用；宿主允许后续步骤复用 provider id。同一次调用的结果只消费一次，原生 surface replacement 保留原结果的 turn/step，不增加失败次数。PTC 的步骤从包围它的生命周期/外层调用取得，外层传输也按步骤判断，不能因旧步骤同名 id 而被忽略。参数签名递归排序对象键，保留数组顺序和实际值；同参并发失败可乱序结算。不同调用切断旧错误链；按调用发起顺序计算末尾连续失败；旧调用成功不能抹掉较新失败，旧失败不能越过新成功。缺少 id 或没有对应调用的结果不用于推断 ECHO。
 
 **无信号时绝不改写请求**：唯一被改的字段是 `reasoningEffort`（请求参数，不是提示词内容），
 所以 prefix cache 的唯一键面不受影响，用户显式选择的档位也不会被静默覆盖。信号本身每步从
@@ -145,10 +149,10 @@ echoFailures:5}`（自测实测）。要更早介入的操作员显式改成 `ba
   写出 —— 是 **continuation-managed（continuable）专属**的送达通知，**持久 user 消息**。
   本 preset 的两份派活工具（`subagent` / `subagent_fork`）都配了
   `backgroundMode: 'continuable'`，所以默认值正确。
-- `settlementChannel: 'tool-result'`：终结 = 派活调用各自收到的成功 `tool/result` 数
+- `settlementChannel: 'tool-result'`：终结 = 派活调用各自收到的所有 `tool/result` 回执数（失败另记 failedDispatches）
   （按 `callId` 与派活调用配对）。用于 one-shot（block）部署 —— 那里没有结算通知。
 
-原生与 PTC 派发失败或取消均撤销其在飞占位，不计成功回执；有 id 的开始/结果在所属步骤内去重。原生孤立结果不配对其他派发；PTC 结果自带工具名，可从仅剩成功结算的历史恢复。无 id 的旧原生调用保留近似占位，无法确定其结果归属。
+原生与 PTC 派发失败或取消均撤销其未结算占位；dispatched 保留全部尝试，delegatedResults 保留全部回执，failedDispatches 单列失败；有 id 的开始/结果在所属步骤内去重。原生孤立结果不配对其他派发；PTC 结果自带工具名，可从仅剩成功结算的历史恢复。无 id 的旧原生调用保留近似占位，无法确定其结果归属。
 
 选错的后果是单向的：用 `'settled-notice'` 跑 one-shot 会让"在飞"永久偏高；反过来会恒为 0。
 接上外部 store 时 store 值优先，直接绕开这个选择。

@@ -1,0 +1,208 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import * as guard from '../../lib/plugins/guard.mjs'
+
+const call = (id, args = { path: 'a' }, tool = 'read') =>
+  ({ type: 'tool/call', data: { name: tool, arguments: args, callId: id } })
+const result = (id, failed = true) =>
+  ({ type: 'tool/result', data: { callId: id, message: { isError: failed } } })
+const failures = (prefix, count = 3, args) =>
+  Array.from({ length: count }, (_, i) => [call(`${prefix}${i}`, args), result(`${prefix}${i}`)]).flat()
+const signal = (events) => guard.foldGuardSignal(events, { echoFailures: 3, detectStall: false }).signal
+const reasoning = (length = 20_000) => ({ type: 'assistant/message', data: {
+  message: { content: [{ type: 'reasoning', text: 'x'.repeat(length) }] },
+} })
+
+function harness(config = {}) {
+  const handlers = new Map()
+  const logs = []
+  guard.apply({ on: (event, fn) => handlers.set(event, fn), logger: { warn: (text) => logs.push(text) } }, {
+    stallAction: 'observe', stepDownRequests: 0, sensitivity: 'balanced', echoFailures: 3,
+    refireCooldownSteps: 2, ...config,
+  })
+  const agent = { session: { events: [] } }
+  return {
+    agent, logs,
+    pre: () => handlers.get('agent/pre-step')({ agent }, async () => ({ kind: 'enter', messages: [] })),
+    request: (value) => handlers.get('agent/request')({ agent }, async () => value),
+  }
+}
+
+// Removing key sorting or falling back to String(object) would break these contracts.
+test('equivalent nested JSON objects and encoded JSON have one call signature', () => {
+  const first = { z: 1, a: { right: 2, left: [{ b: 2, a: 1 }] } }
+  const second = { a: { left: [{ a: 1, b: 2 }], right: 2 }, z: 1 }
+  assert.equal(guard.callSignature(call('a', first)), guard.callSignature(call('b', second)))
+  assert.equal(guard.callSignature(call('a', first)), guard.callSignature(call('c', JSON.stringify(second))))
+})
+test('argument key permutation cannot hide three consecutive failures', () => {
+  const events = [{ x: 1, y: 2 }, { y: 2, x: 1 }, { x: 1, y: 2 }]
+    .flatMap((args, i) => [call(String(i), args), result(String(i))])
+  assert.equal(signal(events), 'echo')
+})
+test('array order, values, tool names, and raw non-JSON arguments remain distinct', () => {
+  for (const [a, b] of [
+    [call('a', [1, 2]), call('b', [2, 1])],
+    [call('a', { x: 1 }), call('b', { x: '1' })],
+    [call('a', { x: 1 }), call('b', { x: 1 }, 'write')],
+    [call('a', 'invalid json'), call('b', 'other invalid json')],
+  ]) assert.notEqual(guard.callSignature(a), guard.callSignature(b))
+})
+test('prototype-like JSON keys remain data during canonicalization', () => {
+  assert.notEqual(guard.callSignature(call('a', JSON.parse('{"__proto__":{"x":1}}'))),
+    guard.callSignature(call('b', {})))
+})
+test('cyclic or unserializable arguments are unknown, not one generic object signature', () => {
+  const cycle = {}; cycle.self = cycle
+  assert.equal(guard.callSignature(call('a', cycle)), undefined)
+  assert.equal(guard.callSignature(call('b', { x: 1n })), undefined)
+})
+
+// A result must count once for its own invocation, never for the latest unrelated call.
+test('one failure replayed three times is not three failed calls', () => {
+  assert.equal(signal([call('a'), result('a'), result('a'), result('a')]), undefined)
+})
+test('replayed call-result pairs do not manufacture new attempts', () => {
+  const pair = [call('a'), result('a')]
+  assert.equal(signal([...pair, ...pair, ...pair]), undefined)
+})
+test('missing result correlation cannot be attributed to the latest call', () => {
+  assert.equal(signal([call('a'), result(undefined), result(undefined), result(undefined)]), undefined)
+})
+test('calls with missing IDs cannot provide trusted failure evidence', () => {
+  assert.equal(signal(Array.from({ length: 3 }, () => [call(undefined), result(undefined)]).flat()), undefined)
+})
+test('unknown results cannot create or clear a matched failure streak', () => {
+  assert.equal(signal([...failures('a'), result('unknown', false)]), 'echo')
+  assert.equal(signal([result('unknown'), result('unknown'), result('unknown')]), undefined)
+})
+test('nested source callId is accepted for matched results', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [call(String(i)), {
+    type: 'tool/result', data: { message: { isError: true, source: { callId: String(i) } } },
+  }]).flat()
+  assert.equal(signal(events), 'echo')
+})
+test('parallel failures are evaluated in call order regardless of result arrival order', () => {
+  assert.equal(signal([call('a'), call('b'), call('c'), result('c'), result('a'), result('b')]), 'echo')
+})
+test('an unresolved latest call blocks conclusions about a completed failure streak', () => {
+  assert.equal(signal([...failures('a'), call('pending')]), undefined)
+})
+test('late success for an older call cannot erase three newer failures', () => {
+  assert.equal(signal([call('older'), ...failures('new'), result('older', false)]), 'echo')
+})
+test('late failure for an older call cannot resurrect a streak after newer success', () => {
+  assert.equal(signal([call('a'), call('b'), call('c'), result('c', false), result('b'), result('a')]), undefined)
+})
+test('a different invocation signature separates repeated-failure episodes', () => {
+  assert.equal(signal([...failures('first', 2), call('different', { path: 'b' }), result('different'),
+    ...failures('last', 2)]), undefined)
+})
+test('an unattributable latest invocation is an uncertainty barrier', () => {
+  assert.equal(signal([...failures('a'), call(undefined), ...failures('b', 2)]), undefined)
+})
+
+// A persistent warning acknowledges prior evidence, not all future tool failures.
+test('persisted ECHO notices prevent replay of the acknowledged evidence after resume', async () => {
+  const first = harness()
+  first.agent.session.events = failures('old')
+  const warning = (await first.pre()).messages[0]
+  assert.equal(warning.source.signal, 'echo')
+  const resumed = harness()
+  resumed.agent.session.events = [...first.agent.session.events, { type: 'user/message', data: warning }]
+  assert.equal((await resumed.pre()).messages.length, 0)
+  resumed.agent.session.events.push(...failures('new', 2))
+  assert.equal((await resumed.pre()).messages.length, 0)
+  resumed.agent.session.events.push(...failures('third', 1))
+  assert.equal((await resumed.pre()).messages.length, 1)
+})
+test('unchanged ECHO evidence cannot rearm the same runtime warning after cooldown', async () => {
+  const h = harness()
+  h.agent.session.events = failures('a')
+  assert.equal((await h.pre()).messages.length, 1)
+  for (let i = 0; i < 10; i++) assert.equal((await h.pre()).messages.length, 0)
+})
+test('new failures after successful recovery remain observable', async () => {
+  const h = harness()
+  h.agent.session.events = failures('a')
+  const warning = (await h.pre()).messages[0]
+  h.agent.session.events.push({ type: 'user/message', data: warning }, call('ok'), result('ok', false))
+  await h.pre(); await h.pre()
+  h.agent.session.events.push(...failures('b'))
+  assert.equal((await h.pre()).messages.length, 1)
+})
+for (const effort of [undefined, 42, 'toString', 'constructor']) {
+  test(`route effort ${String(effort)} replaces rather than inherits the previous max threshold`, async () => {
+    const h = harness()
+    const before = { reasoningEffort: 'max' }
+    assert.equal(await h.request(before), before)
+    const after = { reasoningEffort: effort }
+    assert.equal(await h.request(after), after)
+    h.agent.session.events = [reasoning(10_000)]
+    await h.pre()
+    assert.equal(h.logs.length, 0)
+  })
+}
+test('prototype property names cannot become numeric threshold values', () => {
+  const defaults = guard.resolveThresholds({})
+  for (const key of ['toString', 'constructor', '__proto__']) {
+    assert.deepEqual(guard.resolveThresholds({ effort: key, sensitivity: key }), defaults)
+  }
+})
+test('single folding pass exposes STALL and ECHO independently', () => {
+  assert.equal(typeof guard.foldGuardSignals, 'function')
+  const events = [...failures('a'), { type: 'step/start' }, reasoning()]
+  const { stall, echo } = guard.foldGuardSignals(events, { echoFailures: 3 })
+  assert.equal(stall.signal, 'stall')
+  assert.equal(echo.signal, 'echo')
+  assert.deepEqual(guard.foldGuardSignal(events, { echoFailures: 3 }), stall)
+  assert.deepEqual(guard.foldGuardSignal(events, { echoFailures: 3, detectStall: false }), echo)
+})
+test('observing STALL and interrupting ECHO traverses session events only once per pre-step', async () => {
+  const h = harness()
+  let scans = 0
+  const events = [...failures('a'), { type: 'step/start' }, reasoning()]
+  const iterator = events[Symbol.iterator].bind(events)
+  events[Symbol.iterator] = function () { scans++; return iterator() }
+  h.agent.session.events = events
+  assert.equal((await h.pre()).messages.length, 1)
+  assert.equal(scans, 1)
+})
+
+test('reused callId with conflicting arguments is an uncertainty barrier, not a replay', () => {
+  assert.equal(signal([...failures('a'), call('a2', { path: 'changed' }), result('a2')]), undefined)
+})
+test('conflicting result callId locations cannot manufacture matched failures', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [call(String(i)), {
+    type: 'tool/result', data: { callId: String(i),
+      message: { isError: true, source: { callId: 'unrelated' } } },
+  }]).flat()
+  assert.equal(signal(events), undefined)
+})
+test('error objects and immutable event snapshots remain supported without mutation', () => {
+  const events = Object.freeze(Array.from({ length: 3 }, (_, i) => [call(String(i)), {
+    type: 'tool/result', data: { callId: String(i), error: { message: 'boom' } },
+  }]).flat().map(event => Object.freeze(event)))
+  const before = JSON.stringify(events)
+  assert.equal(signal(events), 'echo')
+  assert.equal(JSON.stringify(events), before)
+})
+test('all 384 arrival permutations and success patterns match an invocation-order oracle', () => {
+  function permutations(values) {
+    return values.length === 0 ? [[]] : values.flatMap((value, i) =>
+      permutations(values.filter((_, j) => i !== j)).map(rest => [value, ...rest]))
+  }
+  let checked = 0
+  for (let mask = 0; mask < 16; mask++) {
+    const failed = Array.from({ length: 4 }, (_, i) => Boolean(mask & (1 << i)))
+    let trailing = 0
+    for (let i = 3; i >= 0 && failed[i]; i--) trailing++
+    for (const order of permutations([0, 1, 2, 3])) {
+      const events = [0, 1, 2, 3].map(i => call(String(i)))
+      events.push(...order.map(i => result(String(i), failed[i])))
+      assert.equal(signal(events), trailing >= 3 ? 'echo' : undefined, `mask=${mask} order=${order}`)
+      checked++
+    }
+  }
+  assert.equal(checked, 384)
+})

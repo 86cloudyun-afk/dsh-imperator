@@ -28,7 +28,7 @@ test('failed or cancelled native delegation retires its in-flight placeholder', 
     nativeCall('cancelled', 'subagent_fork'), cancelled]
   for (const settlement of ['settled-notice', 'tool-result']) {
     assert.deepEqual(foldSubagentFlow(events, undefined, settlement), {
-      dispatched: 0, delegatedResults: 0, settledNotices: 0, settled: 0, inFlight: 0,
+      dispatched: 2, delegatedResults: 2, failedDispatches: 2, settledNotices: 0, settled: settlement === 'tool-result' ? 2 : 0, inFlight: 0,
     })
   }
 })
@@ -37,31 +37,31 @@ test('native replay counts each call and settlement once, including late starts'
   const call = nativeCall('ok')
   const settled = nativeResult('ok')
   assert.deepEqual(foldSubagentFlow([call, call, settled, settled, call, notice]), {
-    dispatched: 1, delegatedResults: 1, settledNotices: 1, settled: 1, inFlight: 0,
+    dispatched: 1, delegatedResults: 1, failedDispatches: 0, settledNotices: 1, settled: 1, inFlight: 0,
   })
   const failedCall = nativeCall('failed')
   const failure = nativeResult('failed', true)
-  assert.equal(foldSubagentFlow([failedCall, failure, failure, failedCall]).dispatched, 0)
+  assert.equal(foldSubagentFlow([failedCall, failure, failure, failedCall]).failedDispatches, 1)
 })
 
 test('mixed successful and failed dispatches keep both settlement channels accurate', () => {
   const events = [nativeCall('bad'), nativeResult('bad', true), nativeCall('good'), nativeResult('good'),
     start('ptc:1'), result('ptc:1'), start('ptc:2'), result('ptc:2', true), notice]
   assert.deepEqual(foldSubagentFlow(events), {
-    dispatched: 2, delegatedResults: 2, settledNotices: 1, settled: 1, inFlight: 1,
+    dispatched: 4, delegatedResults: 4, failedDispatches: 2, settledNotices: 1, settled: 1, inFlight: 1,
   })
   assert.equal(foldSubagentFlow(events, undefined, 'tool-result').inFlight, 0)
 })
 
 test('unmatched native results cannot settle another pending child', () => {
   assert.deepEqual(foldSubagentFlow([nativeCall('pending'), nativeResult('unknown'), nativeResult('unknown', true)]), {
-    dispatched: 1, delegatedResults: 0, settledNotices: 0, settled: 0, inFlight: 1,
+    dispatched: 1, delegatedResults: 0, failedDispatches: 0, settledNotices: 0, settled: 0, inFlight: 1,
   })
 })
 
 test('PTC successful delegation, unresolved start and settlement notices survive replay', () => {
   const events = [start('a:ptc:1'), result('a:ptc:1'), start('b:ptc:1'), notice]
-  assert.deepEqual(foldSubagentFlow(events), { dispatched: 2, delegatedResults: 1,
+  assert.deepEqual(foldSubagentFlow(events), { dispatched: 2, delegatedResults: 1, failedDispatches: 0,
     settledNotices: 1, settled: 1, inFlight: 1 })
   assert.equal(foldSubagentFlow(events, undefined, 'tool-result').inFlight, 1)
   assert.deepEqual(foldSubagentFlow(events), foldSubagentFlow(JSON.parse(JSON.stringify(events))))
@@ -72,8 +72,9 @@ test('failed or aborted PTC dispatch does not claim a child was created', () => 
   const abort = result('b:ptc:1', true)
   abort.data.error = { name: 'AbortError', code: 'ABORT_ERR' }
   const flow = foldSubagentFlow([start('a:ptc:1'), failure, start('b:ptc:1'), abort])
-  assert.equal(flow.dispatched, 0)
-  assert.equal(flow.delegatedResults, 0)
+  assert.equal(flow.dispatched, 2)
+  assert.equal(flow.failedDispatches, 2)
+  assert.equal(flow.delegatedResults, 2)
   assert.equal(flow.inFlight, 0)
 })
 
@@ -90,7 +91,7 @@ test('native and PTC delegations share the same settlement channel without count
     { type: 'tool/call', data: { callId: 'a', name: 'run_code' } },
     start('a:ptc:1'), result('a:ptc:1'), notice,
   ]
-  assert.deepEqual(foldSubagentFlow(events), { dispatched: 2, delegatedResults: 2,
+  assert.deepEqual(foldSubagentFlow(events), { dispatched: 2, delegatedResults: 2, failedDispatches: 0,
     settledNotices: 1, settled: 1, inFlight: 1 })
 })
 
@@ -177,12 +178,12 @@ for (const kind of ['native', 'ptc']) {
     assert.equal(foldGuardSignal(events, { echoFailures: 2 }).signal, undefined)
   })
 
-  test(`${kind} a late success from an older call clears the current failure chain`, () => {
+  test(`${kind} a late success from an older call does not erase newer failures (main contract)`, () => {
     const events = [call('old-success', 'read', { path: 'exists' })]
     for (const id of ['a', 'b', 'c']) events.push(call(id, 'read', { path: 'missing' }), settle(id, true))
     assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
     events.push(settle('old-success', false, { path: 'exists' }))
-    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, undefined)
+    assert.equal(foldGuardSignal(events, { echoFailures: 3 }).signal, 'echo')
   })
 
   test(`${kind} reused IDs in separate steps identify distinct delegation attempts`, () => {
@@ -190,7 +191,7 @@ for (const kind of ['native', 'ptc']) {
     const events = turn(1, [step(1, 1, [call('same', 'subagent'), settled('same', true)]),
       step(1, 2, [call('same', 'subagent'), settled('same', false)])])
     assert.deepEqual(foldSubagentFlow(events), {
-      dispatched: 1, delegatedResults: 1, settledNotices: 0, settled: 0, inFlight: 1,
+      dispatched: 2, delegatedResults: 2, failedDispatches: 1, settledNotices: 0, settled: 0, inFlight: 1,
     })
   })
 
@@ -212,7 +213,7 @@ test('late native surface replacements stay attached to the original attempt', (
   const rewrite = { ...first[2], surfaceOp: { op: 'replace', startSeq: 2, endSeq: 2 }, sourceEventSeqs: [2] }
   const events = turn(1, [first, step(1, 2, [nativeCall('same'), rewrite, nativeResult('same')])])
   assert.deepEqual(foldSubagentFlow(events), {
-    dispatched: 1, delegatedResults: 1, settledNotices: 0, settled: 0, inFlight: 1,
+    dispatched: 2, delegatedResults: 2, failedDispatches: 1, settledNotices: 0, settled: 0, inFlight: 1,
   })
   assert.equal(foldGuardSignal(events, { echoFailures: 2 }).signal, undefined)
 })

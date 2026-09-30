@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -76,4 +76,37 @@ test('real native resolution rejects missing Config fields, bad structure and mi
     const output = execFileSync(process.execPath, ['--input-type=module', '-e', code],
       { encoding: 'utf8', timeout: 20_000, stdio: ['ignore', 'pipe', 'pipe'] })
     assert.match(output, /NATIVE_CONFIG_NEGATIVES_PASS/)
+  })
+
+test('native failed or hung cleanup exits nonzero and deletes its disposable home',
+  { skip: !process.env.DSH_INSTALL_ANCHOR && 'requires DSH_INSTALL_ANCHOR', timeout: 25_000 }, () => {
+    for (const mode of ['reject', 'hang']) {
+      const verifier = new URL('../verify-host.mjs', import.meta.url).href
+      const code = `const { verifyHost } = await import(${JSON.stringify(verifier)});
+        await verifyHost({ configureShutdown(app, root) {
+          console.log('CLEANUP_ROOT=' + root);
+          const dispose = app.ctx.fiber.dispose.bind(app.ctx.fiber);
+          app.ctx.fiber.dispose = async () => {
+            await dispose();
+            ${mode === 'reject' ? "throw new Error('injected cleanup failure')" : 'return new Promise(() => {})'};
+          };
+        }});
+        console.log('UNEXPECTED_SUCCESS');`
+      let output
+      try {
+        assert.throws(() => execFileSync(process.execPath, ['--input-type=module', '-e', code],
+          { encoding: 'utf8', timeout: 12_000, stdio: ['ignore', 'pipe', 'pipe'] }), error => {
+          output = error.stdout
+          assert.equal(error.status, 1, 'forced native cleanup must never exit zero')
+          assert.doesNotMatch(output, /UNEXPECTED_SUCCESS|HOST_VERIFIED/)
+          return true
+        })
+        const root = output.match(/^CLEANUP_ROOT=(.+)$/m)?.[1]
+        assert.ok(root?.startsWith(join(tmpdir(), 'taskforce-host-')))
+        assert.equal(existsSync(root), false, 'forced native cleanup leaked its home')
+      } finally {
+        const root = output?.match(/^CLEANUP_ROOT=(.+)$/m)?.[1]
+        if (root?.startsWith(join(tmpdir(), 'taskforce-host-'))) rmSync(root, { recursive: true, force: true })
+      }
+    }
   })

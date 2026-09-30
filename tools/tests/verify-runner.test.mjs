@@ -5,11 +5,17 @@ import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
-import { runVerification } from '../verify-all.mjs'
+import { defaultRunProcess, runVerification } from '../verify-all.mjs'
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const missingProfile = join(tmpdir(), 'taskforce-runner-no-profile')
 const missingInstall = join(tmpdir(), 'taskforce-runner-no-install')
+
+test('a real timed out child that handles SIGTERM with exit zero is still a failure', async () => {
+  await assert.rejects(defaultRunProcess(process.execPath, ['-e',
+    "process.on('SIGTERM', () => process.exit(0)); setInterval(() => {}, 1000)"],
+  { cwd: root, shell: false, timeout: 200 }), { code: 'ETIMEDOUT' })
+})
 
 test('offline runs six scripts and explicit test files, then marks host integration unverified', async () => {
   const calls = []

@@ -17,11 +17,25 @@ const TESTS = [
   'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
 ]
 
-function defaultRunProcess(file, args, options) {
+export function defaultRunProcess(file, args, options) {
   return new Promise((resolveResult, reject) => {
-    const child = spawn(file, args, { ...options, stdio: 'inherit' })
-    child.once('error', reject)
-    child.once('close', (exitCode) => resolveResult({ exitCode }))
+    const { timeout, ...launch } = options
+    const child = spawn(file, args, { ...launch, stdio: 'inherit' })
+    let timedOut = false
+    let forceKill
+    const deadline = timeout === undefined ? undefined : setTimeout(() => {
+      timedOut = true
+      child.kill('SIGTERM')
+      // A stuck shutdown must not keep the verification runner alive forever.
+      forceKill = setTimeout(() => child.kill('SIGKILL'), 1000)
+    }, timeout)
+    const clear = () => { clearTimeout(deadline); clearTimeout(forceKill) }
+    child.once('error', (error) => { clear(); reject(error) })
+    child.once('close', (exitCode) => {
+      clear()
+      if (timedOut) reject(Object.assign(new Error('Verification child timed out'), { code: 'ETIMEDOUT' }))
+      else resolveResult({ exitCode })
+    })
   })
 }
 

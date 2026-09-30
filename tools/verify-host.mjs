@@ -11,9 +11,14 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
 /** Actual loopback-only web profile, no input enqueued and no model request.
  * The real registry, scoped tools, store and plugin Loader perform the work. */
-export async function verifyHost({ installAnchor, installDir } = {}) {
+export async function verifyHost({ installAnchor, installDir, configureShutdown } = {}) {
   const anchor = resolveInstallAnchor({ installAnchor, installDir })
+  const previousExitCode = process.exitCode
   const fixture = await controlledProfile(anchor, ROOT)
+  // Native shutdown may force process.exit on failed/stuck disposal, bypassing
+  // finally. This synchronous exit hook still removes our disposable home.
+  const emergencyCleanup = () => fixture.dispose()
+  process.once('exit', emergencyCleanup)
   const checks = []
   let application
   const handles = []
@@ -22,6 +27,8 @@ export async function verifyHost({ installAnchor, installDir } = {}) {
     const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
     application = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
       patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
+    // Trusted test hook for native cleanup failure injection; not a CLI flag.
+    configureShutdown?.(application, fixture.root)
     const { ctx } = application
     const registry = ctx.get('agentPresets')
     const roster = async () => (await registry.list()).filter(row => row.id === 'taskforce')
@@ -112,10 +119,14 @@ export async function verifyHost({ installAnchor, installDir } = {}) {
   } finally {
     try {
       try { for (const handle of handles.reverse()) await handle.dispose() }
-      finally { await application?.shutdown.shutdown(0) }
+      // Native shutdown forces the supplied code on rejection/cleanup timeout.
+      // Keep failure selected until every disposer and fixture cleanup returns.
+      finally { await application?.shutdown.shutdown(1) }
     } finally {
       fixture.dispose()
+      process.removeListener('exit', emergencyCleanup)
       assert.equal(existsSync(fixture.root), false, 'isolated home leaked')
+      process.exitCode = previousExitCode
     }
   }
 }

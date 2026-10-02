@@ -561,4 +561,4 @@ console.log(`断言：${passed} PASS / ${failed} FAIL（共 ${rows.length} 条�
 console.log(`临时目录：${TMP}${KEEP ? '（--keep：保留）' : '（将清理）'}`)
 if (!KEEP) rmSync(TMP, { recursive: true, force: true })
 console.log(`退出码：${failed === 0 ? 0 : 1}`)
-process.exit(failed === 0 ? 0 : 1)
+process.exitCode = failed === 0 ? 0 : 1

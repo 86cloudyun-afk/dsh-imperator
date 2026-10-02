@@ -29,6 +29,8 @@ const toolText = readdirSync(toolsDir).filter((f) => f.endsWith('.mjs')).sort()
 const EXTERNAL_FLAGS = new Map([
   ['--profile', 'dsh CLI 自带旗标（docs/DELIVERY.md：`dsh plugin --profile web add …`），非本仓工具'],
   ['--dump-config', 'dsh CLI 自带旗标（docs/DELIVERY.md：`dsh --profile web --dump-config`），非本仓工具'],
+  ['--ignore-scripts', 'npm pack 自带旗标（README 隔离实挂：禁止打包生命周期脚本），非本仓工具'],
+  ['--pack-destination', 'npm pack 自带旗标（README 隔离实挂：归档仅写入本次临时目录），非本仓工具'],
   ['--test', 'node:test 内置旗标（`node --test …`），非本仓旗标'],
 ])
 

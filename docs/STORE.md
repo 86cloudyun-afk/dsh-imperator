@@ -260,10 +260,12 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 
 ## 八、自测与集成注意
 
+从**仓库根**直接执行（无需切换目录）：
+
 ```bash
-cd /root/Hack/packages/dsh-taskforce && node tools/verify-store.mjs     # P2 既有：35 条
-cd /root/Hack/packages/dsh-taskforce && node tools/verify-store-v2.mjs  # v2：63 条
-cd /root/Hack/packages/dsh-taskforce && node tools/verify-store-v3.mjs  # v3：42 条（终态 / 晚到阻塞 / 验收门槛）
+node tools/verify-store.mjs     # P2 既有：35 条
+node tools/verify-store-v2.mjs  # v2：68 条
+node tools/verify-store-v3.mjs  # v3：42 条（终态 / 晚到阻塞 / 验收门槛）
 ```
 
 全 PASS = 退出码 0；三份都必须通过（v3 只加新判据，不改既有语义）。

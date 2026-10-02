@@ -165,7 +165,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `open` | ✓ | ✓ | ✓ | ✓ → submitted | ✗（非 submitted） | ✗ | ✓ → submitted | ✓ → cancelled |
 | `claimed` | ✓（同 owner 幂等） | ✓ | ✓ | ✓ → submitted | ✗ | ✗ | ✓ → submitted | ✓ → cancelled |
 | `submitted` | ✗ | ✓ | ✓ | ✓（幂等） | ✓ → accepted | ✓ → rejected | ✓（幂等） | ✓ → cancelled |
-| `rejected` | ✓ | ✓ | ✓ | ✓ → submitted | ✗ | ✗ | ✓ → submitted | ✓ → cancelled |
+| `rejected` | ✓ | ✓ | ✓ | ✗ `E_STATUS`（须先 claim） | ✗ | ✗ | ✗ `E_STATUS`（须先 claim） | ✓ → cancelled |
 | **终态** | ✗ `E_TERMINAL` | ✗ `E_TERMINAL` | ✓ **晚到阻塞**（不改结论） | ✗ `E_TERMINAL` | ✗ `E_TERMINAL` | ✓ **重新复核** → rejected | ✗ `E_TERMINAL` | ✗ `E_TERMINAL` |
 
 终态 = `accepted` / `cancelled` / `done` / `partial` / `failed`。终态任务上 `claim` **先判状态再判 owner**：

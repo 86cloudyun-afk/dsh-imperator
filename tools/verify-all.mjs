@@ -42,6 +42,7 @@ const TESTS = [
   'engines-contract.test.mjs',
   'code-hint-coverage.test.mjs',
   'mount-diagnostics.test.mjs',
+  'tool-args-contract.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

@@ -36,6 +36,7 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
     'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
     'workflow-contract.test.mjs',
+    'tool-args-contract.test.mjs',
   ])
   assert(calls.every(({ file, args, options }) => file === process.execPath
     && args.slice(args[0] === '--test' ? 1 : 0).every(isAbsolute)

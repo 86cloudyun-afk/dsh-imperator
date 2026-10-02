@@ -111,26 +111,41 @@ npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.
 
 ### 端到端实挂（隔离 DSH_HOME，不碰现有实例）
 
-以下命令在仓库根目录、官方 DSH `0.2.0-rc.2` + Node 22 上实测通过；全程使用临时 `DSH_HOME`，不发模型请求、不需要 API key。
+在仓库根目录执行，原生验收需官方 DSH `0.2.0-rc.2` + Node 22。子 shell 保留调用者环境，退出时只清理本次创建并验证的临时目录；全程使用临时 `DSH_HOME`，不发模型请求、不需要 API key。
 
 ```bash
-# 1. 打包精确交付物（npm pack 的 stdout 只有文件名）
-TGZ="$PWD/$(npm pack)"
+(
+set -euo pipefail
+# 1. 先创建并验证本次专用目录，再打包；任一步失败立即中止
+SMOKE_PARENT="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || exit 1
+SMOKE_ROOT="$(mktemp -d "$SMOKE_PARENT/dsh-taskforce-smoke.XXXXXXXX")" || exit 1
+SMOKE_NAME="${SMOKE_ROOT##*/}"
+case "$SMOKE_NAME" in dsh-taskforce-smoke.????????) ;; *) exit 1 ;; esac
+[ "$SMOKE_ROOT" = "$SMOKE_PARENT/$SMOKE_NAME" ] && [ -d "$SMOKE_ROOT" ] && [ ! -L "$SMOKE_ROOT" ] || exit 1
+readonly SMOKE_ROOT
+cleanup() { rm -rf -- "$SMOKE_ROOT"; }
+trap cleanup EXIT
+PACK_NAME="$(npm pack --ignore-scripts --pack-destination "$SMOKE_ROOT")" || exit 1
+case "$PACK_NAME" in ''|.*|*[!A-Za-z0-9._-]*) exit 1 ;; esac
+case "$PACK_NAME" in *.tgz) ;; *) exit 1 ;; esac
+TGZ="$SMOKE_ROOT/$PACK_NAME"
+[ -f "$TGZ" ] && [ ! -L "$TGZ" ] || exit 1
 
 # 2. 装进临时 DSH_HOME 的 web profile（首次会自动初始化该 profile）
-export DSH_HOME="$(mktemp -d)" DSH_TELEMETRY_DISABLED=1
+export DSH_HOME="$SMOKE_ROOT/home" DSH_TELEMETRY_DISABLED=1
+mkdir "$DSH_HOME"
 dsh plugin --profile web add "$TGZ"
 dsh --profile web --dump-config | grep taskforce   # 应出现 taskforce 与 taskforce-store 两行
 
 # 3. 回环试挂：日志应出现 [taskforce] preset "taskforce" declared (21 rows)，
-#    且无 failed to import / activate；确认后 Ctrl-C 退出
-dsh --profile web --host 127.0.0.1 --port 0 --no-open
+#    且无 failed to import / activate；确认后 Ctrl-C 停止试挂并继续验收
+trap ':' INT
+dsh --profile web --host 127.0.0.1 --port 0 --no-open || [ "$?" -eq 130 ]
 
 # 4. 全量原生验收（自建并清理自己的临时 home）；anchor 取自 PATH 上的 dsh
 ANCHOR="$(dirname "$(dirname "$(realpath "$(command -v dsh)")")")/package.json"
 npm run test:all -- --install-anchor "$ANCHOR"     # 须见 HOST_VERIFIED 与 ISOLATION_VERIFIED
-
-rm -rf "$DSH_HOME" "$TGZ"; unset DSH_HOME
+)
 ```
 
 `21 rows` 是预设顶层行数；`verify-preset` 报告的 `29 rows` 含嵌套 group 内的行，两者不矛盾。生产实例的安装、备份与回滚仍按 [DELIVERY.md](docs/DELIVERY.md) 执行。

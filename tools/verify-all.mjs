@@ -34,6 +34,7 @@ const TESTS = [
   'package-delivery.test.mjs',
   'preset-isolation.test.mjs',
   'docs-contract.test.mjs',
+  'readme-smoke-safety.test.mjs',
   'exit-propagation.test.mjs',
   'repo-hygiene.test.mjs',
   'error-code-contract.test.mjs',

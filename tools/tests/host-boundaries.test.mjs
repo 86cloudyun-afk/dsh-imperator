@@ -83,6 +83,37 @@ test('native PTC transport cannot write from the root; children retain execution
   assert.equal(nativeMain.ctx.tools.schemas(nativeMain).some(({ name }) => name === 'bash'), false)
 })
 
+test('main session denies pwsh execution the same way as bash (first-party shell twin)', options, async (t) => {
+  const { ctx, agent } = await fixture(t)
+  let pwshHandlerRuns = 0
+  let bashHandlerRuns = 0
+  ctx.tools.register({ name: 'bash', description: 'execution probe', parameters: {},
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => { bashHandlerRuns += 1; return {} } })
+  ctx.tools.register({ name: 'pwsh', description: 'powershell execution probe', parameters: {},
+    output: { schema: { type: 'object' }, render: () => [] },
+    execute: async () => { pwshHandlerRuns += 1; return {} } })
+  applyScope(ctx)
+  const main = agent('root-pwsh')
+  await ctx.serial('agent/created', { agent: main })
+  const execute = (name) => main.ctx.tools.execute({
+    agent: main, callId: `probe-${name}`, name,
+    arguments: { command: 'echo hi' }, signal: new AbortController().signal,
+  })
+  const deniedBash = await execute('bash')
+  const deniedPwsh = await execute('pwsh')
+  assert.equal(deniedBash.isError, true)
+  assert.equal(deniedPwsh.isError, true)
+  assert.match(deniedBash.error.message, new RegExp(DENY_CODE))
+  assert.match(deniedPwsh.error.message, new RegExp(DENY_CODE))
+  assert.equal(bashHandlerRuns, 0, 'bash handler must not run under orchestrator scope')
+  assert.equal(pwshHandlerRuns, 0, 'pwsh handler must not run under orchestrator scope')
+  assert.equal(main.ctx.tools.schemas(main).some(({ name }) => name === 'bash'), false)
+  assert.equal(main.ctx.tools.schemas(main).some(({ name }) => name === 'pwsh'), false)
+  // Child retention for execution tools is covered by the PTC/bash case above;
+  // this case only closes the main-session deny-list hole for pwsh.
+})
+
 test('both native delegation providers replace the orchestrator persona in children', options, async (t) => {
   const { ctx, owner, agent, createScope } = await fixture(t)
   const [{ renderPrompt }, persona, { applyChildComposition }] = await Promise.all([

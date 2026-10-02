@@ -117,6 +117,10 @@ function makeHost({
   schemasFailOn = [],
   schemasFailMessage = 'SESSION_TOOLS_PROJECTION_UNAVAILABLE',
   restrictHidesOnly,
+  // 降级路径注入点（对应 orchestrator-scope 的 no-guard / guard-refused / no-scoped-view）。
+  omitGuard = false,
+  guardRefusal,
+  omitRestrict = false,
 } = {}) {
   const registry = new Set(surface)
   const handlers = new Map()
@@ -136,7 +140,7 @@ function makeHost({
   }
   let failuresLeft = restrictFailures
   // 可在用例中途翻转：用来演"下一步宿主恢复了"。
-  const flags = { restrictNoop: restrictNoop === true }
+  const flags = { restrictNoop: restrictNoop === true, guardRefusal }
   const failOn = new Set(schemasFailOn)
   const hidesOnly = restrictHidesOnly === undefined ? undefined : new Set(restrictHidesOnly)
   // 真宿主的 restrict 只认**全局**工具名；scope-local 注册（如本机的 spawn_teammate）
@@ -232,7 +236,20 @@ function makeHost({
 
   const makeAgent = (header) => {
     const agent = { id: header.id, session: { header } }
-    agent.ctx = { tools: toolsFor(agent) }
+    // toolsFor() 每次返回**新建**的 scoped 视图对象 ⇒ 这里的降级注入只影响本 agent。
+    const tools = toolsFor(agent)
+    if (omitRestrict) tools.restrict = undefined
+    if (omitGuard) {
+      tools.guard = undefined
+    } else {
+      // 可翻转的拒绝注入：翻转 flags 后委托回原生实现（= 模拟"宿主恢复"）。
+      const nativeGuard = tools.guard
+      tools.guard = (guard) => {
+        if (flags.guardRefusal !== undefined) throw new Error(flags.guardRefusal)
+        return nativeGuard(guard)
+      }
+    }
+    agent.ctx = { tools }
     return agent
   }
 
@@ -264,6 +281,8 @@ function makeHost({
     restrictCallsOf: (agent) => stats.restrictCalls.filter((entry) => entry.scope === agent).length,
     /** 翻转"restrict 收下提交但不改面"的宿主行为：用来演"下一步恢复了"。 */
     setRestrictNoop: (value) => { flags.restrictNoop = value === true },
+    /** 翻转"宿主恢复提供可用 guard"的注入（降级路径 D2 的恢复段用）。 */
+    setGuardRefusal: (value) => { flags.guardRefusal = value },
   }
 }
 
@@ -887,6 +906,131 @@ section('守卫形状：ToolGuard = (execution: Readonly<ToolExecution>) => stri
       'plugin_install', 'plugin_remove', 'plugin_auto_update', 'plugin_set_auto_update',
       'spawn_teammate'].every((name) => scope.DEFAULT_DENY.includes(name)),
     `DEFAULT_DENY(${scope.DEFAULT_DENY.length})=${scope.DEFAULT_DENY.join(', ')}`,
+  )
+}
+
+/* ═══════════════════ 场景 D：三条降级路径（AUDIT4 候选 2）═══════════════════ */
+
+section('场景 D1：agent.ctx.tools.guard 不可用 —— 降级路径 no-guard')
+
+{
+  const host = makeHost({ surface: ['read', 'bash'], executable: ['bash'], omitGuard: true })
+  const ctx = fakePluginCtx()
+  scope.apply(ctx, {})
+  const agent = host.makeAgent(MAIN_HEADER)
+  await ctx.emit('agent/created', { agent, source: 'new' })
+
+  const warns = warnsOf(ctx)
+  check(
+    'D1a',
+    'guard 入口不可用时如实告警（含原因、后果与「继续重试」承诺）',
+    warns.some((text) => text.includes('取不到 agent 作用域的执行守卫入口')
+      && text.includes('本轨不生效') && text.includes('继续重试')),
+    JSON.stringify(warns),
+  )
+  check(
+    'D1b',
+    '该轨确实未装上（guards 层为空，降级如实发生）',
+    host.guardsOf(agent).length === 0,
+    `guards=${host.guardsOf(agent).length}`,
+  )
+  check(
+    'D1c',
+    '可见性轨不受影响：bash 仍被从面上遮蔽',
+    !host.visibleNames(agent).includes('bash'),
+    `visible=${JSON.stringify(host.visibleNames(agent))}`,
+  )
+  check(
+    'D1d',
+    '降级语义如实：无守卫时不伪称拦截（本夹具记录这一事实）',
+    host.call('bash', agent).ran === true,
+    JSON.stringify(host.call('bash', agent)),
+  )
+  await tick(ctx, agent)
+  check(
+    'D1e',
+    '每步复核持续重试且告警幂等（warnOnce 只发一次）',
+    host.guardsOf(agent).length === 0
+      && warnsOf(ctx).filter((text) => text.includes('取不到 agent 作用域的执行守卫入口')).length === 1,
+    `guards=${host.guardsOf(agent).length} no-guard 告警数=${warnsOf(ctx).filter((text) => text.includes('取不到 agent 作用域的执行守卫入口')).length}`,
+  )
+}
+
+section('场景 D2：guard 注册被拒 —— 降级路径 guard-refused（含宿主恢复后重试成功）')
+
+{
+  const host = makeHost({ surface: ['read', 'bash'], executable: ['bash'], guardRefusal: 'registry exploded' })
+  const ctx = fakePluginCtx()
+  scope.apply(ctx, {})
+  const agent = host.makeAgent(MAIN_HEADER)
+  await ctx.emit('agent/created', { agent, source: 'new' })
+
+  const warns = warnsOf(ctx)
+  check(
+    'D2a',
+    '注册被拒时如实告警并带原始错误文本',
+    warns.some((text) => text.includes('执行守卫注册被拒') && text.includes('registry exploded')),
+    JSON.stringify(warns),
+  )
+  check(
+    'D2b',
+    '被拒后该轨不在位（guards 层为空）',
+    host.guardsOf(agent).length === 0,
+    `guards=${host.guardsOf(agent).length}`,
+  )
+  check(
+    'D2c',
+    '被拒不影响可见性轨：bash 仍被遮蔽',
+    !host.visibleNames(agent).includes('bash'),
+    `visible=${JSON.stringify(host.visibleNames(agent))}`,
+  )
+
+  host.setGuardRefusal(undefined) // 宿主恢复
+  await tick(ctx, agent)
+  check(
+    'D2d',
+    '宿主恢复后，下一次复核把守卫真正装上（「永不放弃」落点）',
+    host.guardsOf(agent).length === 1,
+    `guards=${host.guardsOf(agent).length}`,
+  )
+  const denied = host.call('bash', agent)
+  check(
+    'D2e',
+    '恢复后的守卫按全量名单拒绝 bash（执行边界回来了）',
+    denied.isError === true && denied.message.includes(scope.DENY_CODE),
+    JSON.stringify(denied),
+  )
+}
+
+section('场景 D3：agent.ctx.tools.restrict 不可用 —— 降级路径 no-scoped-view')
+
+{
+  const host = makeHost({ surface: ['read', 'bash'], executable: ['bash'], omitRestrict: true })
+  const ctx = fakePluginCtx()
+  scope.apply(ctx, {})
+  const agent = host.makeAgent(MAIN_HEADER)
+  await ctx.emit('agent/created', { agent, source: 'new' })
+
+  const warns = warnsOf(ctx)
+  check(
+    'D3a',
+    'restrict 不可用时如实告警（含「可见性不生效 / 执行守卫仍在位」）',
+    warns.some((text) => text.includes('取不到 agent 作用域的工具视图')
+      && text.includes('可见性过滤不生效') && text.includes('执行守卫仍会拒绝')),
+    JSON.stringify(warns),
+  )
+  check(
+    'D3b',
+    '可见性轨确实不生效：bash 仍在面上（降级如实发生）',
+    host.visibleNames(agent).includes('bash'),
+    `visible=${JSON.stringify(host.visibleNames(agent))}`,
+  )
+  const denied = host.call('bash', agent)
+  check(
+    'D3c',
+    '执行守卫独立在位：bash 的执行仍被拒绝（第 2 轨兜底）',
+    denied.isError === true && denied.message.includes(scope.DENY_CODE) && denied.ran === false,
+    JSON.stringify(denied),
   )
 }
 

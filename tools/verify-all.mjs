@@ -37,6 +37,8 @@ const TESTS = [
   'sqlite-fault-hint.test.mjs',
   'workflow-contract.test.mjs',
   'engines-contract.test.mjs',
+  'code-hint-coverage.test.mjs',
+  'mount-diagnostics.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

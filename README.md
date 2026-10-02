@@ -1,7 +1,8 @@
-# 任务部队（taskforce）· DSH 多 agent 生产工具
+# DSH IMPERATOR
 
-> **主会话研究决策，子代理按需执行。**
-> TaskForce `0.2.1`；验收目标为官方 DSH `0.2.0-rc.2`，Node 22/24。
+> ### *He who speaks — and legions march.*
+
+**dsh指挥官** · 主会话统御决策，子代理军团执行 · 版本 `0.2.1`；验收目标为官方 DSH `0.2.0-rc.2`，Node 22/24。
 
 一个 DeepSeek Harness 的 **agent preset**（附带 host 插件）：主会话亲自做只读调查、方案比较、决策和验收，子代理负责有边界的执行任务。优先复用已有执行者，不再为每个信息缺口新建代理；写文件、命令执行和宿主变更的限制保持不变。
 
@@ -123,3 +124,15 @@ npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.
 ### 模式隔离（0.2.1）
 
 TaskForce 只作用于选择该预设的会话。切换回 standard/minimal 时撤销本插件自己的 guard/restrict；不会删除宿主或其他插件的安全限制。新建、并存、反复切换、持久恢复及预设重载由原生隔离验收覆盖。详见 `docs/PRESET_ISOLATION.md`。
+
+## 命名
+
+| 层 | 名称 | 状态 |
+|---|---|---|
+| 项目对外名 | **dsh指挥官** / *DSH Imperator* | 本仓库发布名 |
+| 包名 | `@local/dsh-taskforce` | **固定** —— profile 的 `link:` 依赖与 CI 的 `npm pack` 产物名直接引用 |
+| preset 标识符 | `taskforce` | **固定** —— 被用户配置、`ctx.agentPresets.register` 与三套验证脚本引用 |
+| preset 显示名 / persona 自称 | `任务部队` | **固定** —— `lib/preset.js` 与运行时状态行使用，`verify-isolation` / `verify-p3` 对其有硬断言 |
+| 事实库路径 | `$DSH_HOME/taskforce/taskforce.db` | **固定** —— 既有数据所在 |
+
+改名只作用于发布门面（仓库名、README 标题、包描述）。技术标识符与运行时可观测字符串一律不动——它们是既有部署、CI 与验收契约的一部分，改动会打断正在运行的宿主。

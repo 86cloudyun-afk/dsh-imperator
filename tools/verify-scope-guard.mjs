@@ -884,10 +884,17 @@ section('守卫形状：ToolGuard = (execution: Readonly<ToolExecution>) => stri
       .map((name) => [name, typeof guard({ name, agent: main })])),
   )
   check(
+    'T7b',
+    'pwsh 与 bash 同类：主会话执行守卫硬拦截（官方 dsh-tool-pwsh 第一方工具）',
+    typeof guard({ name: 'pwsh', agent: main }) === 'string'
+      && String(guard({ name: 'pwsh', agent: main })).includes(scope.DENY_CODE),
+    String(guard({ name: 'pwsh', agent: main })),
+  )
+  check(
     'T8',
     '全量名单不裁剪：guard 用 DEFAULT_DENY 原样建集（不与工具面求交）',
     scope.DEFAULT_DENY.every((name) => typeof guard({ name, agent: main }) === 'string')
-      && scope.DEFAULT_DENY.length >= 11,
+      && scope.DEFAULT_DENY.length >= 12,
     `deny 项 ${scope.DEFAULT_DENY.length}`,
   )
   check(
@@ -902,7 +909,7 @@ section('守卫形状：ToolGuard = (execution: Readonly<ToolExecution>) => stri
   check(
     'T10',
     '默认 deny 覆盖既有清单（标准执行/写 + 改宿主/改插件 + 拉起队友）',
-    ['bash', 'write', 'edit', 'str_replace_editor', 'purge_apply', 'purge_revert',
+    ['bash', 'pwsh', 'write', 'edit', 'str_replace_editor', 'purge_apply', 'purge_revert',
       'plugin_install', 'plugin_remove', 'plugin_auto_update', 'plugin_set_auto_update',
       'spawn_teammate'].every((name) => scope.DEFAULT_DENY.includes(name)),
     `DEFAULT_DENY(${scope.DEFAULT_DENY.length})=${scope.DEFAULT_DENY.join(', ')}`,

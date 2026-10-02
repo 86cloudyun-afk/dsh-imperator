@@ -69,14 +69,19 @@ export async function runVerification({ mode = 'offline', profileDir,
     }
   }
 
-  if (mode !== 'integration') {
-    for (const script of SCRIPTS) await run(script, [join(HERE, script)])
-    await run('node:test', ['--test', ...TESTS.map((file) => join(HERE, 'tests', file))])
-  }
-
   let anchor
   if (mode !== 'offline' && (profileDir === undefined || existsSync(profileDir))) {
     try { anchor = resolveInstallAnchor({ installAnchor, installDir }) } catch { /* fail closed below */ }
+  }
+
+  if (mode !== 'integration') {
+    for (const script of SCRIPTS) {
+      // With a resolved native host, verify-store must cross-check its fallback
+      // schema compiler against the real dsh-tools (S33) instead of skipping it.
+      const extra = anchor !== undefined && script === 'verify-store.mjs' ? ['--install-anchor', anchor] : []
+      await run(script, [join(HERE, script), ...extra])
+    }
+    await run('node:test', ['--test', ...TESTS.map((file) => join(HERE, 'tests', file))])
   }
   if (mode === 'offline' || anchor === undefined) {
     results.push({ name: 'host integration', status: 'unverified', exitCode: null })

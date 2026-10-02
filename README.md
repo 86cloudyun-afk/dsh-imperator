@@ -109,6 +109,32 @@ npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.
 不传 anchor 时可从 PATH 的 dsh 安装发现；显式路径错误时不会悄悄回退。
 `npm test` 中的宿主 UNVERIFIED 和仅宿主用例 SKIP 不算原生通过；`test:all` 要求预设契约、原生边界、真实 web boot 和 standard/TaskForce 切换隔离均成功。
 
+### 端到端实挂（隔离 DSH_HOME，不碰现有实例）
+
+以下命令在仓库根目录、官方 DSH `0.2.0-rc.2` + Node 22 上实测通过；全程使用临时 `DSH_HOME`，不发模型请求、不需要 API key。
+
+```bash
+# 1. 打包精确交付物（npm pack 的 stdout 只有文件名）
+TGZ="$PWD/$(npm pack)"
+
+# 2. 装进临时 DSH_HOME 的 web profile（首次会自动初始化该 profile）
+export DSH_HOME="$(mktemp -d)" DSH_TELEMETRY_DISABLED=1
+dsh plugin --profile web add "$TGZ"
+dsh --profile web --dump-config | grep taskforce   # 应出现 taskforce 与 taskforce-store 两行
+
+# 3. 回环试挂：日志应出现 [taskforce] preset "taskforce" declared (21 rows)，
+#    且无 failed to import / activate；确认后 Ctrl-C 退出
+dsh --profile web --host 127.0.0.1 --port 0 --no-open
+
+# 4. 全量原生验收（自建并清理自己的临时 home）；anchor 取自 PATH 上的 dsh
+ANCHOR="$(dirname "$(dirname "$(realpath "$(command -v dsh)")")")/package.json"
+npm run test:all -- --install-anchor "$ANCHOR"     # 须见 HOST_VERIFIED 与 ISOLATION_VERIFIED
+
+rm -rf "$DSH_HOME" "$TGZ"; unset DSH_HOME
+```
+
+`21 rows` 是预设顶层行数；`verify-preset` 报告的 `29 rows` 含嵌套 group 内的行，两者不矛盾。生产实例的安装、备份与回滚仍按 [DELIVERY.md](docs/DELIVERY.md) 执行。
+
 ## 已知边界
 
 读取快照、证据归属与验收约束已保留；默认 STALL 仅观察、不降档。ECHO 统一按调用发起顺序判断，旧成功不能清空新失败；native/PTC 的调用 ID 按所属 turn/step 区分，外层传输成功不代替内层工具成功。派发计数保留全部尝试与失败回执，未结算估计会扣除失败，不冒充实际存活代理数。

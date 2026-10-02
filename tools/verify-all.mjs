@@ -36,6 +36,7 @@ const TESTS = [
   'docs-contract.test.mjs',
   'exit-propagation.test.mjs',
   'repo-hygiene.test.mjs',
+  'error-code-contract.test.mjs',
   'workflow-contract.test.mjs',
   'engines-contract.test.mjs',
 ]

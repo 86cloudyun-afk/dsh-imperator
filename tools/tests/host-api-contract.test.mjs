@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
@@ -19,20 +20,43 @@ import { resolveInstallAnchor } from '../host-runtime.mjs'
  * 不假装通过。
  */
 
-let hostRoot = null
+let hostRequire = null
+let hostResolverNote = null
 let skipReason = null
 try {
   const anchor = resolveInstallAnchor({})
-  // anchor = <prefix>/.../@deepseek-ai/dsh/package.json → 同级目录即兄弟宿主包所在处
-  hostRoot = dirname(dirname(anchor))
+  // 用宿主自己的解析器定位兄弟包：createRequire(anchor) 会按 Node 算法
+  // 依次在 <dsh>/node_modules → 上层 node_modules 中查找，因此**嵌套布局**
+  // （…/node_modules/@deepseek-ai/dsh/node_modules/@deepseek-ai/dsh-scope）与
+  // **扁平布局**（…/node_modules/@deepseek-ai/dsh-scope）都能解析。
+  // 注意：不能用 dirname(dirname(anchor)) 拼接——那只在扁平布局下成立。
+  hostRequire = createRequire(anchor)
+  hostResolverNote = `anchor=${anchor}`
 } catch (error) {
   skipReason = `requires a resolvable @deepseek-ai/dsh install (anchor/PATH): ${error.message}`
 }
 
 async function importHost(pkg, entry) {
-  const modulePath = join(hostRoot, pkg, entry)
+  const name = `@deepseek-ai/${pkg}`
+  let packageRoot
+  try {
+    // 首选：用 package.json 定位包根（最精确）
+    packageRoot = dirname(hostRequire.resolve(`${name}/package.json`))
+  } catch (primaryError) {
+    // 回退：部分包的 exports 未开放 ./package.json —— 由入口文件回溯包根
+    let entryPath
+    try {
+      entryPath = hostRequire.resolve(name)
+    } catch (fallbackError) {
+      throw new Error(`宿主包 ${name} 无法解析（宿主布局或包名已变化）：${fallbackError.message}；${hostResolverNote}`)
+    }
+    const marker = `/${pkg}`
+    const index = entryPath.lastIndexOf(marker)
+    packageRoot = index < 0 ? dirname(entryPath) : entryPath.slice(0, index + marker.length)
+  }
+  const modulePath = join(packageRoot, entry)
   if (!existsSync(modulePath)) {
-    throw new Error(`宿主包路径不存在：${modulePath}（宿主布局或包名已变化）`)
+    throw new Error(`宿主包路径不存在：${modulePath}（包根 ${packageRoot}；入口 ${entry}）`)
   }
   return import(pathToFileURL(modulePath).href)
 }

@@ -1130,4 +1130,4 @@ console.log('')
 console.log('══════════════════════════════════════════════════════════════════')
 console.log(`结果：${passed} PASS / ${failed} FAIL`)
 console.log('══════════════════════════════════════════════════════════════════')
-process.exit(failed === 0 ? 0 : 1)
+process.exitCode = failed === 0 ? 0 : 1

@@ -39,6 +39,7 @@ const TESTS = [
   'error-code-contract.test.mjs',
   'workflow-contract.test.mjs',
   'engines-contract.test.mjs',
+  'code-hint-coverage.test.mjs',
   'mount-diagnostics.test.mjs',
 ]
 

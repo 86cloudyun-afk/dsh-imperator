@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -10,6 +10,8 @@ import { runVerification } from '../verify-all.mjs'
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const missingProfile = join(tmpdir(), 'taskforce-runner-no-profile')
 const missingInstall = join(tmpdir(), 'taskforce-runner-no-install')
+// native-only 测试只在 integration 分支的 native boundaries 调用中运行，不属于 offline 清单。
+const NATIVE_ONLY_TESTS = ['host-boundaries.test.mjs']
 
 test('offline runs six scripts and explicit test files, then marks host integration unverified', async () => {
   const calls = []
@@ -25,19 +27,13 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'verify-p3.mjs', 'verify-scope-guard.mjs', 'verify-child-control.mjs',
   ])
   assert.equal(calls[6].args[0], '--test')
-  assert.deepEqual(calls[6].args.slice(1).map((path) => path.split('/').at(-1)), [
-    'sqlite.test.mjs', 'store-atomicity.test.mjs', 'store-evidence.test.mjs',
-    'lifecycle.test.mjs', 'verify-runner.test.mjs', 'deliberate-orchestration.test.mjs',
-    'guard-causality.test.mjs',
-    'store-scope-integrity.test.mjs', 'sqlite-failure-safety.test.mjs',
-    'working-state.test.mjs', 'process-runner.test.mjs',
-    'context-boundaries.test.mjs', 'board-batching.test.mjs',
-    'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
-    'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
-    'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
-    'workflow-contract.test.mjs',
-    'mount-diagnostics.test.mjs',
-  ])
+  // 目录锚定：期望集合由 tools/tests 的实际内容推导——孤儿测试（在目录里但未注册）与幽灵条目
+  // （注册了但文件缺失）都会在此失败，且新增测试文件无需第二处手工同步。
+  const expectedOfflineTests = readdirSync(join(root, 'tools/tests'))
+    .filter((name) => name.endsWith('.test.mjs') && !NATIVE_ONLY_TESTS.includes(name))
+    .sort()
+  assert.deepEqual(calls[6].args.slice(1).map((path) => path.split('/').at(-1)).sort(), expectedOfflineTests,
+    'the offline test list must equal the .test.mjs files present in tools/tests (no orphans, no ghosts)')
   assert(calls.every(({ file, args, options }) => file === process.execPath
     && args.slice(args[0] === '--test' ? 1 : 0).every(isAbsolute)
     && options.timeout === 60_000 && options.shell === false))
@@ -161,4 +157,21 @@ test('offline mode never passes an anchor to verify-store', async () => {
     } })
   const store = calls.find(({ args }) => args[0].endsWith('verify-store.mjs'))
   assert.equal(store.args.length, 1)
+})
+
+test('native-only boundaries test stays wired into the integration run', async (t) => {
+  const fixture = mkdtempSync(join(tmpdir(), 'taskforce-runner-nativeonly-'))
+  t.after(() => rmSync(fixture, { recursive: true, force: true }))
+  const anchor = join(fixture, 'package.json')
+  writeFileSync(anchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
+  const calls = []
+  const result = await runVerification({ mode: 'integration', installAnchor: anchor,
+    runProcess: async (file, args, options) => {
+      calls.push({ file, args, options })
+      return { exitCode: 0 }
+    } })
+  assert.equal(result.ok, true)
+  const nativeCall = calls.find(({ args }) => args[0] === '--test'
+    && args.some((path) => NATIVE_ONLY_TESTS.includes(path.split('/').at(-1))))
+  assert.ok(nativeCall, `${NATIVE_ONLY_TESTS.join(', ')} must be exercised by the integration native boundaries call`)
 })

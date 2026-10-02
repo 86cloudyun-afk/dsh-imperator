@@ -23,6 +23,7 @@ const TESTS = [
   'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
   'docs-contract.test.mjs',
   'workflow-contract.test.mjs',
+  'engines-contract.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

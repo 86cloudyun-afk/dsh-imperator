@@ -22,6 +22,7 @@ const TESTS = [
   'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
   'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
   'workflow-contract.test.mjs',
+  'engines-contract.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

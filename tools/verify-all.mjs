@@ -37,6 +37,7 @@ const TESTS = [
   'exit-propagation.test.mjs',
   'repo-hygiene.test.mjs',
   'error-code-contract.test.mjs',
+  'sqlite-fault-hint.test.mjs',
   'workflow-contract.test.mjs',
   'engines-contract.test.mjs',
   'code-hint-coverage.test.mjs',

@@ -1038,6 +1038,85 @@ section('场景 D3：agent.ctx.tools.restrict 不可用 —— 降级路径 no-s
   )
 }
 
+/* ═══════════════ 场景 E：名单漂移诊断（只告警不拦截）═══════════════ */
+
+section('场景 E：DEFAULT_DENY 名单漂移诊断（AUDIT4 候选 3）')
+
+{
+  const drift = scope.executionLikeToolsNotDenied(
+    ['read', 'glob', 'exec_shell', 'apply_patch', 'todo_write', 'mmap_remove', 'bash'],
+    scope.DEFAULT_DENY,
+  )
+  check(
+    'E1',
+    '漂移判定：只报「疑似执行类且不在名单」的名字（编排工具与豁免不误报）',
+    JSON.stringify(drift) === JSON.stringify(['exec_shell', 'apply_patch']),
+    JSON.stringify(drift),
+  )
+
+  const host = makeHost({ surface: ['read', 'exec_shell'], executable: ['exec_shell'] })
+  const ctx = fakePluginCtx()
+  scope.apply(ctx, {})
+  const agent = host.makeAgent(MAIN_HEADER)
+  await ctx.emit('agent/created', { agent, source: 'new' })
+  const warns = warnsOf(ctx)
+  check(
+    'E2',
+    '端到端：激活时对漂移名字告警一次（含「只告警不拦截」声明）',
+    warns.some((text) => text.includes('疑似执行类') && text.includes('exec_shell')
+      && text.includes('只告警不拦截')),
+    JSON.stringify(warns),
+  )
+  check(
+    'E3',
+    '只告警不拦截：漂移工具仍按现状放行（诊断未改变任何行为）',
+    host.call('exec_shell', agent).ran === true,
+    JSON.stringify(host.call('exec_shell', agent)),
+  )
+
+  const cleanHost = makeHost({ surface: ['read', 'glob', 'todo_write'] })
+  const cleanCtx = fakePluginCtx()
+  scope.apply(cleanCtx, {})
+  await cleanCtx.emit('agent/created', { agent: cleanHost.makeAgent(MAIN_HEADER), source: 'new' })
+  check(
+    'E4',
+    '零漂移：工具面全为非执行类时不产生漂移告警（假命中=0）',
+    !warnsOf(cleanCtx).some((text) => text.includes('疑似执行类')),
+    JSON.stringify(warnsOf(cleanCtx)),
+  )
+
+  // E5-E8（REVIEW-15-16 独立复核补漏）：plugin_update 的遮蔽与诊断可捕获性 + 豁免腐烂守卫
+  check(
+    'E5',
+    'plugin_update 在 DEFAULT_DENY 内（与 plugin_install/remove 同类：下载并运行新插件代码）',
+    scope.DEFAULT_DENY.includes('plugin_update'),
+    JSON.stringify(scope.DEFAULT_DENY.filter((name) => name.startsWith('plugin_'))),
+  )
+  const pluginSurface = ['read', 'plugin_update', 'plugin_install']
+  check(
+    'E6',
+    'plugin_update 已被遮蔽时，漂移诊断不把它报为漏网',
+    scope.executionLikeToolsNotDenied(pluginSurface, scope.DEFAULT_DENY).length === 0,
+    JSON.stringify(scope.executionLikeToolsNotDenied(pluginSurface, scope.DEFAULT_DENY)),
+  )
+  check(
+    'E7',
+    '反向：从名单移除 plugin_update 后，诊断会报出它（证明该名字可被模式捕获）',
+    scope.executionLikeToolsNotDenied(pluginSurface,
+      scope.DEFAULT_DENY.filter((name) => name !== 'plugin_update')).includes('plugin_update'),
+    JSON.stringify(scope.executionLikeToolsNotDenied(pluginSurface,
+      scope.DEFAULT_DENY.filter((name) => name !== 'plugin_update'))),
+  )
+  const rottedExemptions = [...scope.DRIFT_EXEMPT]
+    .filter((name) => !scope.EXECUTION_LIKE_PATTERNS.some((pattern) => pattern.test(name)))
+  check(
+    'E8',
+    'DRIFT_EXEMPT 无腐烂：每条豁免仍被某个模式命中（否则豁免已无意义，应删除）',
+    rottedExemptions.length === 0,
+    JSON.stringify(rottedExemptions),
+  )
+}
+
 /* ═══════════════════════════ 汇总 ═══════════════════════════ */
 
 console.log('')

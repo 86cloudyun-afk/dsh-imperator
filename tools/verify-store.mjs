@@ -209,7 +209,7 @@ check(
 
 if (store === undefined) {
   console.log('\n服务未发布，后续断言无法进行。')
-  process.exit(1)
+  throw new Error('taskforceStore service was not published (S01 failed)')
 }
 
 const DB_PATH = store.dbPath
@@ -625,4 +625,4 @@ inspect.close()
 if (!KEEP) rmSync(TMP, { recursive: true, force: true })
 
 console.log(`退出码：${failed === 0 ? 0 : 1}`)
-process.exit(failed === 0 ? 0 : 1)
+process.exitCode = failed === 0 ? 0 : 1

@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, relative } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { test } from 'node:test'
@@ -7,8 +7,11 @@ import { test } from 'node:test'
 const root = fileURLToPath(new URL('../../', import.meta.url))
 
 // 环境兼容：本测试不依赖 .git / .github —— 同一套断言在仓库检出与 npm pack 产物（lib/tools/docs…）
-// 内都必须成立。文件遍历只依赖目录本身（跳过 node_modules/.git，缺失也不必存在）。
-const SKIP_DIRS = new Set(['node_modules', '.git'])
+// 内都必须成立。文件遍历只依赖目录本身（跳过 node_modules/.git/.worktrees，缺失也不必存在）。
+//
+// `.worktrees` 与本仓库 `.gitignore` 首行（`.worktrees/`）逐字对应：嵌套 worktree 是完整工作副本，
+// 不属于仓库内容；扫描它们会虚增计数，并可能把未提交内容误报为命中或以豁免掩盖。
+const SKIP_DIRS = new Set(['node_modules', '.git', '.worktrees'])
 const MAX_FILE_BYTES = 4 * 1024 * 1024
 
 const PATTERNS = [
@@ -89,3 +92,25 @@ test('exemption entries carry a non-empty, well-formed reason', () => {
     assert.ok(typeof reason === 'string' && reason.trim().length > 0, `豁免条目缺少原因: ${key}`)
   }
 })
+
+// 同步守卫（单向包含）：`.gitignore` 中的顶层目录模式必须都出现在 SKIP_DIRS 中——
+// 防止未来新增忽略目录（新的 worktree 布局、缓存目录等）时扫描范围悄悄失配。
+// 只做单向：SKIP_DIRS 允许有额外条目（如 `.git`，它不出现在 .gitignore 中）。
+// 打包产物不含 `.gitignore`（files 白名单之外），故该断言只在仓库检出内执行；
+// 源码树里文件缺失则 fail-closed（判据与 workflow/engines 契约测试一致：看 `.git` 是否存在）。
+const IGNORE_FILE = join(root, '.gitignore')
+const ignoreSkipReason = !existsSync(IGNORE_FILE) && !existsSync(join(root, '.git'))
+  ? 'packed deliverable excludes .gitignore — the ignore/skip sync contract is validated in the repository checkout'
+  : false
+
+test('.gitignore top-level directory patterns stay covered by SKIP_DIRS',
+  { skip: ignoreSkipReason }, () => {
+    const topLevelDirs = readFileSync(IGNORE_FILE, 'utf8').split('\n')
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0 && !line.startsWith('#') && !line.startsWith('!') && line.endsWith('/'))
+      .map((line) => line.replace(/^\//, '').replace(/\/$/, ''))
+      .filter((name) => name.length > 0 && !name.includes('/'))
+    const missing = topLevelDirs.filter((name) => !SKIP_DIRS.has(name))
+    assert.deepEqual(missing, [],
+      `以下 .gitignore 顶层目录未被 SKIP_DIRS 覆盖（扫描会误入）：${missing.join(', ')}`)
+  })

@@ -130,3 +130,33 @@ test('integration runs actual boot separately and cannot hide a boot failure beh
   assert.equal(calls[1].options.env.DSH_INSTALL_ANCHOR, anchor)
   assert.ok(calls[2].args[0].endsWith('verify-host.mjs'))
 })
+
+test('all mode hands a resolved anchor to verify-store so S33 cannot silently skip', async (t) => {
+  const fixture = mkdtempSync(join(tmpdir(), 'taskforce-runner-s33-'))
+  t.after(() => rmSync(fixture, { recursive: true, force: true }))
+  const anchor = join(fixture, 'package.json')
+  writeFileSync(anchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
+  const calls = []
+  const result = await runVerification({ mode: 'all', installAnchor: anchor,
+    runProcess: async (file, args, options) => {
+      calls.push({ file, args, options })
+      return { exitCode: 0 }
+    } })
+  assert.equal(result.ok, true)
+  const store = calls.find(({ args }) => args[0].endsWith('verify-store.mjs'))
+  assert.deepEqual(store.args.slice(1), ['--install-anchor', anchor])
+  for (const { args } of calls.filter(({ args }) => /verify-store-v[23]\.mjs$/.test(args[0]))) {
+    assert.equal(args.includes('--install-anchor'), false)
+  }
+})
+
+test('offline mode never passes an anchor to verify-store', async () => {
+  const calls = []
+  await runVerification({ mode: 'offline', installAnchor: join(tmpdir(), 'ignored', 'package.json'),
+    runProcess: async (file, args, options) => {
+      calls.push({ file, args, options })
+      return { exitCode: 0 }
+    } })
+  const store = calls.find(({ args }) => args[0].endsWith('verify-store.mjs'))
+  assert.equal(store.args.length, 1)
+})

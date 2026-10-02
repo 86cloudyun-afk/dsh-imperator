@@ -2,7 +2,8 @@
 /**
  * P2 事实库自测：在**临时目录**跑一遍完整闭环，绝不碰真实库。
  *
- * 跑法：`node tools/verify-store.mjs`（任意 cwd 都可；`--keep` 保留临时目录供检查）
+ * 跑法：`node tools/verify-store.mjs`（任意 cwd 都可；`--keep` 保留临时目录供检查；
+ *       `--install-anchor <dsh/package.json>` 或 `DSH_INSTALL_ANCHOR` 让 S33 真身交叉验证必跑）
  *
  * 它测什么：
  *   1. 两个插件行（store=host 平面、tools=agent 平面）用 fake ctx 真实 apply，
@@ -25,6 +26,8 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { DatabaseSync } from 'node:sqlite'
+import { createRequire } from 'node:module'
+import { resolveInstallAnchor } from './host-runtime.mjs'
 
 const KEEP = process.argv.includes('--keep')
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -98,8 +101,38 @@ function hashTree(dir, base = dir, acc = []) {
 
 const SOURCE_HASHES = hashTree(TMP_LIB)
 
-/** 真身 dsh-tools 的位置：让被测模块能解析到它。 */
+/**
+ * 显式 DSH 安装锚点：`--install-anchor <dsh/package.json>` 或 `DSH_INSTALL_ANCHOR`，
+ * 与 verify-all / verify-host 同一解析（host-runtime.resolveInstallAnchor）。
+ * 只认显式来源，不做 PATH 发现：离线 `npm test` 行为不变。显式锚点无效时失败，
+ * 不悄悄回退成 SKIP。
+ */
+function explicitAnchorArg(args) {
+  const inline = args.find((arg) => arg.startsWith('--install-anchor='))
+  const index = args.indexOf('--install-anchor')
+  return inline ? inline.slice('--install-anchor='.length) : index < 0 ? undefined : args[index + 1]
+}
+const EXPLICIT_ANCHOR = explicitAnchorArg(process.argv.slice(2)) ?? process.env.DSH_INSTALL_ANCHOR
+/** 有显式锚点时，S33 必须真跑：缺真身或兜底被启用都算 FAIL，而不是 SKIP。 */
+const NATIVE_REQUIRED = EXPLICIT_ANCHOR !== undefined && EXPLICIT_ANCHOR !== ''
+let anchorProblem
+let anchorToolsDir
+if (NATIVE_REQUIRED) {
+  try {
+    const anchor = resolveInstallAnchor({ installAnchor: EXPLICIT_ANCHOR })
+    // 官方安装把 dsh-tools 放在 dsh 自身依赖树里；从锚点解析，得到包根目录。
+    const entry = createRequire(anchor).resolve('@deepseek-ai/dsh-tools')
+    let dir = dirname(entry)
+    while (!existsSync(join(dir, 'package.json')) && dirname(dir) !== dir) dir = dirname(dir)
+    anchorToolsDir = dir
+  } catch (error) {
+    anchorProblem = error instanceof Error ? error.message : String(error)
+  }
+}
+
+/** 真身 dsh-tools 的位置：让被测模块能解析到它。锚点优先，其次旧的固定部署路径。 */
 const NATIVE_CANDIDATES = [
+  ...(anchorToolsDir === undefined ? [] : [anchorToolsDir]),
   '/opt/dsh/install/node_modules/@deepseek-ai/dsh-tools',
   join(REAL_DSH_HOME, '..', 'install', 'node_modules', '@deepseek-ai', 'dsh-tools'),
 ]
@@ -107,6 +140,7 @@ let nativeDir
 for (const candidate of NATIVE_CANDIDATES) {
   if (existsSync(join(candidate, 'package.json'))) { nativeDir = candidate; break }
 }
+if (NATIVE_REQUIRED && anchorToolsDir === undefined) nativeDir = undefined
 if (nativeDir !== undefined) {
   mkdirSync(join(TMP, 'node_modules', '@deepseek-ai'), { recursive: true })
   try {
@@ -536,8 +570,11 @@ if (nativeDir !== undefined && toolsMod.usingNativeDefineTool) {
     mismatches.length === 0,
     mismatches.join(' ; '),
   )
+} else if (NATIVE_REQUIRED) {
+  check('S33', '兜底编译 ≡ 真身编译（已提供 install anchor，必须真跑）', false,
+    anchorProblem ?? (nativeDir === undefined ? '锚点下未解析到 @deepseek-ai/dsh-tools' : '被测模块未加载真身 defineTool（兜底被启用）'))
 } else {
-  checkSkip('S33', '兜底编译 ≡ 真身编译', '本机没有真身 dsh-tools 或兜底被启用')
+  checkSkip('S33', '兜底编译 ≡ 真身编译', '本机没有真身 dsh-tools 或兜底被启用；传 --install-anchor 或 DSH_INSTALL_ANCHOR 以真跑')
 }
 
 check(

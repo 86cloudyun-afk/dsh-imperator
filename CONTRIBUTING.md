@@ -85,7 +85,7 @@ test(contract): 文档-实现一致性守卫（npm scripts + CLI flags + 豁免�
 - 正文建议包含：动机、改动清单、验证命令与结果（测试计数 / EXIT）、未覆盖项。
 - 出处：`git log`（上述 sha 可直接 `git show` 查看完整消息）。
 
-## 8. 两个实测陷阱（2026-10-02）
+## 8. 三个实测陷阱（2026-10-02）
 
 **`git push … | tail` 会吞退出码。** 实测 `git push … 2>&1 | tail -3` 得到 `PIPE_EXIT=0`，
 而推送实际失败（远端未更新）—— 管道退出码取的是 `tail` 的。判推送结果须用重定向：
@@ -97,7 +97,17 @@ test(contract): 文档-实现一致性守卫（npm scripts + CLI flags + 豁免�
 ⇒ **改 workflow 的分支必须走 SSH 推送**（本次用 `git@github.com:…` 成功）；
 **HTTPS token 仍可用于开 PR 与只读 API**。
 
-- 出处：本仓库 2026-10-02 实测。复现（两条均无副作用：失败推送不会改动远端）：
+**叠层合并禁用 `-X ours` / `-X theirs` 整文件覆盖。** 实测事故：叠层同步某分支时用 `-X ours`
+解决 `lib/tools/index.js` 的冲突，**静默冲掉了另一侧已登记的四个 hint 映射**
+（`E_STATUS` / `E_BLOCKERS` / `E_NOT_FOUND` / `E_STORE_INTEGRITY` → 各自的 `HINT_*` 常量），
+只留下该侧自己的 `HINT_STORE_FAULT`。**该丢失不报错、不留冲突标记**，直到 CI 上
+`code-hint-coverage` 与 `error-code-contract` 两个守卫报出 `not ok` 才被发现
+（**`main` 一度为红**，由 PR #24 补回四条映射）。
+⇒ **纪律**：多 PR 叠层 / rebase 时**不要用 `-X ours` / `-X theirs` 整文件覆盖** —— 它会丢弃
+另一侧对该文件的全部改动且无任何提示。**应按 hunk 逐处判断**（本仓库绝大多数冲突是
+"末尾追加型"，取并集即可）；确需整侧取舍时，**必须在提交信息里写明取舍理由**并单独复核。
+
+- 出处：本仓库 2026-10-02 实测。复现（三条均无副作用）：
   ```sh
   # ① 管道 vs 重定向：同一失败推送，管道得 0、重定向得 1
   git push origin refs/heads/__nonexistent__:refs/heads/__nonexistent__ 2>&1 | tail -3; echo "PIPE_EXIT=$?"
@@ -106,6 +116,9 @@ test(contract): 文档-实现一致性守卫（npm scripts + CLI flags + 豁免�
   #    git worktree add /tmp/wf -b probe/wf origin/main && cd /tmp/wf
   #    printf '\n# probe\n' >> .github/workflows/verify.yml
   #    git add -A && git commit -m probe && git push origin probe/wf
+  # ③ -X ours 的静默丢失：同一文件两侧各有改动时，merge -X ours 只保留当前侧，
+  #    另一侧改动全部消失且无冲突标记（判据只能靠合并后的全量验证）：
+  #    node tools/verify-all.mjs --mode=offline   # 必须 EXIT=0
   ```
 
 ## 附：出处索引
@@ -119,4 +132,4 @@ test(contract): 文档-实现一致性守卫（npm scripts + CLI flags + 豁免�
 | 5 | 四段式 PR 描述 / 变异自证 | PR #1–#4 描述、PR #4 的变异双向记录 |
 | 6 | 冻结契约四要素 | `README.md`「命名」节 |
 | 7 | 提交消息风格 | `git log`（d2b597d / 56c7c24 / aabb94e） |
-| 8 | 两个实测陷阱（管道吞退出码 / workflow 需 SSH 推送） | 本仓库 2026-10-02 实测（见 §8 的复现命令） |
+| 8 | 三个实测陷阱（管道吞退出码 / workflow 需 SSH 推送 / `-X ours` 静默丢失） | 本仓库 2026-10-02 实测（见 §8 的复现命令）；`-X ours` 事故由 PR #24 修复（commit 9280e7e） |

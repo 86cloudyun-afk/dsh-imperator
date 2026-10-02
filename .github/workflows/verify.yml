@@ -47,13 +47,17 @@ jobs:
   native-host:
     runs-on: ubuntu-24.04
     timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.23.2', '24.19.0']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: '24.19.0'
+          node-version: ${{ matrix.node }}
       - name: Install pinned official DSH
         run: npm install --global --prefix "$RUNNER_TEMP/dsh-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.0-rc.2
       - name: Pack exact deliverable and record inputs
@@ -82,7 +86,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: taskforce-delivery-${{ github.run_id }}-${{ github.run_attempt }}
+          name: taskforce-delivery-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.node }}
           path: ${{ runner.temp }}/taskforce-native/
           retention-days: 14
           if-no-files-found: error

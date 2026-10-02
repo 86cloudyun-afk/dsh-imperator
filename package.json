@@ -5,6 +5,9 @@
   "type": "module",
   "description": "DSH Imperator (dsh指挥官) — 主会话统御决策、子代理军团执行的多 agent 生产工具（DSH agent preset）",
   "main": "lib/index.js",
+  "engines": {
+    "node": "^22.23.2 || ^24.19.0"
+  },
   "scripts": {
     "test": "node tools/verify-all.mjs --mode=offline",
     "test:integration": "node tools/verify-all.mjs --mode=integration",

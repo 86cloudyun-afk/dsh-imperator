@@ -187,3 +187,32 @@ test('a native host with unavailable scope support fails activation instead of a
   const ctx = { get: name => name === 'pluginPackages' ? { packageOf: () => undefined } : undefined }
   assert.throws(() => createScopeMembership(ctx), /native scope unavailable/)
 })
+
+test('a standalone host without native scope or a composed preset owns every agent', async t => {
+  const { createRequire } = await import('node:module')
+  const { createScopeMembership } = await import('../../lib/plugins/scope-membership.mjs')
+  // 设施自证：本断言针对「既解析不到 native scope、也没有组合预设」的兜底放行分支。
+  // 若该环境恰好能解析到 @deepseek-ai/dsh-scope，兜底分支不可达 —— 如实跳过并写明原因，
+  // 而不是让断言在另一条分支上假装通过（native scope 路径由上一个测试覆盖）。
+  let nativeScopeResolvable = true
+  try { createRequire(import.meta.url)('@deepseek-ai/dsh-scope') } catch { nativeScopeResolvable = false }
+  if (nativeScopeResolvable) {
+    t.skip('native @deepseek-ai/dsh-scope resolves in this environment; the standalone fallback is unreachable')
+    return
+  }
+  // ① 既无 native scope、也无 agentPresets 注册表 ⇒ 显式安装的独立插件必须放行自己的 agent
+  const owns = createScopeMembership({ get: () => undefined })
+  assert.equal(owns({ ctx: {} }), true, 'a standalone plugin must own its own agents')
+  assert.equal(owns(undefined), true, 'the fallback must not depend on the agent object being well formed')
+  // ② 宿主暴露注册表但未声明组合预设（composedPreset → undefined）⇒ 仍走兜底放行
+  const ownsUncomposed = createScopeMembership({ preset: 'taskforce', get: name => name === 'agentPresets'
+    ? { composedPreset: () => undefined } : undefined })
+  assert.equal(ownsUncomposed({ ctx: {} }), true)
+  // ③ 正对照：一旦宿主声明了组合预设，同一个函数不再无条件放行 ⇒ 证明 ① 的 true 来自兜底
+  //    分支，而不是「这个函数对任何输入都返回 true」。注意 composedPreset 收到的是**宿主** ctx。
+  const ownsComposed = createScopeMembership({ preset: 'taskforce', get: name => name === 'agentPresets'
+    ? { composedPreset: target => target?.preset } : undefined })
+  assert.equal(ownsComposed({ ctx: { preset: 'taskforce' } }), true)
+  assert.equal(ownsComposed({ ctx: { preset: 'standard' } }), false,
+    'a declared composed preset must restrict membership to the matching scope')
+})

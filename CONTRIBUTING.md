@@ -85,6 +85,29 @@ test(contract): 文档-实现一致性守卫（npm scripts + CLI flags + 豁免�
 - 正文建议包含：动机、改动清单、验证命令与结果（测试计数 / EXIT）、未覆盖项。
 - 出处：`git log`（上述 sha 可直接 `git show` 查看完整消息）。
 
+## 8. 两个实测陷阱（2026-10-02）
+
+**`git push … | tail` 会吞退出码。** 实测 `git push … 2>&1 | tail -3` 得到 `PIPE_EXIT=0`，
+而推送实际失败（远端未更新）—— 管道退出码取的是 `tail` 的。判推送结果须用重定向：
+`git push … > /tmp/push.log 2>&1; echo "EXIT=$?"`，并核对 `git ls-remote` 的实际 sha。
+（这是 §2「不要用管道看汇总」的又一实例。）
+
+**HTTPS token 推不动 `.github/workflows/`。** 用 HTTPS token 推送改动 workflow 文件的分支被拒：
+`refusing to allow an OAuth App to create or update workflow .github/workflows/verify.yml without workflow scope`。
+⇒ **改 workflow 的分支必须走 SSH 推送**（本次用 `git@github.com:…` 成功）；
+**HTTPS token 仍可用于开 PR 与只读 API**。
+
+- 出处：本仓库 2026-10-02 实测。复现（两条均无副作用：失败推送不会改动远端）：
+  ```sh
+  # ① 管道 vs 重定向：同一失败推送，管道得 0、重定向得 1
+  git push origin refs/heads/__nonexistent__:refs/heads/__nonexistent__ 2>&1 | tail -3; echo "PIPE_EXIT=$?"
+  git push origin refs/heads/__nonexistent__:refs/heads/__nonexistent__ > /tmp/p.log 2>&1; echo "REAL_EXIT=$?"
+  # ② 在改动 .github/workflows/ 的分支上经 HTTPS 推送 ⇒ remote 拒绝（消息见上）：
+  #    git worktree add /tmp/wf -b probe/wf origin/main && cd /tmp/wf
+  #    printf '\n# probe\n' >> .github/workflows/verify.yml
+  #    git add -A && git commit -m probe && git push origin probe/wf
+  ```
+
 ## 附：出处索引
 
 | # | 实践 | 出处 |
@@ -96,3 +119,4 @@ test(contract): 文档-实现一致性守卫（npm scripts + CLI flags + 豁免�
 | 5 | 四段式 PR 描述 / 变异自证 | PR #1–#4 描述、PR #4 的变异双向记录 |
 | 6 | 冻结契约四要素 | `README.md`「命名」节 |
 | 7 | 提交消息风格 | `git log`（d2b597d / 56c7c24 / aabb94e） |
+| 8 | 两个实测陷阱（管道吞退出码 / workflow 需 SSH 推送） | 本仓库 2026-10-02 实测（见 §8 的复现命令） |

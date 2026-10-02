@@ -1100,4 +1100,4 @@ console.log(`源码指纹 lib/tools/index.js sha256:${SRC_SHA}`)
 if (failed > 0) {
   console.log('失败项：' + rows.filter((r) => !r.ok).map((r) => r.id).join(', '))
 }
-process.exit(failed === 0 ? 0 : 1)
+process.exitCode = failed === 0 ? 0 : 1

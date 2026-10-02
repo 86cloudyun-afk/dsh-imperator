@@ -44,7 +44,8 @@ test('store 业务方法体内不得出现裸 throw new Error（必须用 refuse
   const lines = storeSrc.split('\n')
   const violations = []
   lines.forEach((line, i) => {
-    if (!/throw new Error\(/.test(line)) return
+    // 同时捕获 `throw new Error(` 与三元假枝 `: new Error(`（后者曾漏掉 submitTask）。
+    if (!/throw new Error\(/.test(line) && !(/throw\b/.test(line) && /:\s*new Error\(/.test(line))) return
     if (/^\s*\*/.test(line) || line.includes('用法约束')) return // 注释里的示例文本
     const owner = ownerFunctionOf(lines, i)
     if (!BARE_ERROR_ALLOWED.has(owner)) {

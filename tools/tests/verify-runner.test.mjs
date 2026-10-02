@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -175,3 +175,25 @@ test('native-only boundaries test stays wired into the integration run', async (
     && args.some((path) => NATIVE_ONLY_TESTS.includes(path.split('/').at(-1))))
   assert.ok(nativeCall, `${NATIVE_ONLY_TESTS.join(', ')} must be exercised by the integration native boundaries call`)
 })
+
+for (const mode of ['integration', 'all']) {
+  test(`${mode} runs host API contracts with the resolved installation anchor`, async (t) => {
+    const fixture = mkdtempSync(join(tmpdir(), 'taskforce-runner-contract-'))
+    t.after(() => rmSync(fixture, { recursive: true, force: true }))
+    const anchor = join(fixture, 'package.json')
+    writeFileSync(anchor, JSON.stringify({ name: '@deepseek-ai/dsh', version: '0.2.0-rc.2' }))
+    const calls = []
+    const result = await runVerification({ mode, installAnchor: anchor,
+      runProcess: async (file, args, options) => {
+        calls.push({ file, args, options })
+        return { exitCode: 0 }
+      } })
+    assert.equal(result.ok, true)
+    const nativeCall = calls.find(({ args }) => args[0] === '--test'
+      && args.includes(join(root, 'tools/tests/host-boundaries.test.mjs')))
+    assert.ok(nativeCall, `${mode} must run native boundaries`)
+    assert.ok(nativeCall.args.includes(join(root, 'tools/tests/host-api-contract.test.mjs')),
+      `${mode} must run host API contracts in the anchored native invocation`)
+    assert.equal(nativeCall.options.env.DSH_INSTALL_ANCHOR, realpathSync(anchor))
+  })
+}

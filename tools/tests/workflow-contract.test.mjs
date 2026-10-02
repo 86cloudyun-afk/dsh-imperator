@@ -40,3 +40,22 @@ test('tar unpack and checksum reuse the single resolved filename', { skip: packe
   const checksumLine = exactlyOneLineContaining('source.tar.gz > SHA256SUMS')
   assert.match(checksumLine, /\$PACK_FILE/, 'checksums must cover the same resolved deliverable file')
 })
+
+// 每个 uses: 行必须同时是「40 位十六进制 SHA」且带「# vX.Y.Z」版本备注。
+// 出处：notes/AUDIT-imperator-20261002T064348Z.md 候选 C2 ——
+// docs/superpowers/plans/2026-09-29-taskforce-phase-a.md:162 要求 actions 固定为
+// 「经官方 tag 核对的 SHA」；版本注释正是该核对留下的可审计痕迹。
+const PINNED_ACTION = /^uses: [^\s@]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$/
+
+test('every pinned action carries a 40-hex SHA and its version comment', { skip: packedSkipReason }, () => {
+  const usesLines = lines
+    .filter((line) => /^\s*(?:- )?uses:/.test(line))
+    .map((line) => line.trim().replace(/^- /, ''))
+  // fail-loud 自证：静态解析型守卫最常见的自失效方式是「解析塌了 ⇒ 空集 ⇒ 恒真」，
+  // 所以先钉住数量下限（工作流现有 6 条 uses: 行）——解析失败必须报错而非静默全绿。
+  assert.ok(usesLines.length >= 6, `expected at least six uses: lines, parsed ${usesLines.length}`)
+  for (const line of usesLines) {
+    assert.match(line, PINNED_ACTION,
+      `a pinned action must carry a 40-hex SHA plus a trailing "# vX.Y.Z" comment, got ${JSON.stringify(line)}`)
+  }
+})

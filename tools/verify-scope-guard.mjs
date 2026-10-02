@@ -985,6 +985,10 @@ section('场景 D2：guard 注册被拒 —— 降级路径 guard-refused（含�
     `visible=${JSON.stringify(host.visibleNames(agent))}`,
   )
 
+  // 边界声明（REVIEW-15-16 Q3，复核者 cdc017d2）：下面的「宿主恢复」是**显式夹具翻转**
+  // （`setGuardRefusal(undefined)`），只覆盖**插件侧的每步重试路径** —— 它不模拟宿主
+  // registry 的真实恢复时序（何时恢复、恢复瞬间是否存在并发调用窗口）。该时序需在集成
+  // 环境（真实宿主）另验；此处断言的是「插件在恢复后的一次复核内即重装守卫」。
   host.setGuardRefusal(undefined) // 宿主恢复
   await tick(ctx, agent)
   check(

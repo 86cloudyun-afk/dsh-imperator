@@ -35,6 +35,7 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'read-snapshot.test.mjs', 'lifecycle-recovery.test.mjs',
     'ptc-events.test.mjs', 'store-reassignment.test.mjs', 'host-runtime.test.mjs',
     'integration-contract.test.mjs', 'package-delivery.test.mjs', 'preset-isolation.test.mjs',
+    'exit-propagation.test.mjs',
     'workflow-contract.test.mjs',
   ])
   assert(calls.every(({ file, args, options }) => file === process.execPath

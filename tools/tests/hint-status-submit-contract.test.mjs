@@ -168,3 +168,32 @@ test('store 头注释与 docs/STORE.md 的 rejected 行与 submitTask 实现一�
   assert.match(storeSrc, /\| `rejected` \| ✓ \| ✓ \| ✓ \| ✗ `E_STATUS`（须先 claim） \|/)
   assert.match(docsSrc, /\| `rejected` \| ✓ \| ✓ \| ✓ \| ✗ `E_STATUS`（须先 claim） \|/)
 })
+
+const toolsSrc = readFileSync(fileURLToPath(new URL('../../lib/tools/index.js', import.meta.url)), 'utf8')
+
+/** Extract a TOOL_SPECS description string for one tool (concatenated adjacent literals). */
+function toolSpecDescription(src, name) {
+  const start = src.indexOf(`  ${name}: {`)
+  assert.ok(start >= 0, `TOOL_SPECS entry ${name} missing`)
+  const params = src.indexOf('    parameters:', start)
+  assert.ok(params > start, `${name}: parameters block missing`)
+  const chunk = src.slice(start, params)
+  const parts = [...chunk.matchAll(/'((?:\\'|[^'])*)'/g)].map((m) => m[1].replace(/\\'/g, "'"))
+  assert.ok(parts.length > 0, `${name}: no description literals`)
+  return parts.join('')
+}
+
+test('TOOL_SPECS.task_claim/task_submit descriptions match #30 measured retry contracts', () => {
+  const claim = toolSpecDescription(toolsSrc, 'task_claim')
+  const submit = toolSpecDescription(toolsSrc, 'task_submit')
+  // Stale pre-#30 claim wording omitted same-owner claimed retry and would steer models away from idempotent reclaims.
+  assert.doesNotMatch(claim, /只能认领\*\*当前工作实例\*\*内、状态为 open 或 rejected 的任务/)
+  assert.match(claim, /open \/ rejected → claimed/)
+  assert.match(claim, /同 owner.*already:true/)
+  assert.match(claim, /不同 owner.*冲突/)
+  assert.match(claim, /updated_at.*claimed_at/)
+  assert.match(submit, /open \/ claimed → submitted/)
+  assert.match(submit, /submitted 上重复提交幂等（already:true/)
+  assert.match(submit, /rejected 不可直接提交/)
+  assert.match(submit, /须先 task_claim/)
+})

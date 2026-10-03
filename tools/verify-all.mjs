@@ -39,6 +39,7 @@ const TESTS = [
   'repo-hygiene.test.mjs',
   'error-code-contract.test.mjs',
   'submit-status-code.test.mjs',
+  'hint-status-submit-contract.test.mjs',
   'sqlite-fault-hint.test.mjs',
   'host-api-contract.test.mjs',
   'workflow-contract.test.mjs',

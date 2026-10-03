@@ -211,3 +211,28 @@ test('TOOL_SPECS.task_close description inherits submit retry contract for done/
   assert.match(docsSrc, /`task_close`.*`rejected` 须先 claim/)
   assert.match(docsSrc, /`task_submit`.*`rejected` 不可直提/)
 })
+
+test('TOOL_SPECS.task_reject/task_fact list full TERMINAL_STATUSES including historical done/partial/failed', () => {
+  const reject = toolSpecDescription(toolsSrc, 'task_reject')
+  const fact = toolSpecDescription(toolsSrc, 'task_fact')
+  // Store rejectTask / recordFact treat all five TERMINAL_STATUSES as frozen (and rejectable for reopen).
+  // Stale specs that only named accepted/cancelled steered models away from reopening migrated rows.
+  const full = /accepted \/ cancelled \/ done \/ partial \/ failed/
+  assert.match(reject, full)
+  assert.match(fact, full)
+  assert.doesNotMatch(reject, /对终态任务（accepted \/ cancelled）/)
+  assert.doesNotMatch(fact, /任务已收口（accepted\/cancelled）后/)
+  assert.match(docsSrc, /已收口（`accepted` \/ `cancelled` \/ 历史终态 `done` \/ `partial` \/ `failed`）/)
+})
+
+test('E_TERMINAL hint enumerates the full terminal set used by rejectTask', async (t) => {
+  const store = tempStore(t)
+  const task_id = seedSubmitted(store, 'run-a')
+  store.acceptTask({ task_id, note: 'ok' }, 'run-a', 'lead')
+  const { call } = toolCaller(store)
+  const result = await call('task_close', { task_id, result: 'failed' })
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'E_TERMINAL')
+  assert.match(result.hint, /accepted \/ cancelled \/ done \/ partial \/ failed/)
+  assert.doesNotMatch(result.hint, /accepted \/ cancelled 等终态/)
+})

@@ -197,3 +197,17 @@ test('TOOL_SPECS.task_claim/task_submit descriptions match #30 measured retry co
   assert.match(submit, /rejected 不可直接提交/)
   assert.match(submit, /须先 task_claim/)
 })
+
+test('TOOL_SPECS.task_close description inherits submit retry contract for done/partial', () => {
+  const close = toolSpecDescription(toolsSrc, 'task_close')
+  // close(done/partial) delegates to submitTask; stale wording only said "等价于 task_submit"
+  // without naming rejected→E_STATUS or submitted idempotency, which steers models the same way #31 fixed for task_submit.
+  assert.match(close, /open \/ claimed → submitted/)
+  assert.match(close, /submitted 上重复调用幂等（already:true/)
+  assert.match(close, /rejected 上 close\(done\/partial\) 不可直提/)
+  assert.match(close, /须先 task_claim/)
+  assert.match(close, /failed.*cancelled/)
+  assert.match(close, /E_TERMINAL/)
+  assert.match(docsSrc, /`task_close`.*`rejected` 须先 claim/)
+  assert.match(docsSrc, /`task_submit`.*`rejected` 不可直提/)
+})

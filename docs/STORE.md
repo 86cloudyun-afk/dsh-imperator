@@ -203,10 +203,10 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `task_open` | `title`(必), `note?` | 主/子 | 开任务，归属 = 调用者的 run |
 | `task_claim` | `task_id`(必), `child_id`(必) | 主/子 | `open`/`rejected` 可认领，同 owner 幂等；仅主控可在 `rejected` 时换 owner，原子写 decision 与 handoff；**终态不可认领** |
 | `task_fact` | `task_id`(必), `kind`(必, enum), `statement`(必), `evidence_path?`, `evidence_line?`, `confidence?`(enum), `resolves_fact_id?`, `child_id?` | 主/子 | 落一条事实；**终态任务上只有 `kind=blocker` 允许**（标 `late`，进 `late_blockers`），其余 `E_TERMINAL` |
-| `task_submit` | `task_id`(必), `note?` | 主/子 | **提交待验收** → `submitted` |
+| `task_submit` | `task_id`(必), `note?` | 主/子 | **提交待验收**：`open`/`claimed` → `submitted`；`submitted` 幂等（`already:true`）；**`rejected` 不可直提（`E_STATUS`，须先 `task_claim`）** |
 | `task_accept` | `task_id`(必), `note?`, `waiver_reason?` | **仅主会话** | **验收通过** → `accepted`；有未解 blocker 一律拒绝；**无执行依据也拒绝**（`waiver_reason` = 显式人工豁免） |
 | `task_reject` | `task_id`(必), `reason`(必) | **仅主会话** | `submitted` → **打回**（`rejected`）；**终态** → **重新复核**（`reopened:true`，任务回待办板） |
-| `task_close` | `task_id`(必), `result`(必, enum), `note?` | 主/子 | 兼容别名：`done`/`partial` → `submitted`，`failed` → `cancelled`；**终态任务一律拒绝** |
+| `task_close` | `task_id`(必), `result`(必, enum), `note?` | 主/子 | 兼容别名：`done`/`partial` 同 `task_submit`（含 `submitted` 幂等；**`rejected` 须先 claim**）；`failed` → `cancelled`；**终态任务一律拒绝（`E_TERMINAL`）** |
 | `task_board` | `task_id?` | 主/子 | 读板（范围恒为本 run；返回体带 `viewer` / `can_accept` / `late_blockers`） |
 
 参数经 `defineTool` 编译成 raw JSON Schema（`required` 与 `enum` 都进 schema）；

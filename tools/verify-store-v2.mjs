@@ -283,8 +283,10 @@ section('A. 工作实例（run）隔离 —— store 层')
 
   const a3 = store.openTask({ title: 'A-run 的第三任务' }, LEAD_A)
   const closeFailed = store.closeTask({ task_id: a3.task_id, result: 'failed' }, LEAD_A)
-  check('B09', 'task_close(failed) → cancelled（主动放弃，不可再验收）',
-    closeFailed.status === 'cancelled' && closeFailed.mapped_status.includes('cancelled'),
+  check('B09', 'task_close(failed) → cancelled，且 alias_of 不得自称 submitTask',
+    closeFailed.status === 'cancelled'
+      && closeFailed.mapped_status.includes('cancelled')
+      && closeFailed.alias_of === null,
     JSON.stringify(closeFailed))
 
   const badReason = thrownOf(() => store.rejectTask({ task_id: a2.task_id }, LEAD_A, 'lead'))

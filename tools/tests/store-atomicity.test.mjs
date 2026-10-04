@@ -54,7 +54,9 @@ test('failed close note failure rolls back cancellation; no-note close and alias
   store.handle.exec("CREATE TEMP TRIGGER fail_cancel BEFORE INSERT ON fact BEGIN SELECT RAISE(ABORT,'cancel audit failure'); END")
   assert.throws(() => store.closeTask({ task_id: id, result: 'failed', note: '原因' }, 'run-a'), /cancel audit failure/)
   assert.deepEqual(snapshot(store, id), before)
-  assert.equal(store.closeTask({ task_id: id, result: 'failed' }, 'run-a').status, 'cancelled')
+  const cancelled = store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+  assert.equal(cancelled.status, 'cancelled')
+  assert.equal(cancelled.alias_of, null)
   assert.deepEqual(facts(store, id), [])
   store.handle.exec('DROP TRIGGER fail_cancel')
   for (const result of ['done', 'partial']) {

@@ -48,6 +48,11 @@ test('E_STATUS hint distinguishes claim/submit transitions and their measured re
   assert.match(result.hint, /rejected 须先 task_claim/)
   assert.match(result.hint, /close\(done\/partial\) 同 submit/)
   assert.match(result.hint, /close\(failed\) 单独取消为 cancelled/)
+  // rejectTask is dual-use: submitted→打回 AND terminal→显式重新复核. Conflating
+  // "accept / reject 只在 submitted" steers models away from task_reject on closed tasks.
+  assert.doesNotMatch(result.hint, /accept \/ reject 只在 submitted 可用/)
+  assert.match(result.hint, /accept 只在 submitted 可用/)
+  assert.match(result.hint, /reject 在 submitted（打回）或终态（显式重新复核）可用/)
   assert.match(result.hint, /身份、当前 run 与参数检查/)
 })
 
@@ -211,3 +216,10 @@ test('TOOL_SPECS.task_close description inherits submit retry contract for done/
   assert.match(docsSrc, /`task_close`.*`rejected` 须先 claim/)
   assert.match(docsSrc, /`task_submit`.*`rejected` 不可直提/)
 })
+
+test('HINT_STATUS separates accept(submitted-only) from reject(submitted-or-terminal reopen)', () => {
+  // Mirrors rejectTask: submitted → 打回; TERMINAL_STATUSES → 显式重新复核.
+  assert.doesNotMatch(toolsSrc, /accept \/ reject 只在 submitted 可用/)
+  assert.match(toolsSrc, /accept 只在 submitted 可用；reject 在 submitted（打回）或终态（显式重新复核）可用/)
+})
+

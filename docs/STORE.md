@@ -128,7 +128,7 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 | `submitTask` | `({ task_id, note? }, runId)` | `{ task_id, status:'submitted', submitted_at, fact_count, blockers, warnings[], next }` |
 | `acceptTask` | `({ task_id, note?, waiver_reason? }, runId, actor)`（`actor` 必须 `'lead'`；`waiver_reason` = 显式人工豁免） | `{ task_id, status:'accepted', accepted_at, fact_count, resolved_blockers, evidence_basis{count,fact_ids,with_pointer,unattributed}, waiver, warnings[] }`；缺依据且无豁免 → `E_EVIDENCE_MISSING` |
 | `rejectTask` | `({ task_id, reason }, runId, actor)`（`reason` 必填） | `submitted` → `{ task_id, status:'rejected', rejected_at, reason, facts_to_fix, owner, reopened:false, previous_status:null, late_blockers:[], next }`；**终态 → 重新复核** `{ …, reopened:true, previous_status:'accepted', late_blockers:[…] }` |
-| `closeTask` | `({ task_id, result ∈ done/partial/failed, note? }, runId)` | **兼容别名**：`done`/`partial` → `submitted`（附注转交 `submitTask`），`failed` → `cancelled`（有附注时写取消裁决）；返回体带 `alias_of` 与 `mapped_status`。**永不产生 `accepted`**；**终态任务一律拒绝**（`E_TERMINAL`，先查原状态） |
+| `closeTask` | `({ task_id, result ∈ done/partial/failed, note? }, runId)` | **兼容别名**：`done`/`partial` → `submitted`（附注转交 `submitTask`，`alias_of:'submitTask'`），`failed` → `cancelled`（有附注时写取消裁决，`alias_of:null` —— 取消不是 submit 别名）；返回体另带 `mapped_status`。**永不产生 `accepted`**；**终态任务一律拒绝**（`E_TERMINAL`，先查原状态） |
 | `taskOf` | `(task_id \| { task_id }, runId)` | `{ task, fact_count, last_fact_at, blockers, open }` |
 | `board` | `({} \| { task_id }, runId)` | 见下 |
 | `stats` | `(runId)` | `{ run_id, tasks{…}, facts{…}, blockers_open, blockers_late }`；缺省 = 未归属域 |

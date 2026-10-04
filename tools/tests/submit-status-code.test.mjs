@@ -93,3 +93,21 @@ test('submitTask on accepted still refuses with E_TERMINAL', (t) => {
     },
   )
 })
+
+test('closeTask(failed) cancels with alias_of null (not submitTask)', (t) => {
+  const store = tempStore(t)
+  store.open()
+  const run = 'run-a'
+  const { task_id } = store.openTask({ title: '放弃' }, run)
+  const closed = store.closeTask({ task_id, result: 'failed', note: '不做了' }, run)
+  assert.equal(closed.status, 'cancelled')
+  assert.equal(closed.alias_of, null)
+  assert.match(closed.mapped_status, /cancelled/)
+  assert.equal(store.taskOf({ task_id }, run).task.status, 'cancelled')
+
+  // done/partial still correctly advertise the submit alias
+  const other = store.openTask({ title: '交付' }, run).task_id
+  const submitted = store.closeTask({ task_id: other, result: 'done' }, run)
+  assert.equal(submitted.status, 'submitted')
+  assert.equal(submitted.alias_of, 'submitTask')
+})

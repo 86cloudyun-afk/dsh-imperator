@@ -66,6 +66,49 @@ for (const status of ['claimed', 'submitted', 'accepted', 'cancelled']) {
   })
 }
 
+test('owner-conflict E_TASK_CONFLICT guidance is status-aware (no blind task_reject)', (t) => {
+  const store = tempStore(t)
+  const expectConflict = (fn, checks) => {
+    assert.throws(fn, (error) => {
+      assert.equal(error.code, STORE_CODES.conflict)
+      for (const check of checks) check(error.message)
+      return true
+    })
+  }
+
+  const claimedId = store.openTask({ title: 'claimed-conflict' }, 'run-a').task_id
+  store.claimTask({ task_id: claimedId, child_id: 'old-child' }, 'run-a')
+  expectConflict(
+    () => store.claimTask({ task_id: claimedId, child_id: 'new-child' }, 'run-a', 'lead'),
+    [
+      (msg) => assert.match(msg, /不能直接 task_reject/),
+      (msg) => assert.match(msg, /task_submit|task_close\(failed\)/),
+      (msg) => assert.doesNotMatch(msg, /先 task_reject 显式驳回/),
+    ],
+  )
+
+  const submittedId = store.openTask({ title: 'submitted-conflict' }, 'run-a').task_id
+  store.claimTask({ task_id: submittedId, child_id: 'old-child' }, 'run-a')
+  store.submitTask({ task_id: submittedId }, 'run-a')
+  expectConflict(
+    () => store.claimTask({ task_id: submittedId, child_id: 'new-child' }, 'run-a', 'lead'),
+    [
+      (msg) => assert.match(msg, /先 task_reject/),
+      (msg) => assert.match(msg, /再由主会话 task_claim/),
+    ],
+  )
+
+  const rejectedId = rejected(store)
+  expectConflict(
+    () => store.claimTask({ task_id: rejectedId, child_id: 'new-child' }, 'run-a'),
+    [
+      (msg) => assert.match(msg, /已是 rejected/),
+      (msg) => assert.match(msg, /不要再调 task_reject/),
+      (msg) => assert.doesNotMatch(msg, /先 task_reject/),
+    ],
+  )
+})
+
 test('cross-run and audit failures leave the owner, timestamp and all audit rows unchanged', (t) => {
   const store = tempStore(t)
   const id = rejected(store)

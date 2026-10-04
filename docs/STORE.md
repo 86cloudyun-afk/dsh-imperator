@@ -251,7 +251,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 4. **核对 = 读板 + 对证据文件**：`task_board()` 看本 run 的待办与每任务最近 5 条；
    `task_board({task_id})` 看全量事实与交接；对不上就 `task_reject` 或派 fresh 子代理重做。
 5. **识别符纪律**：`task_id` 必须已存在且**属于本 run**（不存在与跨 run 给不同错误，都不静默）；
-   已收口（`accepted` / `cancelled`）的任务拒绝再认领。
+   已收口（`accepted` / `cancelled` / 历史终态 `done` / `partial` / `failed`）的任务拒绝再认领。
 6. **错误语义**：任何写库失败**抛出中文可读错误**（含字段名、收到的值、允许值或原因）；
    经工具调用时被收敛成 `{ok:false}` + `code` + `hint`，**不静默跳过**。读板绝不因空库报错。
 7. **服务不可用不静默**：工具行激活时探测一次、调用时惰性重解析；服务缺席会 `logger.warn`

@@ -224,7 +224,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `E_EVIDENCE_MISSING`（v3） | 验收缺执行依据（且没有 `waiver_reason`） | `hint` 指向"先落 fact/artifact（带 `evidence_path`）"或"写明 `waiver_reason` 做人工豁免" |
 | `E_RESOLUTION_INVALID`（阶段 A） | 携带 `resolves_fact_id` 却不是 `decision` + `CONFIRMED/PLAUSIBLE` | 拒绝写入，`hint` 要求核对同任务同 run 的 blocker 后落有效 decision |
 | `E_CROSS_RUN` | 跨 run 访问别的**工作实例**的任务（读 / 落事实 / 结任务三条路径共用同一拒绝点） | `hint` 指向"这是**隔离边界**，不是参数问题"：不要重试、不要换 id 试探。⚠️ 与子代理平面的 `E_CHILD_NOT_OWN`（跨会话操作别人的子代理）**不是同一回事**，两者都保留、不合并 |
-| `E_TASK_CONFLICT` | 任务已有其他认领者，或条件状态更新未命中 | 先 `task_board` 核对最新 owner 与状态；不要盲目重试认领 |
+| `E_TASK_CONFLICT` | 任务已有其他认领者，或条件状态更新未命中 | 先 `task_board` 核对最新 owner 与状态；不要盲目重试认领。换人指引按状态分流：`rejected` → 主会话直接 `task_claim`；`submitted` → 先 `task_reject` 再 `task_claim`；`claimed` → 不可直接 `task_reject`（等 submit 后驳回，或 `task_close(failed)` 后开新任务） |
 | `E_STORE_BUSY` | SQLite 写锁正忙，写事务未开始 | 稍后有限次数重试；持续繁忙则报告 |
 
 所有写动作的检查与多条写入在同一 `BEGIN IMMEDIATE` 写事务中完成；组合动作使用 savepoint。写入失败时状态、事实、时间戳和 run 归属一起回滚，认领竞争串行化后仅一个 owner 成功。同 owner 重复认领仍是幂等调用。

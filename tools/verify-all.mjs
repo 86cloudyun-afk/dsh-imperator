@@ -47,6 +47,7 @@ const TESTS = [
   'code-hint-coverage.test.mjs',
   'mount-diagnostics.test.mjs',
   'tool-args-contract.test.mjs',
+  'hint-dispatch-order.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

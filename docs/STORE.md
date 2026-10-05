@@ -128,7 +128,7 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 | `submitTask` | `({ task_id, note? }, runId)` | `{ task_id, status:'submitted', submitted_at, fact_count, blockers, warnings[], next }` |
 | `acceptTask` | `({ task_id, note?, waiver_reason? }, runId, actor)`（`actor` 必须 `'lead'`；`waiver_reason` = 显式人工豁免） | `{ task_id, status:'accepted', accepted_at, fact_count, resolved_blockers, evidence_basis{count,fact_ids,with_pointer,unattributed}, waiver, warnings[] }`；缺依据且无豁免 → `E_EVIDENCE_MISSING` |
 | `rejectTask` | `({ task_id, reason }, runId, actor)`（`reason` 必填） | `submitted` → `{ task_id, status:'rejected', rejected_at, reason, facts_to_fix, owner, reopened:false, previous_status:null, late_blockers:[], next }`；**终态 → 重新复核** `{ …, reopened:true, previous_status:'accepted', late_blockers:[…] }` |
-| `closeTask` | `({ task_id, result ∈ done/partial/failed, note? }, runId)` | **兼容别名**：`done`/`partial` → `submitted`（附注转交 `submitTask`，`alias_of:'submitTask'`），`failed` → `cancelled`（有附注时写取消裁决，`alias_of:null` —— 取消不是 submit 别名）；返回体另带 `mapped_status`。**永不产生 `accepted`**；**终态任务一律拒绝**（`E_TERMINAL`，先查原状态） |
+| `closeTask` | `({ task_id, result ∈ done/partial/failed, note? }, runId, caller?)` | **兼容别名**：`done`/`partial` → `submitted`（附注转交 `submitTask`，`alias_of:'submitTask'`），`failed` → `cancelled`（有附注时写取消裁决，`alias_of:null` —— 取消不是 submit 别名）；返回体另带 `mapped_status`。**永不产生 `accepted`**；**终态任务一律拒绝**（`E_TERMINAL`，先查原状态）；**取消（`failed`）还要求身份**：只有主会话或该任务**当前 owner** 能取消，同 run 的竞争子代理被 `E_TASK_CONFLICT` 拒绝且不产生任何写入（`caller` 由工具层派生，模型参数不参与；缺省 = 宿主直连，沿用只校验 run 的历史语义） |
 | `taskOf` | `(task_id \| { task_id }, runId)` | `{ task, fact_count, last_fact_at, blockers, open }` |
 | `board` | `({} \| { task_id }, runId)` | 见下 |
 | `stats` | `(runId)` | `{ run_id, tasks{…}, facts{…}, blockers_open, blockers_late }`；缺省 = 未归属域 |
@@ -178,6 +178,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | 子代理只能 `task_submit` | 提交后进 `submitted`，**不是完成**；仍出现在默认看板 |
 | 只有主会话能 `task_accept` / `task_reject` | 身份判据在**工具层强制**（`identity.isRoot`），数据层再用 `actor === 'lead'` 二次校验（纵深防御） |
 | **终态冻结**（v3） | 已收口任务的结论**不被任何普通写入改写**：`closeTask(failed)` 分支**先查原状态**，`claim` / `submit` / `accept` / `close` / 非 blocker 落事实 一律拒绝（`E_TERMINAL` + 可读错误），错误里指路 `task_reject` |
+| **取消要证明资格**（本版） | `closeTask(failed)` 在终态闸门之后追加 `requireCancelAuthority`：只有**主会话**或**该任务当前 owner** 能取消（`caller` 由工具层按真实调用者派生，模型参数不参与）；同一 run 的竞争子代理被 `E_TASK_CONFLICT` 拒绝，**任务状态、事实与交接一字未改**。取消是终态且破坏性的动作，不能由竞争方代劳 —— 要停别人的任务就报告主会话。取消审计的 `created_by` 记为**真实调用者**（主会话叫停写 `lead`），不再无条件写成 `row.owner` |
 | **晚到阻塞不静默**（v3） | 终态上**唯一**允许的新写入是 `kind='blocker'`：它**不改状态**（结论不被自动推翻），但立刻进默认看板 `late_blockers` 区、详情板 `late_blockers` 与 `task.late`，并计入 `stats().blockers_late`（与待办任务的 `blockers_open` 分开计） |
 | **推翻结论 = 显式重新复核**（v3） | 主会话 `task_reject`（`reason` 必填）对终态任务 = 重新复核：置回 `rejected`、**重新回到默认待办板**、返回体带 `reopened` / `previous_status` / `late_blockers`，原认领者可重新认领。子代理**永远**推不翻结论（`actor` 必须是 `lead`） |
 | **验收门槛**（阶段 A） | `acceptTask` 要求至少一条**依据事实**：属于该任务、`confidence ∈ {CONFIRMED,PLAUSIBLE}`，且（`kind ∈ {fact, artifact}` **或**带非空白 `evidence_path` 产物指针）。`REFUTED` 和畸形历史置信度均不算；零依据**拒绝**（`E_EVIDENCE_MISSING`）。已确认的反证结论作为独立 fact 仍可算依据；无路径的 decision / blocker 不算依据。无证据路径的有效基础任务给 warning，不在本阶段强制 SHA 审查 |
@@ -224,7 +225,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `E_EVIDENCE_MISSING`（v3） | 验收缺执行依据（且没有 `waiver_reason`） | `hint` 指向"先落 fact/artifact（带 `evidence_path`）"或"写明 `waiver_reason` 做人工豁免" |
 | `E_RESOLUTION_INVALID`（阶段 A） | 携带 `resolves_fact_id` 却不是 `decision` + `CONFIRMED/PLAUSIBLE` | 拒绝写入，`hint` 要求核对同任务同 run 的 blocker 后落有效 decision |
 | `E_CROSS_RUN` | 跨 run 访问别的**工作实例**的任务（读 / 落事实 / 结任务三条路径共用同一拒绝点） | `hint` 指向"这是**隔离边界**，不是参数问题"：不要重试、不要换 id 试探。⚠️ 与子代理平面的 `E_CHILD_NOT_OWN`（跨会话操作别人的子代理）**不是同一回事**，两者都保留、不合并 |
-| `E_TASK_CONFLICT` | 任务已有其他认领者，或条件状态更新未命中 | 先 `task_board` 核对最新 owner 与状态；不要盲目重试认领。换人指引按状态分流：`rejected` → 主会话直接 `task_claim`；`submitted` → 先 `task_reject` 再 `task_claim`；`claimed` → 不可直接 `task_reject`（等 submit 后驳回，或 `task_close(failed)` 后开新任务） |
+| `E_TASK_CONFLICT` | 任务已有其他认领者、条件状态更新未命中，或取消请求来自非 owner | 先 `task_board` 核对最新 owner 与状态；不要盲目重试认领。换人指引按状态分流：`rejected` → 主会话直接 `task_claim`；`submitted` → 先 `task_reject` 再 `task_claim`；`claimed` → 不可直接 `task_reject`（等当前认领者 `task_submit` 后由主会话驳回并重指派）。**指引不再提供 `task_close(failed)` 这类"竞争方直接取消"的回退**：取消要过 owner 闸门，只有主会话或当前 owner 能做 |
 | `E_STORE_BUSY` | SQLite 写锁正忙，写事务未开始 | 稍后有限次数重试；持续繁忙则报告 |
 
 所有写动作的检查与多条写入在同一 `BEGIN IMMEDIATE` 写事务中完成；组合动作使用 savepoint。写入失败时状态、事实、时间戳和 run 归属一起回滚，认领竞争串行化后仅一个 owner 成功。同 owner 重复认领仍是幂等调用。
@@ -312,6 +313,16 @@ v3 覆盖（逐条对应审计缺陷，断言 id 里带 ★）：
 - `handoff` 表有服务方法 `recordHandoff`，未开模型可见工具（视需要再加）。
 
 ## 九、已知边界（诚实声明）
+
+- **取消闸门只挡模型可达的路径，不挡宿主直连**：`requireCancelAuthority` 在 `caller`
+  缺省时沿用"只校验 run"的历史语义 —— 宿主进程内代码（不经工具层）本就有直写 SQLite
+  的能力，与本文件上一条同源。工具层**永远**显式传身份，所以模型可达的路径是关死的。
+- **取消闸门只覆盖 `failed`，不覆盖 `done`/`partial`**：后者走 `submitTask`，语义未变。
+  同 run 的竞争方仍可把别人的 `claimed` 任务推到 `submitted`（**不是**终态，可由主会话
+  `task_reject` 打回），破坏性远低于取消；本版刻意不动它以避免行为回退，留作后续单独立项。
+- **owner 匹配用的是认领时的 `child_id` 标签**：`task_claim` 的 `child_id` 允许"约定的代号"，
+  与调用者真实 sessionId 未必相同。代号与 sessionId 不一致时，owner 自己的取消会被闸门拒绝
+  （**失败方向是拒绝而非放行**），需要主会话代为取消或按真实 id 重新认领。
 
 - **run 隔离是接口层隔离，不是文件层安全边界**：库是本地 SQLite 文件，
   任何能在本机执行代码的 agent 都可以绕过服务 API 直接读整个文件（`v_task_board` 视图

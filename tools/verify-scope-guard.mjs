@@ -1122,6 +1122,28 @@ section('场景 E：DEFAULT_DENY 名单漂移诊断（AUDIT4 候选 3）')
     rottedExemptions.length === 0,
     JSON.stringify(rottedExemptions),
   )
+
+  // E9-E10：把 E7 对 plugin_update 的「移除后可被捕获」约定推广到**整份** DEFAULT_DENY。
+  // 否则名单里有的项（此前 pwsh / purge_apply / purge_revert / plugin_auto_update /
+  // plugin_set_auto_update）一旦在重构中被误删，漂移诊断不会报出 ⇒ 静默放行且无人察觉。
+  const unbackstopped = scope.DEFAULT_DENY
+    .filter((name) => !scope.executionLikeToolsNotDenied([name],
+      scope.DEFAULT_DENY.filter((other) => other !== name)).includes(name))
+  check(
+    'E9',
+    '整份 DEFAULT_DENY 均有漂移兜底：任一项从名单移除后，诊断都会报出它（推广 E7）',
+    unbackstopped.length === 0,
+    `无兜底项=${JSON.stringify(unbackstopped)}`,
+  )
+  const shellTwins = ['bash', 'pwsh']
+  check(
+    'E10',
+    'bash 与 pwsh 两个 shell 孪生对称：移除名单后都会被漂移诊断报出（对齐 PR #22 的同类判定）',
+    shellTwins.every((name) => scope.executionLikeToolsNotDenied([name],
+      scope.DEFAULT_DENY.filter((other) => other !== name)).includes(name)),
+    JSON.stringify(shellTwins.map((name) => [name, scope.executionLikeToolsNotDenied([name],
+      scope.DEFAULT_DENY.filter((other) => other !== name))])),
+  )
 }
 
 /* ═══════════════════════════ 汇总 ═══════════════════════════ */

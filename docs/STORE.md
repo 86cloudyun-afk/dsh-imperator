@@ -224,7 +224,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `E_EVIDENCE_MISSING`（v3） | 验收缺执行依据（且没有 `waiver_reason`） | `hint` 指向"先落 fact/artifact（带 `evidence_path`）"或"写明 `waiver_reason` 做人工豁免" |
 | `E_RESOLUTION_INVALID`（阶段 A） | 携带 `resolves_fact_id` 却不是 `decision` + `CONFIRMED/PLAUSIBLE` | 拒绝写入，`hint` 要求核对同任务同 run 的 blocker 后落有效 decision |
 | `E_CROSS_RUN` | 跨 run 访问别的**工作实例**的任务（读 / 落事实 / 结任务三条路径共用同一拒绝点） | `hint` 指向"这是**隔离边界**，不是参数问题"：不要重试、不要换 id 试探。⚠️ 与子代理平面的 `E_CHILD_NOT_OWN`（跨会话操作别人的子代理）**不是同一回事**，两者都保留、不合并 |
-| `E_TASK_CONFLICT` | 任务已有其他认领者，或条件状态更新未命中 | 先 `task_board` 核对最新 owner 与状态；不要盲目重试认领。换人指引按状态分流：`rejected` → 主会话直接 `task_claim`；`submitted` → 先 `task_reject` 再 `task_claim`；`claimed` → 不可直接 `task_reject`（等 submit 后驳回，或 `task_close(failed)` 后开新任务） |
+| `E_TASK_CONFLICT` | 任务已有其他认领者，或条件状态更新未命中 | 先 `task_board` 核对最新 owner 与状态；不要盲目重试认领。owner 冲突的 `error` 与内联 `hint` 都按状态指路：`rejected` → 主会话直接 `task_claim`；`submitted` → 主会话先 `task_reject` 再 `task_claim`；`claimed` → 不可直接 `task_reject`，等当前认领者 `task_submit` 后由主会话驳回并重新认领。其他竞争仍使用通用读板提示 |
 | `E_STORE_BUSY` | SQLite 写锁正忙，写事务未开始 | 稍后有限次数重试；持续繁忙则报告 |
 
 所有写动作的检查与多条写入在同一 `BEGIN IMMEDIATE` 写事务中完成；组合动作使用 savepoint。写入失败时状态、事实、时间戳和 run 归属一起回滚，认领竞争串行化后仅一个 owner 成功。同 owner 重复认领仍是幂等调用。
@@ -236,6 +236,10 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 只有同一 run 的 `rejected` 任务允许主控换 owner，`claimed`/`submitted` 和终态仍拒绝换人。
 换人会同时写入主控 decision 和 old→new handoff；任一写入失败整笔回滚。重复认领不会重复写审计。
 原来的两参数调用仍禁止换 owner，`recordHandoff` 仍只记录交接，不改变任务认领者。
+
+owner 冲突指引不提供 `task_close(failed)` 放弃他人任务的回退：关闭入口目前只校验 run，
+没有 owner 校验，因此同 run 的竞争子代理也能取消未收口任务。本修复删除危险建议并传递状态专属 hint，
+不新增关闭权限边界；调用方应等待当前认领者提交，再由可信主会话驳回与重指派。
 
 `code` 的命名**刻意避开 `E_NO_` 前缀**：工具层把 `E_NO_*` 一律当作"身份不可得"（宿主集成问题），
 用 `E_NO_EVIDENCE` 会把模型引到错误方向。

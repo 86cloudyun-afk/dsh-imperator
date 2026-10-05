@@ -166,15 +166,35 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
     pass('native cancelled delegation, scoped IDs and result replacement replay')
 
+    const competitor = await agents.create({ sessionId: 'taskforce-probe-competitor', parentAgent: parent.agent,
+      meta: { cwd: fixture.root, origin: 'subagent', delegationDepth: 1, parentSession: parent.agent.id },
+      setup: agentCtx => applyChildComposition(agentCtx, parent.agent, { persona: workerConfig.persona }) })
+    handles.push(competitor)
     const opened = await task(parent.agent, 'task_open', { title: 'native tool closure' })
     const id = opened.task_id
+    const conflictWithoutWrites = async (status, guidance) => {
+      const before = await task(parent.agent, 'task_board', { task_id: id })
+      assert.equal(before.task.status, status)
+      const denied = await task(competitor.agent, 'task_claim', { task_id: id, child_id: competitor.agent.id, actor: 'lead' })
+      assert.equal(denied.ok, false)
+      assert.equal(denied.code, 'E_TASK_CONFLICT')
+      assert.deepEqual(await task(parent.agent, 'task_board', { task_id: id }), before)
+      assert.doesNotMatch(denied.error, /task_close/)
+      assert.doesNotMatch(denied.hint, /task_close/)
+      assert.match(denied.hint, /先 task_board 核对最新 owner 与状态/)
+      assert.match(denied.hint, guidance)
+    }
     assert.ok(opened.ok)
     assert.equal((await task(child.agent, 'task_claim', { task_id: id, child_id: child.agent.id })).owner, child.agent.id)
     assert.equal((await task(child.agent, 'task_accept', { task_id: id })).code, 'E_NOT_LEAD')
     await task(child.agent, 'task_fact', { task_id: id, kind: 'artifact', statement: 'verified artifact', evidence_path: artifact, confidence: 'CONFIRMED' })
+    await conflictWithoutWrites('claimed', /当前认领者 task_submit 后由主会话 task_reject/)
     assert.equal((await task(child.agent, 'task_submit', { task_id: id })).status, 'submitted')
+    await conflictWithoutWrites('submitted', /由主会话先 task_reject 打回，再由主会话 task_claim/)
     assert.equal((await task(parent.agent, 'task_accept', { task_id: id })).status, 'accepted')
     assert.equal((await task(parent.agent, 'task_reject', { task_id: id, reason: 'fresh executor required' })).status, 'rejected')
+    await conflictWithoutWrites('rejected', /只能由主会话直接 task_claim[\s\S]*不要再调 task_reject/)
+    pass('native competing child gets safe state-specific owner-conflict hints without writes')
     assert.equal((await task(child.agent, 'task_claim', { task_id: id, child_id: 'replacement', actor: 'lead' })).code, 'E_TASK_CONFLICT')
     assert.equal((await task(parent.agent, 'task_claim', { task_id: id, child_id: 'replacement' })).owner, 'replacement')
     const board = await task(parent.agent, 'task_board', { task_id: id })
@@ -183,6 +203,7 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     pass('native task tools, role rejection, acceptance and audited reassignment')
     for (const handle of handles.splice(0).reverse()) await handle.dispose()
     assert.equal(agents.get('taskforce-probe-child'), undefined)
+    assert.equal(agents.get('taskforce-probe-competitor'), undefined)
     assert.equal(agents.get('taskforce-probe-lead'), undefined)
     pass('agent handle teardown')
 

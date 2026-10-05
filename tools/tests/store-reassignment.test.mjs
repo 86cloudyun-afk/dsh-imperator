@@ -82,7 +82,8 @@ test('owner-conflict E_TASK_CONFLICT guidance is status-aware (no blind task_rej
     () => store.claimTask({ task_id: claimedId, child_id: 'new-child' }, 'run-a', 'lead'),
     [
       (msg) => assert.match(msg, /不能直接 task_reject/),
-      (msg) => assert.match(msg, /task_submit|task_close\(failed\)/),
+      (msg) => assert.match(msg, /当前认领者 task_submit/),
+      (msg) => assert.doesNotMatch(msg, /task_close/),
       (msg) => assert.doesNotMatch(msg, /先 task_reject 显式驳回/),
     ],
   )
@@ -142,3 +143,77 @@ test('task_claim derives reassignment authority from the real caller, ignoring a
   const allowed = JSON.parse(await tool.execute(args, { agent: lead }))
   assert.equal(allowed.owner, 'new-child')
 })
+
+function conflictCaller(store) {
+  const lead = { id: 'run-a', options: {}, session: { header: { id: 'run-a' } } }
+  const children = ['old-child', 'new-child'].map(id => ({ id, options: {},
+    session: { header: { id, origin: 'subagent', delegationDepth: 1, parentSession: 'run-a' } } }))
+  const agents = [lead, ...children]
+  const definitions = []
+  applyTools({ logger: { warn() {} }, get(name) {
+    if (name === 'taskforceStore') return store
+    if (name === 'agents') return { get: id => agents.find(agent => agent.id === id) }
+  }, tools: { register: definition => definitions.push(definition) } })
+  return { lead, owner: children[0], competitor: children[1],
+    call: async (name, args, agent = lead) =>
+      JSON.parse(await definitions.find(tool => tool.name === name).execute(args, { agent })) }
+}
+
+test('competing child claimed-conflict never suggests cancelling the current owner', async (t) => {
+  const store = tempStore(t)
+  const { call, owner, competitor } = conflictCaller(store)
+  const { task_id } = await call('task_open', { title: '竞争认领' })
+  assert.equal((await call('task_claim', { task_id, child_id: owner.id }, owner)).ok, true)
+  assert.equal((await call('task_fact', { task_id, statement: '原执行者的证据', child_id: owner.id }, owner)).ok, true)
+  const before = snapshot(store, task_id)
+  const denied = await call('task_claim', { task_id, child_id: competitor.id, actor: 'lead' }, competitor)
+  assert.equal(denied.ok, false)
+  assert.equal(denied.code, STORE_CODES.conflict)
+  assert.deepEqual(snapshot(store, task_id), before)
+  for (const text of [denied.error, denied.hint]) assert.doesNotMatch(text, /task_close/)
+  assert.match(denied.error, /当前认领者 task_submit/)
+  // The owner can still finish; only the real lead can reject and reassign.
+  assert.equal((await call('task_submit', { task_id }, owner)).status, 'submitted')
+  assert.equal((await call('task_reject', { task_id, reason: '换人复核' }, competitor)).code, STORE_CODES.notLead)
+  assert.equal((await call('task_reject', { task_id, reason: '换人复核' })).status, 'rejected')
+  assert.equal((await call('task_claim', { task_id, child_id: competitor.id }, competitor)).code, STORE_CODES.conflict)
+  const reassigned = await call('task_claim', { task_id, child_id: competitor.id })
+  assert.equal(reassigned.reassigned, true)
+  assert.equal(reassigned.owner, competitor.id)
+})
+
+for (const status of ['claimed', 'submitted', 'rejected']) {
+  test(`task_claim JSON hint carries ${status} owner-conflict guidance without writes`, async (t) => {
+    const store = tempStore(t)
+    const { call, lead, owner, competitor } = conflictCaller(store)
+    const { task_id } = await call('task_open', { title: status })
+    assert.equal((await call('task_claim', { task_id, child_id: owner.id }, owner)).ok, true)
+    if (status !== 'claimed') assert.equal((await call('task_submit', { task_id }, owner)).status, 'submitted')
+    if (status === 'rejected') assert.equal((await call('task_reject', { task_id, reason: '换人复核' })).status, 'rejected')
+    const before = snapshot(store, task_id)
+    // On rejected the lead is allowed to reassign, so only the competitor is refused.
+    for (const agent of status === 'rejected' ? [competitor] : [lead, competitor]) {
+      const denied = await call('task_claim', { task_id, child_id: competitor.id, actor: 'lead' }, agent)
+      assert.equal(denied.ok, false)
+      assert.equal(denied.code, STORE_CODES.conflict)
+      assert.deepEqual(snapshot(store, task_id), before)
+      assert.ok(denied.error.endsWith(denied.hint), 'the inline hint must carry the store next step')
+      assert.match(denied.hint, /先 task_board 核对最新 owner 与状态/)
+      assert.doesNotMatch(denied.hint, /task_close/)
+      if (status === 'claimed') {
+        assert.match(denied.hint, /当前为 claimed/)
+        assert.match(denied.hint, /不能直接 task_reject/)
+        assert.match(denied.hint, /当前认领者 task_submit 后由主会话 task_reject/)
+      } else if (status === 'submitted') {
+        assert.match(denied.hint, /当前为 submitted/)
+        assert.match(denied.hint, /由主会话先 task_reject/)
+        assert.match(denied.hint, /再由主会话 task_claim/)
+      } else {
+        assert.match(denied.hint, /已是 rejected/)
+        assert.match(denied.hint, /只能由主会话直接 task_claim/)
+        assert.match(denied.hint, /不要再调 task_reject/)
+        assert.doesNotMatch(denied.hint, /先 task_reject/)
+      }
+    }
+  })
+}

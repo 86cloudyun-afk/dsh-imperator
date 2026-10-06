@@ -118,3 +118,73 @@ test('rejected 仍须先 task_claim（E_STATUS）—— 既有语义不回退', 
   assert.equal(denied.ok, false)
   assert.equal(denied.code, STORE_CODES.status, 'rejected 仍走 E_STATUS（提交路径本就没有 owner 闸门，不该冒出 E_TASK_CONFLICT）')
 })
+
+// ── 以下三条补齐 #40 复审（6001031129）指出的署名覆盖盲区 ──
+// 复审原文：「新增测试仅覆盖直接 task_submit 的 owner 和主会话场景，未覆盖
+// 「非 owner 带备注提交」及 task_close(done|partial) 两条署名路径」。
+
+test('非 owner 带备注提交他人 claimed 任务：允许提交，署名记真实调用者（不是原 owner）', async (t) => {
+  const store = tempStore(t)
+  const call = toolCaller(store)
+  const id = store.openTask({ title: '他人代交' }, RUN).task_id
+  store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+
+  // 提交路径没有 owner 闸门（负结果见文件头与 docs/STORE.md §九）：非 owner 的提交被接受。
+  // 本测试锁的是**署名** —— 必须写成真实调用者，而不是被误记成任务原 owner。
+  const submitted = await call('task_submit', { task_id: id, note: '替他人提交' }, childOf('worker-b'))
+  assert.equal(submitted.ok, true)
+  assert.equal(submitted.status, 'submitted')
+
+  const fact = store.handle
+    .prepare('SELECT * FROM fact WHERE task_id = ? AND statement = ?').get(id, '提交验收：替他人提交')
+  assert.ok(fact !== undefined, '带备注的提交必须写「提交验收」审计事实')
+  assert.equal(fact.created_by, 'worker-b', '署名必须是真实调用者 worker-b')
+  assert.notEqual(fact.created_by, 'worker-a', '不得被误记成任务原 owner')
+  assert.equal(fact.kind, 'decision')
+  assert.equal(store.taskOf({ task_id: id }, RUN).task.owner, 'worker-a', 'owner 不因他人提交而改变')
+})
+
+test('task_close(done|partial) 别名路径的署名同样反映真实调用者', async (t) => {
+  const store = tempStore(t)
+  const call = toolCaller(store)
+
+  // 三条组合：owner 自己走 done、非 owner 走 partial、主会话走 done。
+  for (const [result, agent, expected] of [
+    ['done', childOf('worker-a'), 'worker-a'],
+    ['partial', childOf('worker-b'), 'worker-b'],
+    ['done', lead, 'lead'],
+  ]) {
+    const id = store.openTask({ title: `别名 ${result} ${expected}` }, RUN).task_id
+    store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+    const note = `别名提交-${result}-${expected}`
+
+    const closed = await call('task_close', { task_id: id, result, note }, agent)
+    assert.equal(closed.ok, true)
+    assert.equal(closed.status, 'submitted')
+    assert.equal(closed.alias_of, 'submitTask', 'done/partial 必须自称 submit 别名')
+
+    const fact = store.handle
+      .prepare('SELECT * FROM fact WHERE task_id = ? AND statement = ?').get(id, `提交验收：${note}`)
+    assert.ok(fact !== undefined, '别名路径同样必须写「提交验收」审计事实')
+    assert.equal(fact.created_by, expected, `${result} 由 ${expected} 调用时署名应为 ${expected}`)
+  }
+})
+
+test('note 为空（含空串与纯空白）时不写「提交验收」审计事实', async (t) => {
+  const store = tempStore(t)
+  const call = toolCaller(store)
+  const submitFacts = (id) => store.handle
+    .prepare("SELECT COUNT(*) AS n FROM fact WHERE task_id = ? AND statement LIKE '提交验收：%'").get(id).n
+
+  // 依据 lib/store/index.js 的 `if (note !== null)` + optionalText：空串/纯空白归一为 null ⇒ 不落审计。
+  for (const note of [undefined, '', '   ']) {
+    const id = store.openTask({ title: `无备注 ${JSON.stringify(note)}` }, RUN).task_id
+    store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+    const args = note === undefined ? { task_id: id } : { task_id: id, note }
+
+    const submitted = await call('task_submit', args, childOf('worker-a'))
+    assert.equal(submitted.ok, true)
+    assert.equal(submitted.status, 'submitted')
+    assert.equal(submitFacts(id), 0, `note=${JSON.stringify(note)} 时不得写「提交验收」事实`)
+  }
+})

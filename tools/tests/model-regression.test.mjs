@@ -265,3 +265,72 @@ for (const source of [
     assert.equal(gradeMoney(workspace, true).ok, false)
   })
 }
+
+for (const waiver of [false, true]) {
+  test(`public store acceptance distinguishes negative waiver text from actual legacy waiver=${waiver}`, async t => {
+    const { observeModelTasks, diagnoseModelClosure } = await api()
+    assert.equal(typeof observeModelTasks, 'function')
+    const { tempStore } = await import('./helpers.mjs')
+    const store = tempStore(t), run = 'closure-run'
+    const id = store.openTask({ title: 'waiver classification' }, run).task_id
+    store.claimTask({ task_id: id, child_id: 'worker' }, run, 'worker', 'worker')
+    store.recordFact({ task_id: id, kind: 'fact', confidence: 'CONFIRMED', statement: '不使用人工豁免；已有实际测试依据' }, run, 'worker', 'worker')
+    store.recordFact({ task_id: id, kind: 'decision', statement: '验收通过（人工豁免）：这是引用的反例，不是验收记录' }, run, 'lead', run)
+    store.submitTask({ task_id: id, note: '不使用人工豁免' }, run, 'worker', 'worker')
+    const acceptance = store.acceptTask({ task_id: id, note: '无需人工豁免，按实际证据验收', ...(waiver ? { waiver_reason: 'explicit actual waiver' } : {}) }, run, 'lead', run)
+    assert.equal(acceptance.status, 'accepted')
+    assert.equal(acceptance.waiver !== null, waiver)
+    const rows = observeModelTasks(store, run, store.root)
+    assert.equal(rows[0].waived, waiver)
+    assert.equal(diagnoseModelClosure(rows, 1, 'worker').ok, !waiver)
+    assert.deepEqual(diagnoseModelClosure(rows, 1, 'worker').failureCodes, waiver ? ['waiver'] : [])
+  })
+}
+
+test('public strict waiver remains rejected using structured current-generation waiver evidence', async t => {
+  const { observeModelTasks, diagnoseModelClosure } = await api()
+  assert.equal(typeof observeModelTasks, 'function')
+  const { tempStore } = await import('./helpers.mjs')
+  const store = tempStore(t), run = 'strict-closure-run'
+  writeFileSync(join(store.root, 'money.mjs'), goodMoney)
+  writeFileSync(join(store.root, 'money.test.mjs'), '// fixture')
+  const id = store.openTask({ title: 'strict waiver', evidence_policy: 'execution', verification_files: ['money.mjs', 'money.test.mjs'], verification_command: 'node --test money.test.mjs' }, run, { sessionId: run, cwd: store.root, isRoot: true }).task_id
+  store.claimTask({ task_id: id, child_id: 'worker' }, run, 'worker', 'worker')
+  store.submitTask({ task_id: id }, run, 'worker', 'worker')
+  const acceptance = store.acceptTask({ task_id: id, waiver_reason: 'explicit strict waiver' }, run, 'lead', run)
+  assert.equal(acceptance.execution_verified, false)
+  assert.notEqual(acceptance.waiver, null)
+  const rows = observeModelTasks(store, run, store.root)
+  assert.equal(rows[0].waived, true)
+  assert.deepEqual(diagnoseModelClosure(rows, 1, 'worker').failureCodes, ['waiver'])
+})
+
+test('incomplete acceptance report includes only bounded allowlisted closure diagnostics', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, 'acceptance')
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  const closure = report.stages.at(-1).closure
+  assert.ok(closure, 'missing closure diagnostics')
+  assert.equal(closure.ok, false)
+  assert.equal(closure.newTaskCount, 1)
+  assert.equal(closure.taskCount, 1)
+  assert.deepEqual(closure.failureCodes, ['task-status'])
+  assert.deepEqual(closure.tasks[0], { taskId: 2, status: 'submitted', ownerMatches: true, evidenceCount: 1, waived: false, evidencePolicy: 'legacy', strictVerified: false })
+  assert.doesNotMatch(JSON.stringify(closure), /sk-secret|reasoning|credentials|marker/)
+})
+
+test('closure diagnostics bound details but retain all failure categories without copying arbitrary strings', async () => {
+  const { diagnoseModelClosure } = await api()
+  assert.equal(typeof diagnoseModelClosure, 'function')
+  const tasks = Array.from({ length: 30 }, (_, id) => ({ id, status: 'accepted', owner_session: 'worker', evidence: 1, evidence_policy: 'legacy', waived: false }))
+  tasks[29] = { ...tasks[29], status: 'sk-secret', owner_session: 'credentials', evidence: 'reasoning', waived: true }
+  const closure = diagnoseModelClosure(tasks, 2, 'worker')
+  assert.equal(closure.taskCount, 30)
+  assert.equal(closure.tasks.length, 20)
+  assert.equal(closure.truncated, true)
+  assert.deepEqual(closure.failureCodes, ['new-task-count', 'task-status', 'owner-mismatch', 'waiver', 'legacy-evidence'])
+  assert.doesNotMatch(JSON.stringify(closure), /sk-secret|reasoning|credentials/)
+  const detail = diagnoseModelClosure(tasks.slice(29), 1, 'worker').tasks[0]
+  assert.equal(detail.status, 'unknown')
+  assert.equal(detail.evidenceCount, null)
+})

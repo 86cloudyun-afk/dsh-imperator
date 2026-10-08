@@ -171,7 +171,8 @@ export async function runModelVerification(options = {}, { createHarness = creat
           workerId = workers[0].id
         } else if (newWorkers !== 0 || workers.length !== 1 || workers[0].id !== workerId || reuse < 1) fail('reuse-contract')
         if (![...requests].some(key => !beforeRequestKeys.has(key) && key.startsWith(workerId + ':'))) fail('reuse-contract')
-        if (newTasks.length !== 1 || after.tasks.some(t => t.status !== 'accepted' || t.owner_session !== workerId || t.waived || t.evidence_policy === 'legacy' && (!count(t.evidence) || t.evidence < 1))) fail('incomplete-acceptance')
+        stageRecord.closure = diagnoseModelClosure(after.tasks, newTasks.length, workerId)
+        if (!stageRecord.closure.ok) fail('incomplete-acceptance')
         if (stage.name === 'strict' && (newTasks[0].evidence_policy !== 'execution' || newTasks[0].strictVerified !== true)) fail('strict-receipt')
         const result = gradeMoney(workspace, stage.name !== 'repair')
         independentChecks = result.checks
@@ -248,6 +249,49 @@ export async function waitForNativeSettlement({ tracked, rootId, activationCount
   fail('unsettled-tree')
 }
 
+/** Fixed codes and bounded primitive details only; never copy owner IDs or fact text. */
+export function diagnoseModelClosure(tasks, newTaskCount, workerId) {
+  const failureCodes = []
+  if (newTaskCount !== 1) failureCodes.push('new-task-count')
+  if (tasks.some(task => task.status !== 'accepted')) failureCodes.push('task-status')
+  if (tasks.some(task => task.owner_session !== workerId)) failureCodes.push('owner-mismatch')
+  if (tasks.some(task => task.waived)) failureCodes.push('waiver')
+  if (tasks.some(task => task.evidence_policy === 'legacy' && (!count(task.evidence) || task.evidence < 1))) failureCodes.push('legacy-evidence')
+  const statuses = ['open', 'claimed', 'submitted', 'accepted', 'rejected', 'cancelled', 'done', 'partial', 'failed']
+  return { ok: failureCodes.length === 0, newTaskCount: count(newTaskCount) ? newTaskCount : null,
+    taskCount: tasks.length, truncated: tasks.length > 20, failureCodes,
+    tasks: tasks.slice(0, 20).map(task => ({ taskId: count(task.id) ? task.id : null,
+      status: statuses.includes(task.status) ? task.status : 'unknown', ownerMatches: task.owner_session === workerId,
+      evidenceCount: count(task.evidence) ? task.evidence : null, waived: Boolean(task.waived),
+      evidencePolicy: ['legacy', 'execution'].includes(task.evidence_policy) ? task.evidence_policy : 'unknown',
+      strictVerified: task.strictVerified === true })) }
+}
+
+/** Project actual task-store closure metadata without persisting fact content. */
+export function observeModelTasks(store, rootId, workspace) {
+  const rows = store.handle.prepare('SELECT * FROM task WHERE run_id = ? ORDER BY id').all(rootId)
+  return rows.map(row => {
+    const facts = store.handle.prepare('SELECT kind, confidence, evidence_path FROM fact WHERE task_id = ? AND run_id = ?').all(row.id, rootId)
+    let strictVerified = false
+    if (row.evidence_policy === 'execution') {
+      try {
+        strictExecutionEvidence(store.handle, store.root, row)
+        strictVerified = row.verification_command === STRICT_COMMAND && row.verification_cwd === workspace
+          && JSON.stringify(JSON.parse(row.verification_files)) === JSON.stringify(STRICT_FILES)
+      } catch { /* no verified receipt */ }
+    }
+    // acceptTask appends the final root decision after transitioning to accepted.
+    // Ordinary facts, quoted examples, submit notes and negative waiver language
+    // are not waiver evidence. A reopened task uses its latest acceptance audit.
+    const acceptance = store.handle.prepare("SELECT statement FROM fact WHERE task_id = ? AND run_id = ? AND kind = 'decision' AND confidence = 'PLAUSIBLE' AND created_by = 'lead' AND (actor_session = ? OR actor_session IS NULL) ORDER BY id DESC LIMIT 1").get(row.id, rootId, rootId)
+    const waived = store.handle.prepare('SELECT COUNT(*) AS n FROM execution_waiver WHERE task_id = ? AND run_id = ? AND evidence_generation = ?').get(row.id, rootId, row.evidence_generation).n > 0
+      || acceptance?.statement.startsWith('验收通过（人工豁免）：') === true
+    return { id: row.id, status: row.status, owner_session: row.owner_session, evidence_policy: row.evidence_policy,
+      facts: facts.length, evidence: facts.filter(f => ['CONFIRMED', 'PLAUSIBLE'].includes(f.confidence) && (['fact', 'artifact'].includes(f.kind) || f.evidence_path)).length,
+      waived, strictVerified }
+  })
+}
+
 /** Official profile/registry path only; no custom provider client and no approval bypass. */
 export async function createNativeHarness({ installAnchor, packageRoot, workspace, provider, model, onRequest }) {
   const anchor = resolveInstallAnchor({ installAnchor })
@@ -304,23 +348,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
 
     function snapshot() {
       const store = app.ctx.get('taskforceStore')
-      const rows = store.handle.prepare('SELECT * FROM task WHERE run_id = ? ORDER BY id').all(rootId)
-      const tasks = rows.map(row => {
-        const facts = store.handle.prepare('SELECT kind, confidence, evidence_path FROM fact WHERE task_id = ? AND run_id = ?').all(row.id, rootId)
-        let strictVerified = false
-        if (row.evidence_policy === 'execution') {
-          try {
-            strictExecutionEvidence(store.handle, store.root, row)
-            strictVerified = row.verification_command === STRICT_COMMAND && row.verification_cwd === workspace
-              && JSON.stringify(JSON.parse(row.verification_files)) === JSON.stringify(STRICT_FILES)
-          } catch { /* no verified receipt */ }
-        }
-        const waived = store.handle.prepare('SELECT COUNT(*) AS n FROM execution_waiver WHERE task_id = ? AND run_id = ?').get(row.id, rootId).n > 0
-          || store.handle.prepare("SELECT COUNT(*) AS n FROM fact WHERE task_id = ? AND statement LIKE '%人工豁免%'").get(row.id).n > 0
-        return { id: row.id, status: row.status, owner_session: row.owner_session, evidence_policy: row.evidence_policy,
-          facts: facts.length, evidence: facts.filter(f => ['CONFIRMED', 'PLAUSIBLE'].includes(f.confidence) && (['fact', 'artifact'].includes(f.kind) || f.evidence_path)).length,
-          waived, strictVerified }
-      })
+      const tasks = observeModelTasks(store, rootId, workspace)
       return { sessions: sessions(), tasks, settled }
     }
     return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, cancel, dispose }

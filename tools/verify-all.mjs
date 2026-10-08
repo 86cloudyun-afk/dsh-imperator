@@ -50,6 +50,7 @@ const TESTS = [
   'hint-dispatch-order.test.mjs',
   'close-failed-owner-guard.test.mjs',
   'submit-audit-attribution.test.mjs',
+  'owner-session.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

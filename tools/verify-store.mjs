@@ -232,8 +232,8 @@ check(
 
 const colsOf = (table) => inspect.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name)
 /* v2 起三表各多出 run 归属列；fact 另有 resolves_fact_id（未解 blocker 的机械判据）。 */
-const COLS_TASK = ['id', 'title', 'note', 'status', 'owner', 'run_id', 'created_at', 'updated_at']
-const COLS_FACT = ['id', 'task_id', 'kind', 'statement', 'evidence_path', 'evidence_line', 'confidence', 'created_by', 'run_id', 'resolves_fact_id', 'created_at']
+const COLS_TASK = ['id', 'title', 'note', 'status', 'owner', 'owner_session', 'run_id', 'created_at', 'updated_at']
+const COLS_FACT = ['id', 'task_id', 'kind', 'statement', 'evidence_path', 'evidence_line', 'confidence', 'created_by', 'actor_session', 'run_id', 'resolves_fact_id', 'created_at']
 const COLS_HANDOFF = ['id', 'task_id', 'from_child', 'to_child', 'note', 'run_id', 'created_at']
 
 check('S04', 'task 表列名与规格一致', same(colsOf('task'), COLS_TASK), `实际=${colsOf('task').join(',')}`)
@@ -337,7 +337,7 @@ const closed1 = store.closeTask({ task_id: 1, result: 'done' })
 check(
   'S17',
   'task_close(done) 是 task_submit 的别名：只产生 submitted，绝不产生 accepted；带 blocker 时返回 warnings',
-  closed1.status === 'submitted' && closed1.blockers === 1 && closed1.warnings.length === 1
+  closed1.status === 'submitted' && closed1.blockers === 1 && closed1.warnings.some(w => w.includes('未解 blocker')) && closed1.warnings.some(w => w.includes('未绑定'))
     && closed1.alias_of === 'submitTask' && closed1.mapped_status.includes('submitted'),
   JSON.stringify(closed1),
 )
@@ -504,7 +504,7 @@ check(
   'S29',
   '工具闭环下半段：task_close(partial) 只产生 submitted（含未解 blocker 告警），详情板读到 2 条完整事实 + 阻塞计数',
   tClose.ok === true && tClose.status === 'submitted' && tClose.alias_of === 'submitTask'
-    && tClose.warnings.length === 1 && tClose.warnings[0].includes('未解 blocker')
+    && tClose.warnings.some(w => w.includes('未解 blocker')) && tClose.warnings.some(w => w.includes('未绑定'))
     && tDetail.ok === true && tDetail.scope === 'task' && tDetail.task.status === 'submitted'
     && tDetail.task.owner === 'child-tool' && tDetail.facts.length === 2 && tDetail.task.blockers === 1
     && tDetail.counts.by_kind.blocker === 1,

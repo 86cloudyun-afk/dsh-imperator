@@ -115,7 +115,7 @@ function toolCalls(store) {
     logger: { warn() {} },
     get(name) {
       if (name === 'taskforceStore') return store
-      if (name === 'agents') return { get: () => lead }
+      if (name === 'agents') return { get: id => id === 'run-a' ? lead : undefined }
     },
     tools: { register: (definition) => definitions.push(definition) },
   })

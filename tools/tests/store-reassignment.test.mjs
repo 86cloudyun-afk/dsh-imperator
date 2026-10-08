@@ -132,7 +132,7 @@ test('task_claim derives reassignment authority from the real caller, ignoring a
     delegationDepth: 1, parentSession: 'run-a' } } }
   applyTools({ logger: { warn() {} }, get(name) {
     if (name === 'taskforceStore') return store
-    if (name === 'agents') return { get: (id) => id === 'run-a' ? lead : child }
+    if (name === 'agents') return { get: (id) => id === 'run-a' ? lead : id === 'child-a' ? child : undefined }
   }, tools: { register: definition => definitions.push(definition) } })
   const tool = definitions.find(({ name }) => name === 'task_claim')
   const args = { task_id: id, child_id: 'new-child', actor: 'lead' }

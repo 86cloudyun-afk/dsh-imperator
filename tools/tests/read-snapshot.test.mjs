@@ -38,7 +38,7 @@ for (const method of ['board', 'taskOf']) {
     const store = tempStore(t, { journalMode: 'wal' })
     const id = seed(store)
     const writer = writerFor(t, store)
-    const fired = afterFirstRead(store.handle, /SELECT id, title, note, status, owner, run_id/, () => {
+    const fired = afterFirstRead(store.handle, /SELECT id, title, note, status, owner, owner_session, run_id/, () => {
       writer.exec('BEGIN IMMEDIATE')
       writer.prepare('UPDATE task SET run_id = ? WHERE id = ?').run('b', id)
       writer.prepare('UPDATE fact SET run_id = ?, statement = ? WHERE task_id = ?').run('b', 'FOREIGN_SECRET', id)

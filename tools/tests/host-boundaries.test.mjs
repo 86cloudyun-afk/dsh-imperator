@@ -554,3 +554,150 @@ test('native model harness applies fixed output capacity through provider, agent
   try { assert.equal(observed, true, 'native configuration probe must inspect the actual harness wiring'); assert.equal(requests, 0) }
   finally { await harness.dispose() }
 })
+
+test('actual native observation policy requires worker reads, survives live edits and resets on cold resume', options, async t => {
+  const { createNativeHarness } = await import('../verify-model.mjs')
+  const { writeFile, readFile } = await import('node:fs/promises')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-read-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  const file = join(workspace, 'observed.txt')
+  await writeFile(file, 'alpha\n')
+  let requests = 0, inspected = false
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-v4-pro',
+    onRequest() { requests++; throw new Error('observation probe forbids model requests') },
+  }, { inspectNative: async ({ ctx, root }) => {
+    inspected = true
+    const { createToolResultMessage, createAssistantMessage } = await native('@deepseek-ai/dsh-llm')
+    const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+    const worker = TASKFORCE_DEFINITION.plugins.find(row => row.id === 'delegation').config.find(row => row.id === 'tool-subagent').config
+    const setup = childCtx => applyChildComposition(childCtx, root, { persona: worker.persona })
+    const agentOptions = resolveChildAgentOptions(root, undefined, 1)
+    let child = await ctx.agents.create({ sessionId: 'native-read-child', parentAgent: root, agentOptions,
+      meta: childSessionMeta(root, 1, false), setup })
+    const observations = []
+    ctx.on('fs/observed', (_target, observation, actor) => observations.push({ session: actor.agent.session, kind: observation.kind }))
+    let call = 0
+    const turns = new Map()
+    const execute = async (agent, name, args) => {
+      const turn = (turns.get(agent.id) ?? 0) + 1, step = 1, callId = `read-policy-${++call}`
+      turns.set(agent.id, turn)
+      agent.session.append('turn/start', { turn })
+      agent.session.append('step/start', { turn, step })
+      // Advertise the synthetic, unpaid tool dispatch using the SDK message
+      // constructor so the real persistence validator can restore this log.
+      agent.session.append('assistant/message', { turn, step, stream: [],
+        message: createAssistantMessage({ source: { provider: 'native-probe', model: 'native-probe' },
+          content: [{ type: 'tool-call', id: callId, name, arguments: JSON.stringify(args) }] }) }, { surfaceOp: 'append' })
+      const called = agent.session.append('tool/call', { turn, step, callId, name, arguments: JSON.stringify(args) })
+      const result = await agent.ctx.tools.execute({ agent, name, arguments: args, callId, signal: new AbortController().signal })
+      agent.session.append('tool/result', { turn, step,
+        message: createToolResultMessage({ callId, content: result.content, isError: result.isError }),
+        ...(result.error?.info ? { error: result.error.info } : {}) },
+      { surfaceOp: 'append', sourceEventSeqs: [called.seq] })
+      agent.session.append('step/end', { turn, step })
+      agent.session.append('turn/end', { turn, reason: { kind: 'completed' } })
+      return result
+    }
+    const edit = (old_string, new_string) => execute(child.agent, 'edit', { file_path: file, old_string, new_string })
+    const read = agent => execute(agent, 'read', { file_path: file })
+    const expectCode = (result, code) => { assert.equal(result.isError, true); assert.equal(result.error?.info?.code, code) }
+    try {
+      expectCode(await edit('alpha', 'beta'), 'FS_NOT_OBSERVED')
+      expectCode(await execute(child.agent, 'write', { file_path: file, content: 'forbidden overwrite\n' }), 'FS_NOT_OBSERVED')
+      assert.equal(await readFile(file, 'utf8'), 'alpha\n')
+      assert.equal((await read(root)).isError, false)
+      expectCode(await edit('alpha', 'beta'), 'FS_NOT_OBSERVED')
+      const countBeforeShell = observations.length
+      const shellRead = await execute(child.agent, 'bash', { command: 'cat observed.txt; grep alpha observed.txt',
+        description: 'Read the observation fixture through shell tools' })
+      assert.equal(shellRead.isError, false)
+      assert.equal(shellRead.value.kind, 'foreground')
+      assert.equal(shellRead.value.exitCode, 0)
+      assert.equal(shellRead.value.stdout.text, 'alpha\nalpha\n')
+      assert.equal(observations.length, countBeforeShell, 'shell reads cannot create native observation state')
+      expectCode(await edit('alpha', 'beta'), 'FS_NOT_OBSERVED')
+      const searched = await execute(child.agent, 'grep', { pattern: 'alpha', path: file })
+      assert.equal(searched.isError, false)
+      assert.match(JSON.stringify(searched.content), /observed\.txt/)
+      assert.equal(observations.length, countBeforeShell, 'native grep is search, not an authoritative file read')
+      expectCode(await edit('alpha', 'beta'), 'FS_NOT_OBSERVED')
+      assert.equal((await read(child.agent)).isError, false)
+      assert.equal(observations.at(-1).session, child.agent.session)
+      assert.equal((await edit('alpha', 'beta')).isError, false)
+      assert.equal((await edit('beta', 'gamma')).isError, false, 'successful edit refreshes the version for another edit')
+      assert.equal((await execute(child.agent, 'write', { file_path: file, content: 'written\n' })).isError, false)
+      assert.equal((await edit('written', 'gamma')).isError, false, 'successful write also refreshes the observation')
+      assert.equal(await readFile(file, 'utf8'), 'gamma\n')
+      await writeFile(file, 'external-change\n')
+      expectCode(await edit('external-change', 'delta'), 'FS_STALE_VERSION')
+      assert.equal(await readFile(file, 'utf8'), 'external-change\n')
+      assert.equal((await read(child.agent)).isError, false)
+      assert.equal((await edit('external-change', 'delta')).isError, false)
+      const priorSession = child.agent.session
+      const priorEvents = priorSession.snapshotEvents().length
+      assert.ok(priorSession.snapshotEvents().some(e => e.type === 'tool/call' && e.data.name === 'read'))
+      await ctx.sessions.flush(priorSession)
+      await child.dispose()
+      child = await ctx.agents.resume({ resumeSessionId: 'native-read-child', parentAgent: root, agentOptions, setup })
+      assert.equal(child.agent.id, 'native-read-child')
+      assert.notEqual(child.agent.session, priorSession)
+      assert.ok(child.agent.session.snapshotEvents().length >= priorEvents)
+      assert.ok(child.agent.session.snapshotEvents().some(e => e.type === 'tool/call' && e.data.name === 'read'))
+      expectCode(await edit('delta', 'resumed'), 'FS_NOT_OBSERVED')
+      assert.equal(await readFile(file, 'utf8'), 'delta\n')
+      assert.equal((await read(child.agent)).isError, false)
+      assert.equal((await edit('delta', 'resumed')).isError, false)
+      assert.equal((await edit('resumed', 'finished')).isError, false)
+      assert.equal(await readFile(file, 'utf8'), 'finished\n')
+      assert.equal((await execute(root, 'edit', { file_path: file, old_string: 'finished', new_string: 'forbidden' })).isError, true)
+      assert.equal(await readFile(file, 'utf8'), 'finished\n')
+      assert.equal(requests, 0)
+      t.diagnostic('native observation proof: unseen/root-read/shell/native-grep/cold-resume rejected; worker read/write/edit and repeated edits pass; external change rejected; restored history retained; model requests 0')
+    } finally { await child.dispose() }
+  } })
+  try { assert.equal(inspected, true); assert.equal(requests, 0) }
+  finally { await harness.dispose() }
+})
+
+test('genuine mounted spawn fork and resumed workers receive the native read discipline', options, async t => {
+  const { createNativeHarness } = await import('../verify-model.mjs')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-read-persona-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let requests = 0, rendered = 0
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-v4-pro',
+    onRequest() { requests++; throw new Error('persona probe forbids model requests') },
+  }, { inspectNative: async ({ ctx, root }) => {
+    const { renderPrompt } = await native('@deepseek-ai/dsh-system-prompt')
+    const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+    const assertWorker = async agent => {
+      const prompt = renderPrompt(await agent.ctx.systemPrompt.assemble({ scope: agent, agent }))
+      for (const contract of [/已有文件.*原生 read/, /新任务或续作.*重读/, /旧对话.*其他代理.*shell cat\/grep.*替代/,
+        /原生写入\/编辑成功.*更新观察.*无需逐次重读/, /FS_NOT_OBSERVED.*FS_STALE_VERSION.*read.*核对修改/]) {
+        assert.match(prompt, contract)
+      }
+      assert.doesNotMatch(prompt, /不执行命令/)
+      assert.ok(agent.ctx.tools.schemas(agent).some(tool => tool.name === 'edit'))
+      rendered++
+    }
+    const rootPrompt = renderPrompt(await root.ctx.systemPrompt.assemble({ scope: root, agent: root }))
+    assert.match(rootPrompt, /不执行命令/)
+    assert.equal(root.ctx.tools.schemas(root).some(tool => tool.name === 'edit'), false)
+    for (const row of TASKFORCE_DEFINITION.plugins.find(row => row.id === 'delegation').config.filter(row => row.name === '@deepseek-ai/dsh-tool-subagent')) {
+      const agentOptions = resolveChildAgentOptions(root, undefined, 1)
+      const setup = childCtx => applyChildComposition(childCtx, root, { persona: row.config.persona })
+      let child = await ctx.agents.create({ sessionId: `read-persona-${row.config.provider}`, parentAgent: root,
+        agentOptions, meta: childSessionMeta(root, 1, false), setup })
+      try {
+        await assertWorker(child.agent)
+        await ctx.sessions.flush(child.agent.session)
+        await child.dispose()
+        child = await ctx.agents.resume({ resumeSessionId: `read-persona-${row.config.provider}`, parentAgent: root, agentOptions, setup })
+        await assertWorker(child.agent)
+      } finally { await child.dispose() }
+    }
+  } })
+  try { assert.equal(rendered, 4); assert.equal(requests, 0) }
+  finally { await harness.dispose() }
+})

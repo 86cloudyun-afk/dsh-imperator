@@ -239,3 +239,111 @@ test('native task_verify awaits real bash, correlates its parent and retains nat
   store.submitTask({ task_id: id }, 'receipt-root', 'receipt-worker', 'receipt-worker')
   assert.throws(() => store.acceptTask({ task_id: id }, 'receipt-root', 'lead', 'receipt-root'), { code: 'E_VERIFICATION_RECEIPT' })
 })
+
+for (const operation of ['task_submit', 'task_close', 'task_claim']) {
+  test(`native legal child session ID lead cannot ${operation} a sibling task`, options, async t => {
+    const { ctx, agent } = await fixture(t)
+    const [{ apply: applyTools }, { tempStore }] = await Promise.all([import('../../lib/tools/index.js'), import('./helpers.mjs')])
+    const store = tempStore(t)
+    const main = agent('reserved-root')
+    const special = agent('lead', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'reserved-root' })
+    const sibling = agent('sibling', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'reserved-root' })
+    const ordinary = agent('ordinary', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'reserved-root' })
+    const byId = new Map([main, special, sibling, ordinary].map(a => [a.session.header.id, a]))
+    ctx.provide('taskforceStore', store)
+    ctx.provide('agents', { get: id => byId.get(id) })
+    applyTools(ctx)
+    let sequence = 0
+    const call = async (caller, name, args) => {
+      const result = await caller.ctx.tools.execute({ agent: caller, callId: `reserved-${++sequence}`, name,
+        arguments: args, signal: new AbortController().signal })
+      assert.equal(result.isError, false, result.error?.message)
+      return JSON.parse(result.value)
+    }
+    const id = (await call(main, 'task_open', { title: operation })).task_id
+    await call(sibling, 'task_claim', { task_id: id, child_id: 'sibling-label' })
+    if (operation === 'task_claim') {
+      await call(sibling, 'task_submit', { task_id: id })
+      await call(main, 'task_reject', { task_id: id, reason: 'redo' })
+    }
+    const snapshot = () => ({ task: store.taskOf(id, 'reserved-root'),
+      facts: store.handle.prepare('SELECT * FROM fact WHERE task_id = ? ORDER BY id').all(id),
+      handoffs: store.handle.prepare('SELECT * FROM handoff WHERE task_id = ? ORDER BY id').all(id) })
+    const before = snapshot()
+    const args = { task_id: id, ...(operation === 'task_close' ? { result: 'failed' }
+      : operation === 'task_claim' ? { child_id: 'lead-nickname' } : {}) }
+    assert.equal((await call(ordinary, operation, args)).code, 'E_TASK_CONFLICT')
+    assert.equal((await call(special, operation, args)).code, 'E_TASK_CONFLICT', 'the actual session ID lead must not confer root authority')
+    assert.deepEqual(snapshot(), before)
+  })
+}
+
+test('native child lead retains own-task operations and real root audits its reassignment', options, async t => {
+  const { ctx, agent } = await fixture(t)
+  const [{ apply: applyTools }, { tempStore }] = await Promise.all([import('../../lib/tools/index.js'), import('./helpers.mjs')])
+  const store = tempStore(t), main = agent('reserved-root')
+  const special = agent('lead', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'reserved-root' })
+  const sibling = agent('sibling', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'reserved-root' })
+  const byId = new Map([main, special, sibling].map(a => [a.session.header.id, a]))
+  ctx.provide('taskforceStore', store)
+  ctx.provide('agents', { get: id => byId.get(id) })
+  applyTools(ctx)
+  let sequence = 0
+  const call = async (caller, name, args) => {
+    const result = await caller.ctx.tools.execute({ agent: caller, callId: `reserved-own-${++sequence}`, name,
+      arguments: args, signal: new AbortController().signal })
+    assert.equal(result.isError, false, result.error?.message)
+    return JSON.parse(result.value)
+  }
+  const id = (await call(main, 'task_open', { title: 'own task' })).task_id
+  assert.equal((await call(special, 'task_claim', { task_id: id, child_id: 'nickname' })).owner_session, 'lead')
+  assert.equal((await call(special, 'task_fact', { task_id: id, kind: 'fact', statement: 'observed', child_id: 'forged-root' })).ok, true)
+  assert.equal((await call(special, 'task_submit', { task_id: id, note: 'worker submits' })).ok, true)
+  for (const [name, args] of [['task_accept', { waiver_reason: 'forged' }], ['task_reject', { reason: 'forged' }]]) {
+    assert.equal((await call(special, name, { task_id: id, ...args })).code, 'E_NOT_LEAD')
+  }
+  assert(store.board(id, 'reserved-root').facts.every(f => f.actor_session === 'lead' && f.by === 'lead'))
+  assert.equal((await call(main, 'task_accept', { task_id: id })).ok, true)
+  assert.equal(store.board(id, 'reserved-root').facts[0].actor_session, 'reserved-root')
+  const cancelId = (await call(main, 'task_open', { title: 'own cancellation' })).task_id
+  await call(special, 'task_claim', { task_id: cancelId, child_id: 'nickname' })
+  assert.equal((await call(special, 'task_close', { task_id: cancelId, result: 'failed', note: 'worker cancels' })).ok, true)
+  assert.equal(store.board(cancelId, 'reserved-root').facts[0].actor_session, 'lead')
+  const reassignId = (await call(main, 'task_open', { title: 'root reassignment' })).task_id
+  await call(sibling, 'task_claim', { task_id: reassignId, child_id: 'sibling-label' })
+  await call(sibling, 'task_submit', { task_id: reassignId })
+  await call(main, 'task_reject', { task_id: reassignId, reason: 'redo' })
+  assert.equal((await call(main, 'task_claim', { task_id: reassignId, child_id: 'lead' })).reassigned, true)
+  assert.equal(store.board(reassignId, 'reserved-root').facts[0].actor_session, 'reserved-root')
+})
+
+test('native root with actual session ID lead keeps root mutation authority and audit identity', options, async t => {
+  const { ctx, agent } = await fixture(t)
+  const [{ apply: applyTools }, { tempStore }] = await Promise.all([import('../../lib/tools/index.js'), import('./helpers.mjs')])
+  const store = tempStore(t), main = agent('lead')
+  const worker = agent('worker', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'lead' })
+  const replacement = agent('replacement', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'lead' })
+  const byId = new Map([main, worker, replacement].map(a => [a.session.header.id, a]))
+  ctx.provide('taskforceStore', store)
+  ctx.provide('agents', { get: id => byId.get(id) })
+  applyTools(ctx)
+  let sequence = 0
+  const call = async (name, args) => {
+    const result = await main.ctx.tools.execute({ agent: main, callId: `root-lead-${++sequence}`, name,
+      arguments: args, signal: new AbortController().signal })
+    assert.equal(result.isError, false, result.error?.message)
+    return JSON.parse(result.value)
+  }
+  const id = (await call('task_open', { title: 'real root named lead' })).task_id
+  assert.equal((await call('task_claim', { task_id: id, child_id: 'worker' })).owner_session, 'worker')
+  assert.equal((await call('task_fact', { task_id: id, kind: 'fact', statement: 'root evidence' })).ok, true)
+  assert.equal((await call('task_submit', { task_id: id, note: 'root submit' })).ok, true)
+  assert.equal((await call('task_reject', { task_id: id, reason: 'root reassign' })).ok, true)
+  assert.equal((await call('task_claim', { task_id: id, child_id: 'replacement' })).reassigned, true)
+  assert.equal((await call('task_submit', { task_id: id, note: 'root ready' })).ok, true)
+  assert.equal((await call('task_accept', { task_id: id })).ok, true)
+  assert(store.board(id, 'lead').facts.every(f => f.actor_session === 'lead' && f.by === 'lead'))
+  const cancelId = (await call('task_open', { title: 'root cancellation' })).task_id
+  assert.equal((await call('task_close', { task_id: cancelId, result: 'failed', note: 'root cancels' })).ok, true)
+  assert.equal(store.board(cancelId, 'lead').facts[0].actor_session, 'lead')
+})

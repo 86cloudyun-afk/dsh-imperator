@@ -211,3 +211,80 @@ test('legacy unbound tasks still reject a nickname change as a label-based owner
   assert.equal((await call('task_claim', { task_id: id, child_id: 'worker-label' }, worker)).code, STORE_CODES.conflict)
   assert.deepEqual(snapshot(store, id), before)
 })
+
+test('structured child lead has owner rights without gaining root permissions, including legacy cancellation', t => {
+  const store = tempStore(t), special = { sessionId: 'lead', isRoot: false }, rootActor = { sessionId: 'run-a', isRoot: true }
+  const own = task(store)
+  assert.equal(store.claimTask({ task_id: own, child_id: 'nickname' }, 'run-a', special, 'lead').owner_session, 'lead')
+  assert.doesNotThrow(() => store.recordFact({ task_id: own, statement: 'own evidence', child_id: 'forged' }, 'run-a', special), 'valid structured child identity must support audited facts')
+  assert.equal(store.submitTask({ task_id: own, note: 'own submission' }, 'run-a', special).status, 'submitted')
+  assert(snapshot(store, own).facts.every(f => f.actor_session === 'lead' && f.created_by === 'lead'))
+  assert.throws(() => store.acceptTask({ task_id: own }, 'run-a', special), { code: STORE_CODES.notLead })
+  assert.throws(() => store.rejectTask({ task_id: own, reason: 'not root' }, 'run-a', special), { code: STORE_CODES.notLead })
+  assert.equal(store.closeTask({ task_id: own, result: 'failed', note: 'own cancellation' }, 'run-a', special).status, 'cancelled')
+  assert.equal(snapshot(store, own).facts.at(-1).actor_session, 'lead')
+  const other = task(store)
+  store.claimTask({ task_id: other, child_id: 'sibling-label' }, 'run-a', 'sibling', 'sibling')
+  assert.throws(() => store.submitTask({ task_id: other }, 'run-a', special), { code: STORE_CODES.conflict })
+  assert.throws(() => store.closeTask({ task_id: other, result: 'failed' }, 'run-a', special), { code: STORE_CODES.conflict })
+  store.submitTask({ task_id: other }, 'run-a', 'sibling', 'sibling')
+  store.rejectTask({ task_id: other, reason: 'redo' }, 'run-a', rootActor)
+  const before = snapshot(store, other)
+  assert.throws(() => store.claimTask({ task_id: other, child_id: 'nickname' }, 'run-a', special, 'lead'), { code: STORE_CODES.conflict })
+  assert.deepEqual(snapshot(store, other), before)
+  const legacy = task(store)
+  store.claimTask({ task_id: legacy, child_id: 'sibling-label' }, 'run-a')
+  assert.throws(() => store.closeTask({ task_id: legacy, result: 'failed' }, 'run-a', special), { code: STORE_CODES.conflict })
+})
+
+test('structured root audits use its actual session and ignore appended identity overrides', t => {
+  const store = tempStore(t), actor = { sessionId: 'run-a', isRoot: true }, id = task(store)
+  store.claimTask({ task_id: id, child_id: 'old' }, 'run-a', 'worker', 'worker')
+  assert.doesNotThrow(() => store.recordFact({ task_id: id, statement: 'root evidence', created_by: 'forged' }, 'run-a', actor, 'forged-session'), 'valid structured root identity must support audited facts')
+  store.submitTask({ task_id: id, note: 'root submission' }, 'run-a', actor, 'forged-session')
+  store.rejectTask({ task_id: id, reason: 'redo' }, 'run-a', actor, 'forged-session')
+  assert.equal(store.claimTask({ task_id: id, child_id: 'new' }, 'run-a', actor, 'replacement').reassigned, true)
+  store.submitTask({ task_id: id, note: 'ready' }, 'run-a', actor)
+  store.acceptTask({ task_id: id }, 'run-a', actor)
+  assert(snapshot(store, id).facts.every(f => f.actor_session === 'run-a' && f.created_by === 'lead'))
+  const legalRoot = { sessionId: 'lead', isRoot: true }, rootTask = store.openTask('root named lead', 'lead').task_id
+  store.recordFact({ task_id: rootTask, statement: 'evidence' }, 'lead', legalRoot)
+  store.submitTask({ task_id: rootTask, note: 'root submits' }, 'lead', legalRoot)
+  assert.equal(store.acceptTask({ task_id: rootTask }, 'lead', legalRoot).status, 'accepted')
+  assert(store.board(rootTask, 'lead').facts.every(f => f.actor_session === 'lead'))
+})
+
+for (const actor of [{ sessionId: 'lead' }, { sessionId: 'lead', isRoot: 'true' }, { isRoot: true }]) {
+  test(`invalid structured role ${JSON.stringify(actor)} cannot authorize any mutation`, t => {
+    const store = tempStore(t), id = task(store), before = snapshot(store, id)
+    for (const action of [
+      () => store.claimTask({ task_id: id, child_id: 'nickname' }, 'run-a', actor, 'lead'),
+      () => store.recordFact({ task_id: id, statement: 'forged' }, 'run-a', actor),
+      () => store.submitTask({ task_id: id }, 'run-a', actor),
+      () => store.closeTask({ task_id: id, result: 'failed' }, 'run-a', actor),
+      () => store.acceptTask({ task_id: id }, 'run-a', actor),
+      () => store.rejectTask({ task_id: id, reason: 'forged' }, 'run-a', actor),
+    ]) {
+      assert.throws(action)
+      assert.deepEqual(snapshot(store, id), before)
+    }
+  })
+}
+
+test('legacy positional host lead remains privileged and omitted actor audit identity stays NULL', t => {
+  const store = tempStore(t), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'sibling-label' }, 'run-a', 'sibling', 'sibling')
+  store.recordFact({ task_id: id, statement: 'legacy positional fact' }, 'run-a', 'sibling')
+  assert.equal(snapshot(store, id).facts.at(-1).actor_session, null)
+  assert.equal(store.submitTask({ task_id: id, note: 'host override' }, 'run-a', 'lead').status, 'submitted')
+  assert.equal(store.acceptTask({ task_id: id }, 'run-a', 'lead').status, 'accepted')
+  assert.equal(snapshot(store, id).facts.at(-1).actor_session, null)
+})
+
+test('legacy unbound label cancellation accepts its old caller slot and records the appended real audit session', t => {
+  const store = tempStore(t), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'legacy-label' }, 'run-a')
+  assert.equal(store.closeTask({ task_id: id, result: 'failed', note: 'legacy caller' }, 'run-a', 'legacy-label', 'real-session').status, 'cancelled')
+  assert.equal(snapshot(store, id).facts.at(-1).created_by, 'legacy-label')
+  assert.equal(snapshot(store, id).facts.at(-1).actor_session, 'real-session')
+})

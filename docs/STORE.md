@@ -120,6 +120,12 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 
 **`runId` 保持既有位置（输入对象之后；stats 等读取接口为首参），身份是独立的可选位置参数，不接受模型输入字段**（字符串 = run 域；缺省 / `null` = 未归属域）。
 
+工具写入传可信结构化 `actor` / `caller = { sessionId, isRoot }`：真实会话 ID 与布尔角色分开，
+子会话的合法 ID `lead` 不获得主会话权限，实际 root ID 为 `lead` 仍按 `isRoot:true` 授权。
+结构缺少有效 ID 或布尔角色时拒绝；模型字段不能指定这两个值。结构化调用的审计只取其真实
+`sessionId`，不会由显示标签或追加位置参数覆盖。旧宿主字符串 `lead` 位置参数仍代表可信主会话角色；
+旧字符串 caller、缺省参数与独立审计 session 位置保持兼容，未提供审计 ID 时不猜填。
+
 | 方法 | 入参 | 返回 |
 |---|---|---|
 | `openTask` | `({ title, note?, evidence_policy?, verification_files?, verification_command? }, runId, trustedContext?)`（可信 context `{sessionId,cwd,isRoot}`；legacy 旧位置兼容） | `{ task_id, title, status, run_id, created_at }` |
@@ -128,8 +134,8 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 | `claimTask` | `({ task_id, child_id }, runId, actor?, ownerSessionId?)` | `{ task_id, owner, owner_session, status:'claimed', claimed_at, already, warnings[] }` |
 | `recordFact` | `({ task_id?, kind, statement, evidence_path?, evidence_line?, confidence?, child_id?, resolves_fact_id? }, runId, caller?, actorSessionId?)` | `{ fact_id, task_id, kind, confidence, resolves_fact_id, created_at, late, late_of_status, next? }`（`late:true` = 落在终态任务上的**晚到阻塞**；终态上非 blocker 一律 `E_TERMINAL`） |
 | `recordHandoff` | `({ task_id, from_child, to_child, note }, runId)` | `{ handoff_id, task_id, from_child, to_child, created_at }` |
-| `submitTask` | `({ task_id, note? }, runId, caller?, actorSessionId?)` | `{ task_id, status:'submitted', submitted_at, fact_count, blockers, warnings[], next }`；`caller` 由工具层派生（`'lead'` 或子代理 sessionId），**用于绑定任务的真实 owner 权限与提交审计**：主会话代提交写 `lead`，不再被误标成原 owner 自己提交（缺省 = 宿主直连，沿用旧署名） |
-| `acceptTask` | `({ task_id, note?, waiver_reason? }, runId, actor, actorSessionId?)`（`actor` 必须 `'lead'`；`waiver_reason` = 显式人工豁免） | `{ task_id, status:'accepted', accepted_at, fact_count, resolved_blockers, evidence_basis{count,fact_ids,with_pointer,unattributed}, waiver, warnings[] }`；缺依据且无豁免 → `E_EVIDENCE_MISSING` |
+| `submitTask` | `({ task_id, note? }, runId, caller?, actorSessionId?)` | `{ task_id, status:'submitted', submitted_at, fact_count, blockers, warnings[], next }`；`caller` 由工具层派生为可信 `{sessionId,isRoot}`（旧宿主字符串兼容），**用于绑定任务的真实 owner 权限与提交审计**：主会话代提交写 `lead`，不再被误标成原 owner 自己提交（缺省 = 宿主直连，沿用旧署名） |
+| `acceptTask` | `({ task_id, note?, waiver_reason? }, runId, actor, actorSessionId?)`（`actor.isRoot` 必须为 `true`；兼容宿主字符串 `lead`；`waiver_reason` = 显式人工豁免） | `{ task_id, status:'accepted', accepted_at, fact_count, resolved_blockers, evidence_basis{count,fact_ids,with_pointer,unattributed}, waiver, warnings[] }`；缺依据且无豁免 → `E_EVIDENCE_MISSING` |
 | `rejectTask` | `({ task_id, reason }, runId, actor, actorSessionId?)`（`reason` 必填） | `submitted` → `{ task_id, status:'rejected', rejected_at, reason, facts_to_fix, owner, reopened:false, previous_status:null, late_blockers:[], next }`；**终态 → 重新复核** `{ …, reopened:true, previous_status:'accepted', late_blockers:[…] }` |
 | `closeTask` | `({ task_id, result ∈ done/partial/failed, note? }, runId, caller?, actorSessionId?)` | **兼容别名**：`done`/`partial` → `submitted`（附注转交 `submitTask`，`alias_of:'submitTask'`），`failed` → `cancelled`（有附注时写取消裁决，`alias_of:null` —— 取消不是 submit 别名）；返回体另带 `mapped_status`。**永不产生 `accepted`**；**终态任务一律拒绝**（`E_TERMINAL`，先查原状态）；**取消（`failed`）还要求身份**：只有主会话或该任务**当前 owner** 能取消，同 run 的竞争子代理被 `E_TASK_CONFLICT` 拒绝且不产生任何写入（`caller` 由工具层派生，模型参数不参与；缺省且未绑定 = 宿主直连，沿用只校验 run 的历史语义） |
 | `taskOf` | `(task_id \| { task_id }, runId)` | `{ task, fact_count, last_fact_at, blockers, open }` |
@@ -199,7 +205,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | **取消要证明资格**（本版） | `closeTask(failed)` 在终态闸门之后追加 `requireCancelAuthority`：只有**主会话**或**该任务当前 owner** 能取消（`caller` 由工具层按真实调用者派生，模型参数不参与）；同一 run 的竞争子代理被 `E_TASK_CONFLICT` 拒绝，**任务状态、事实与交接一字未改**。取消是终态且破坏性的动作，不能由竞争方代劳 —— 要停别人的任务就报告主会话。取消审计的 `created_by` 记为**真实调用者**（主会话叫停写 `lead`），不再无条件写成 `row.owner` |
 | **提交的署名同样反映真实调用者**（本版） | `submitTask`（含 `task_close(done\|partial)` 别名）落审计时，`created_by` 记**真实调用者**：主会话代提交写 `lead`，子代理写自己的 sessionId（缺省 = 宿主直连，沿用 `row.owner`）。避免"主会话代交"被误记成原 owner 自己提交 |
 | **晚到阻塞不静默**（v3） | 终态上**唯一**允许的新写入是 `kind='blocker'`：它**不改状态**（结论不被自动推翻），但立刻进默认看板 `late_blockers` 区、详情板 `late_blockers` 与 `task.late`，并计入 `stats().blockers_late`（与待办任务的 `blockers_open` 分开计） |
-| **推翻结论 = 显式重新复核**（v3） | 主会话 `task_reject`（`reason` 必填）对终态任务 = 重新复核：置回 `rejected`、**重新回到默认待办板**、返回体带 `reopened` / `previous_status` / `late_blockers`，原认领者可重新认领。子代理**永远**推不翻结论（`actor` 必须是 `lead`） |
+| **推翻结论 = 显式重新复核**（v3） | 主会话 `task_reject`（`reason` 必填）对终态任务 = 重新复核：置回 `rejected`、**重新回到默认待办板**、返回体带 `reopened` / `previous_status` / `late_blockers`，原认领者可重新认领。子代理**永远**推不翻结论（结构化 `actor.isRoot` 必须为 true；兼容旧宿主 `lead` 角色） |
 | **验收门槛**（阶段 A） | `acceptTask` 要求至少一条**依据事实**：属于该任务、`confidence ∈ {CONFIRMED,PLAUSIBLE}`，且（`kind ∈ {fact, artifact}` **或**带非空白 `evidence_path` 产物指针）。`REFUTED` 和畸形历史置信度均不算；零依据**拒绝**（`E_EVIDENCE_MISSING`）。已确认的反证结论作为独立 fact 仍可算依据；无路径的 decision / blocker 不算依据。无证据路径的有效基础任务给 warning，不在本阶段强制 SHA 审查 |
 | **人工豁免显式且留痕**（v3） | 确实无法产出证据时，主会话可给 `waiver_reason`：验收记录写「验收通过（人工豁免）：…」，`confidence` 仍是 `PLAUSIBLE`，**不混入"已验证事实"**，返回体带 `waiver{reason,by,at}` 且 `warnings` 明示 |
 | 未解 blocker 不得验收 | `acceptTask` **抛可读错误**并逐条列出 blocker 的 `fact_id` + 陈述，**不是 warning** |
@@ -348,7 +354,7 @@ v3 覆盖（逐条对应审计缺陷，断言 id 里带 ★）：
 - **事实与裁决审计来自宿主**：同 run 协作者可追加事实、报告 blocker，但工具层无视模型
   作者标签，`created_by` 使用真实子会话 ID 或 `lead`，`actor_session` 写实际调用者会话 ID。
   主会话和子会话的提交、取消、验收、打回裁决同样写真实 `actor_session`；主会话重指派
-  审计写其根会话 ID（同可信 run）。任务详情和事实摘要返回新身份字段。
+  审计写可信结构化 actor 的实际根会话 ID（旧宿主字符串角色沿用 run）。任务详情和事实摘要返回新身份字段。
 - **旧未绑定任务仍兼容**：未绑定提交沿用历史允许路径并返回「未绑定」警告，包括
   `submitted` 幂等重试；旧取消仍按 owner 标签匹配，宿主直连缺省身份仍可取消未绑定任务。
   标签与真实会话不一致的旧任务可由原标签执行者自己认领来绑定，或由主会话处理。

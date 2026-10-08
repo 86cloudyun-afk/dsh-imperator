@@ -4,7 +4,7 @@
 
 本版增加可信 session 归属与作者审计、opt-in 严格执行回执、有界分页看板、冻结事件增量投影、独立 durable governor core 及固定四阶段 opt-in 模型回归。包版本为 0.3.0，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
 
-历史候选 `5375975` 的逐字节归档与双 Node 原生验证保留；旧四阶段模型报告的55条普通 agent 请求仅是旧计量样本。最终审核 F1 发现 native compaction 辅助调用绕过旧计量，过去是否发生及其 usage 未知，不能据旧报告宣称新验证器全请求树闸通过。此前333条观察请求全部保留。当前修正改变产品 fingerprint，须重新打包、双 Node 和完整四阶段模型验收；最终一次范围复核、CI 与合并仍待 controller 完成。本版证据和限制见 [0.3 验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。固定模型样例只证明报告所列样例，不证明生产部署或普遍性能/费用改善。
+F1修正候选 `c237ab8` 的108个归档文件与提交逐字节相同，实际解压包已通过双Node全量原生验证及显式四阶段模型验收（58条native stream请求、215946ms，运行/usage/route错误计数全0）。包SHA为 `c4556657616dcd1d016bad5ceb9e4e30a89811ff9de41697430fb7914d815c16`；完整身份与证据见 [0.3验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。历史55条普通agent样本与六次失败278条保留，旧辅助调用覆盖缺失、历史发生情况及usage未知，不能推断历史全部provider用量完整。最终文档归档将不同于模型候选包，仍须controller核对产品等价、双Node、唯一最终范围复核、更新CI与exact HEAD merge；本记录不宣称这些步骤完成。固定样例不证明生产部署或普遍性能/费用改善。
 
 ## 包含内容与核验
 
@@ -91,4 +91,4 @@ node tools/verify-model.mjs --model-calls \
 
 总报告及阶段 `runtimeDiagnostics` 保留 step-error、native-tool-error、ptc-tool-error、noncompleted-turn、missing-message、missing-usage、invalid-usage、duplicate-message、route-mismatch、no-requests，并增加 auxiliary-call、stream-attribution、capacity-mismatch、stream-error、stream-admission-error、compaction-error、pending-stream。每个实际消费流按 SDK 最新 cumulative usage 帧计一次，要求完整合法 usage、一次成功终结及迭代耗尽；异常、取消、提前退出、max-tokens或缺终结均失败。流 usage 为原生总量来源，持久 assistant/message 继续独立核验；失败阶段保留已观察 usage 与任务指标，取消/清理等待流结束后再收集最终已知usage。native compaction/end.error 进入运行闸，即使 pre-step 捕获异常并继续也不能 PASS。持久错误和边界拒绝阻止后续派发，拒绝调用不计请求；并发尚在途流不提前作为持久错误，阶段结束必须完整。全局cap80、每阶段180000ms、stream idle30000ms、清理及原生/PTC scope 不变。每类保留计数，最多20条固定枚举/数字索引详情，不保存原始会话ID、路径、错误、工具内容、模型输出或凭据。bash非零退出仍是普通工具结果，真实isError/错误事件才触发工具错误闸。
 
-历史旧计量样本观察到55请求229651ms，六次失败278请求1470626ms；七次合计333条已观察请求1700277ms。辅助调用覆盖不完整，其历史发生情况与 usage 未知；不推断存在隐藏调用，也不把333当作已证明完整的全部provider请求。当前 repair/reuse 39请求171472ms，历史58请求144214ms：请求较少而时长更长，不是同额度受控比较。完整 usage、每次失败及原因不确定性见验收记录；新完整四阶段验收仍待 controller，历史结果不替代修正后的闸或生产部署验收。
+新四阶段样本按native stream计量58请求215946ms，usage input58054/output41812/cacheRead1526144/cacheWrite0。历史旧计量样本55请求229651ms及六次失败278请求1470626ms保留；旧七次合计333条观察请求1700277ms，辅助发生情况和usage未知。八次混合观察范围合计391请求1916223ms、input422242/output289464/cacheRead9956352/cacheWrite0；此加总不是历史完整provider总量证明。新repair/reuse两阶段41请求156713ms，对历史v0.2.1的58请求144214ms，请求较少而时长更长，输出额度8192/4096、grader及工作量不同，不是同额度受控比较。完整stage/usage、失败与范围说明见验收记录；最终文档包与审核/CI/merge仍待controller完成。

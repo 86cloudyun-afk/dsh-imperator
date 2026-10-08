@@ -18,7 +18,7 @@
 
 冻结的原生事件追加使用增量 reducer；中段 replacement、可变恢复 seed 与策略变化回到全量重放。前缀检查/复制仍为 O(n)，不承诺整步 O(1)。执行者修改已有文件前须自己 native read；新任务/续作重新读，成功 native write/edit 后不需为连续编辑机械重读；观察缺失/版本变化须 read 并复核，shell cat/grep 不替代原生观察。固定四阶段真实模型回归需显式 opt-in；普通测试不产生付费模型请求。版本与验收状态见 [0.3 验收记录](docs/superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。
 
-历史候选 `5375975` 的实际解压包通过双 Node 原生闸；旧模型报告观察到55条普通 agent 请求、1名执行者复用两次、3任务验收且无 waiver。最终审核 F1 发现旧验证器未覆盖 native compaction 辅助流，因此该报告不能证明全请求树完整计量或统一8192额度；是否曾有辅助调用及其用量未知。此前六次失败278条、合计333条已观察请求与 usage 全部保留。修正验证器在全局 native stream 边界拒绝辅助调用并锁存失败，生产 compaction 保持原样。新候选打包、双 Node、完整四阶段模型验收及最终复核/CI/合并待 controller 执行；历史记录不能代替新闸。精确 SHA 和描述性比较见验收记录。
+修正候选 `c237ab8` 的精确解压包已通过 Node 22.23.2/24.19.0 全量原生闸和显式四阶段模型验收：58条 native stream 请求、215946ms，1名执行者复用两次、3任务owner匹配且accepted、无waiver，strict回执有效；全部运行/usage/路由错误计数为0。验证器在公开全局stream边界核对8192容量并拒绝辅助调用，生产compaction保持原样。历史55条普通agent样本及六次失败278条（合计333条）保留，旧辅助调用覆盖不完整、发生情况与usage未知；不能用新58条证明历史provider总量完整。最终文档归档、同一修复波唯一范围复核、更新CI与exact HEAD merge仍待controller完成。精确SHA、用量观察范围和非受控比较限制见验收记录。
 
 ## 两个正交的问题，一次解决
 

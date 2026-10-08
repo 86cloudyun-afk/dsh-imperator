@@ -4,7 +4,7 @@
 
 本版增加可信 session 归属与作者审计、opt-in 严格执行回执、有界分页看板、冻结事件增量投影、独立 durable governor core 及固定四阶段 opt-in 模型回归。包版本为 0.3.0，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
 
-成功候选 `5375975` 已完成逐字节归档核对、双 Node 解压包全量原生验证和显式四阶段模型闭环；文档补齐后的最终 archive 及审核/CI/合并仍待核验。模型候选与最终文档包的 SHA 不同，不能声称模型执行了最终文档包；产品 fingerprint 等价与最终包双 Node 闸由 controller 再查。本版当前实测状态见 [0.3 验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)，待验收项不能当成通过。可交付门槛是：完整离线测试、原生契约与执行边界、实际隔离 web boot、任务工具闭环、卸载恢复、异常清理以及打包后验收通过。不保证没有未知缺陷，也不包含生产服务器部署。固定模型样例通过只证明报告所列样例，不能推断普遍性能或费用改善。
+历史候选 `5375975` 的逐字节归档与双 Node 原生验证保留；旧四阶段模型报告的55条普通 agent 请求仅是旧计量样本。最终审核 F1 发现 native compaction 辅助调用绕过旧计量，过去是否发生及其 usage 未知，不能据旧报告宣称新验证器全请求树闸通过。此前333条观察请求全部保留。当前修正改变产品 fingerprint，须重新打包、双 Node 和完整四阶段模型验收；最终一次范围复核、CI 与合并仍待 controller 完成。本版证据和限制见 [0.3 验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。固定模型样例只证明报告所列样例，不证明生产部署或普遍性能/费用改善。
 
 ## 包含内容与核验
 
@@ -77,7 +77,7 @@ node tools/verify-model.mjs --model-calls \
 
 可选 `--package-sha256 <64位小写SHA256>` 绑定实际交付 tarball 的摘要；调用者应先独立计算该摘要。报告 `report.json` 绑定包版本、完整 git commit（源码树可取时）、产品源码 SHA256、可选包摘要、宿主/Node 版本与 provider/model。每阶段给出请求、输入/输出/缓存 tokens、时长、新建/复用/返工、事实和验收数量、固定独立断言数量；失败阶段仍保留已知计数。只有四阶段独立判据、真实任务闭环、完整 usage 与清理全部通过，`ok` 才为 true，CLI 才退出 0。
 
-原生验证器固定每次请求输出上限为 8192 tokens，同时配置 provider 默认值与 root agent；官方子会话继承此 agent 配置，不降低 reasoning effort。报告 `outputCapacity.configuredMaxTokens` 记录此配置；`source=native-configuration` 表示原生接线，离线自定义 harness 标为 `custom-harness-unverified`，不声称其实际额度已验证。`max-tokens` 结束仍判失败。历史 v0.2.1 基线及此前 0.3 样本使用 4096，后续 8192 样本不能据此宣称同输出额度下的性能提升。
+原生验证器固定每个获准请求输出容量为8192 tokens，同时配置 provider 默认值与 root agent；官方子会话继承此配置，不降低 reasoning effort。在全局公开 `llm/stream` waterfall 消费边界，以 SDK `isAgentLoopRequest` 的精确对象标记、真实 agent/request 的 agent/turn/step/signal 和受控 root 子树核对归属，只对匹配的一次实际流消费计请求。SDK prepared call 已解析的 provider/model/maxTokens 必须匹配固定路由与8192，错误路由或65536等容量在派发前拒绝。报告 `outputCapacity.source=native-stream-boundary`；自定义离线 harness 为 `custom-harness-unverified`。报告 `auxiliaryPolicy=reject-before-dispatch`：本固定回归不支持辅助 LLM 调用，包括自动 compaction；尝试即拒绝并锁存失败，不能捕获异常后继续获准。生产 preset compaction 保持 auto=true 及其原配置，未被禁用或更改。历史 `native-configuration` 仅证明普通 agent 配置，不能证明辅助请求容量；8192与历史4096不能作同额度性能比较。
 
 本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
 
@@ -89,6 +89,6 @@ node tools/verify-model.mjs --model-calls \
 
 执行阶段的 `closure` 诊断只记录固定失败码（new-task-count/task-status/owner-mismatch/waiver/legacy-evidence）、任务/新任务数量和最多 20 条任务的 ID、枚举状态、ownerMatches、evidenceCount、waived、证据策略与 strictVerified；超出部分仍参与全部判定，`truncated` 明示详情截断。不写 owner/session 原文、事实、附注、模型输出或错误消息。waived 依据当前接受记录的系统裁决标记及本代结构化 execution_waiver 记录；普通事实或附注提及「不使用人工豁免」不算实际豁免。
 
-总报告及阶段的 `runtimeDiagnostics` 区分 step-error、native-tool-error、ptc-tool-error、noncompleted-turn、missing-message、missing-usage、invalid-usage、duplicate-message、route-mismatch；阶段未发起请求另记 no-requests。每类完整计数，最多保留 20 条详情（`truncated` 标明截断）：仅含数字 session/event/request 索引、合法 turn/step 数字、固定工具名白名单（未知名称为 null 和 unknownTool）及固定 turn 结束原因枚举。原始会话 ID、错误、工具内容、模型输出均不入报告。运行错误或 usage 不完整也保留已观测到的新执行者、任务事实、验收计数及 closure；这些观察不代表通过验收。已记录的 step/tool/非 completed turn 错误会阻止下一次请求，阻止的调用不计入请求数；并发尚未返回的 usage 不触发提前停止，阶段结束仍严格检查 usage 完整性。已有在途请求可能继续完成或被取消。bash 非零退出是普通工具结果；只有真实 isError/错误事件使运行闸失败。
+总报告及阶段 `runtimeDiagnostics` 保留 step-error、native-tool-error、ptc-tool-error、noncompleted-turn、missing-message、missing-usage、invalid-usage、duplicate-message、route-mismatch、no-requests，并增加 auxiliary-call、stream-attribution、capacity-mismatch、stream-error、stream-admission-error、compaction-error、pending-stream。每个实际消费流按 SDK 最新 cumulative usage 帧计一次，要求完整合法 usage、一次成功终结及迭代耗尽；异常、取消、提前退出、max-tokens或缺终结均失败。流 usage 为原生总量来源，持久 assistant/message 继续独立核验；失败阶段保留已观察 usage 与任务指标，取消/清理等待流结束后再收集最终已知usage。native compaction/end.error 进入运行闸，即使 pre-step 捕获异常并继续也不能 PASS。持久错误和边界拒绝阻止后续派发，拒绝调用不计请求；并发尚在途流不提前作为持久错误，阶段结束必须完整。全局cap80、每阶段180000ms、stream idle30000ms、清理及原生/PTC scope 不变。每类保留计数，最多20条固定枚举/数字索引详情，不保存原始会话ID、路径、错误、工具内容、模型输出或凭据。bash非零退出仍是普通工具结果，真实isError/错误事件才触发工具错误闸。
 
-成功候选55请求229651ms，六次失败278请求1470626ms均计入账；七次合计333请求1700277ms。当前 repair/reuse 39请求171472ms，历史58请求144214ms：请求较少而时长更长，不是同额度受控比较。完整 usage、每次失败及原因不确定性见验收记录；固定模型通过只针对所列 fixture，不替代生产部署验收。
+历史旧计量样本观察到55请求229651ms，六次失败278请求1470626ms；七次合计333条已观察请求1700277ms。辅助调用覆盖不完整，其历史发生情况与 usage 未知；不推断存在隐藏调用，也不把333当作已证明完整的全部provider请求。当前 repair/reuse 39请求171472ms，历史58请求144214ms：请求较少而时长更长，不是同额度受控比较。完整 usage、每次失败及原因不确定性见验收记录；新完整四阶段验收仍待 controller，历史结果不替代修正后的闸或生产部署验收。

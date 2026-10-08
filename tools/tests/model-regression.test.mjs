@@ -602,3 +602,210 @@ test('model report declares the fixed output capacity without claiming custom ha
   assert.deepEqual(JSON.parse(readFileSync(join(h.outputDir, 'report.json'))).outputCapacity, report.outputCapacity)
   assert.equal(report.requestCap, 80)
 })
+
+for (const type of ['compaction/summary', 'compaction/end']) {
+  test(`auxiliary ${type} cannot hide behind completed agent messages`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, undefined, ({ sessions }) => {
+      sessions[0].events.push({ type, data: { error: 'private-error', usage: { inputTokens: 1000, outputTokens: 1000 }, provider: 'wrong', model: 'wrong' } })
+    })
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.ok, false)
+    assert.equal(report.failure, 'usage-or-runtime-error')
+    assert.equal(report.runtimeDiagnostics.counts[type === 'compaction/end' ? 'compaction-error' : 'auxiliary-call'], 1)
+    assert.doesNotMatch(JSON.stringify(report), /private-error/)
+  })
+}
+
+async function streamFixture(overrides = {}) {
+  const { createModelStreamBoundary } = await api()
+  const marked = new WeakSet(), signal = new AbortController().signal
+  const agent = { id: 'private-agent' }, tracked = new Map([[agent.id, agent]])
+  let admitted = 0, dispatched = 0, failures = 0
+  const boundary = createModelStreamBoundary({ tracked, provider: 'p', model: 'm',
+    isAgentLoopRequest: request => marked.has(request),
+    onRequest() { if (admitted >= (overrides.cap ?? 80)) throw new Error('request-cap'); admitted++ },
+    onFailure() { failures++ },
+  })
+  function request(step = 1, extra = {}) {
+    boundary.observeRequest({ agent, turn: 1, step, signal })
+    const value = Object.freeze({ sessionId: agent.id, provider: 'p', model: 'm', maxTokens: 8192, signal, ...extra })
+    marked.add(value)
+    return value
+  }
+  const next = () => (async function* () {
+    dispatched++
+    yield* (overrides.chunks ?? [{ type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }, { type: 'finish', reason: { kind: 'stop' } }])
+  })()
+  const consume = async stream => { for await (const chunk of stream) {} }
+  return { boundary, request, next, consume, counts: () => ({ admitted, dispatched, failures }) }
+}
+
+test('stream admission is lazy, single-use and accounts each consumed response once', async () => {
+  const f = await streamFixture()
+  const stream = f.boundary.intercept(f.request(), f.next)
+  assert.deepEqual(f.counts(), { admitted: 0, dispatched: 0, failures: 0 })
+  await f.consume(stream)
+  await f.consume(stream)
+  assert.deepEqual(f.counts(), { admitted: 1, dispatched: 1, failures: 0 })
+  assert.deepEqual(f.boundary.snapshot().records.map(r => r.usage), [{ inputTokens: 2, outputTokens: 3 }])
+})
+
+for (const [name, extra, category] of [
+  ['route', { model: 'wrong' }, 'route-mismatch'],
+  ['capacity', { maxTokens: 65536 }, 'capacity-mismatch'],
+  ['ownership', { sessionId: 'unknown' }, 'stream-attribution'],
+  ['signal', { signal: new AbortController().signal }, 'stream-attribution'],
+]) test(`stream ${name} mismatch refuses dispatch and latches even if caught`, async () => {
+  const f = await streamFixture()
+  await assert.rejects(f.consume(f.boundary.intercept(f.request(1, extra), f.next)))
+  await assert.rejects(f.consume(f.boundary.intercept(f.request(2), f.next)))
+  assert.equal(f.counts().dispatched, 0)
+  assert.equal(f.counts().admitted, 0)
+  assert.equal(f.boundary.snapshot().failures[category], 1)
+})
+
+for (const [name, chunks, category] of [
+  ['missing usage', [{ type: 'finish', reason: { kind: 'stop' } }], 'missing-usage'],
+  ['invalid usage', [{ type: 'usage', usage: { inputTokens: -1, outputTokens: 1 } }, { type: 'finish', reason: { kind: 'stop' } }], 'invalid-usage'],
+  ['missing terminal', [{ type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }], 'stream-error'],
+  ['error terminal', [{ type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }, { type: 'finish', reason: { kind: 'error' } }], 'stream-error'],
+  ['duplicate terminal', [{ type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }, { type: 'finish', reason: { kind: 'stop' } }, { type: 'finish', reason: { kind: 'stop' } }], 'stream-error'],
+]) test(`consumed stream ${name} fails accounting and prevents later dispatch`, async () => {
+  const f = await streamFixture({ chunks })
+  await assert.rejects(f.consume(f.boundary.intercept(f.request(), f.next)))
+  await assert.rejects(f.consume(f.boundary.intercept(f.request(2), f.next)))
+  assert.equal(f.counts().admitted, 1)
+  assert.equal(f.counts().dispatched, 1)
+  assert.equal(f.boundary.snapshot().failures[category], 1)
+})
+
+test('stream cap applies at consumption across concurrently prepared calls', async () => {
+  const f = await streamFixture({ cap: 1 })
+  const first = f.boundary.intercept(f.request(), f.next)
+  // Independent calls may be in flight, but a repeated same-agent pending
+  // request invalidates the unused earlier envelope instead of misattributing it.
+  await f.consume(first)
+  await assert.rejects(f.consume(f.boundary.intercept(f.request(2), f.next)))
+  assert.equal(f.counts().admitted, 1)
+  assert.equal(f.counts().dispatched, 1)
+})
+
+test('consumer cancellation closes upstream and latches incomplete consumption', async () => {
+  const f = await streamFixture()
+  let closed = false
+  const stream = f.boundary.intercept(f.request(), () => (async function* () {
+    try { yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }; yield { type: 'finish', reason: { kind: 'stop' } } }
+    finally { closed = true }
+  })())
+  await stream.next()
+  await stream.return()
+  assert.equal(closed, true)
+  assert.equal(f.boundary.snapshot().failures['stream-error'], 1)
+})
+
+test('two lazy iterators cannot reuse one native request admission', async () => {
+  const f = await streamFixture(), request = f.request()
+  const first = f.boundary.intercept(request, f.next), second = f.boundary.intercept(request, f.next)
+  await f.consume(first)
+  await assert.rejects(f.consume(second))
+  assert.equal(f.counts().admitted, 1)
+  assert.equal(f.counts().dispatched, 1)
+  assert.equal(f.boundary.snapshot().failures['stream-attribution'], 1)
+})
+
+test('unbranded helper with copied route and owner is blocked before dispatch', async () => {
+  const f = await streamFixture(), request = { ...f.request() }
+  await assert.rejects(f.consume(f.boundary.intercept(Object.freeze(request), f.next)))
+  assert.equal(f.counts().dispatched, 0)
+  assert.equal(f.boundary.snapshot().failures['auxiliary-call'], 1)
+})
+
+test('cumulative usage frames use latest SDK sample once without summing frames', async () => {
+  const f = await streamFixture({ chunks: [
+    { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+    { type: 'usage', usage: { inputTokens: 2, outputTokens: 3, cacheReadTokens: 4 } },
+    { type: 'finish', reason: { kind: 'stop' } },
+  ] })
+  await f.consume(f.boundary.intercept(f.request(), f.next))
+  assert.deepEqual(f.boundary.snapshot().records[0].usage, { inputTokens: 2, outputTokens: 3, cacheReadTokens: 4 })
+})
+
+test('actual stream records retain usage on a failed native-style response and override message-only totals', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t)
+  const factory = async config => {
+    const harness = await h.factory(config)
+    const snapshot = harness.snapshot
+    harness.snapshot = () => ({ ...snapshot(), streamAccounting: {
+      records: snapshot().sessions.flatMap(session => session.events.filter(event => event.type === 'assistant/message').map(event => ({
+        key: `${session.id}:${event.data.turn}:${event.data.step}`, complete: false, ended: true, usage: { inputTokens: 5, outputTokens: 7 },
+      }))), failures: snapshot().sessions[0].events.length ? { 'stream-error': 1 } : {},
+    } })
+    return harness
+  }
+  const report = await runModelVerification(h.options, { createHarness: factory })
+  assert.equal(report.ok, false)
+  assert.equal(report.requests, 1)
+  assert.equal(report.usage.inputTokens, 5)
+  assert.equal(report.stages[0].usage.outputTokens, 7)
+})
+
+test('an in-flight consumed stream does not block another agent at admission', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, 'concurrent-pending')
+  let sawPending = false
+  const factory = async config => {
+    const records = []
+    const harness = await h.factory({ ...config, onRequest(payload) {
+      config.onRequest(payload)
+      records.push({ key: `${payload.agentId}:${payload.turn}:${payload.step}`, ended: false, complete: false, usage: null })
+    } }), snapshot = harness.snapshot
+    harness.snapshot = () => {
+      const value = snapshot()
+      for (const record of records) {
+        const message = value.sessions.flatMap(session => session.events.filter(event => event.type === 'assistant/message')
+          .map(event => ({ key: `${session.id}:${event.data.turn}:${event.data.step}`, usage: event.data.usage })))
+          .find(message => message.key === record.key)
+        if (message) Object.assign(record, { ended: true, complete: true, usage: message.usage })
+      }
+      if (records.some(record => !record.ended)) sawPending = true
+      return { ...value, streamAccounting: { records, failures: {} } }
+    }
+    return harness
+  }
+  const report = await runModelVerification(h.options, { createHarness: factory })
+  assert.equal(sawPending, true)
+  assert.equal(report.ok, true)
+  assert.equal(report.requests, 11)
+})
+
+test('cleanup retains usage arriving from an already admitted stream after the last stage snapshot', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, 'error')
+  const factory = async config => {
+    const harness = await h.factory(config)
+    const records = [], failures = {}
+    harness.runStage = async () => {
+      config.onRequest({ agentId: 'root', turn: 1, step: 1 })
+      records.push({ key: 'root:1:1', ended: false, complete: false, usage: null })
+      failures['stream-error'] = 1
+      throw new Error('local stream cancellation')
+    }
+    const snapshot = harness.snapshot
+    harness.snapshot = () => ({ ...snapshot(), streamAccounting: { records, failures } })
+    harness.streamSnapshot = () => structuredClone({ records, failures })
+    const dispose = harness.dispose
+    harness.dispose = async () => {
+      records[0].usage = { inputTokens: 11, outputTokens: 13 }
+      records[0].ended = true
+      await dispose()
+    }
+    return harness
+  }
+  const report = await runModelVerification(h.options, { createHarness: factory })
+  assert.equal(report.ok, false)
+  assert.equal(report.requests, 1)
+  assert.equal(report.usage.inputTokens, 11)
+  assert.equal(report.stages[0].usage.outputTokens, 13)
+})

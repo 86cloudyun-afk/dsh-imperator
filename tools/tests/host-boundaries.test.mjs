@@ -701,3 +701,183 @@ test('genuine mounted spawn fork and resumed workers receive the native read dis
   try { assert.equal(rendered, 4); assert.equal(requests, 0) }
   finally { await harness.dispose() }
 })
+
+test('native mounted compactor is rejected by the global stream boundary before any provider dispatch', options, async t => {
+  const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-stream-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let providerDispatches = 0, requests = 0, inspected = false
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
+    onRequest() { requests++ },
+  }, { inspectNative: async ({ ctx, root }) => {
+    // Last waterfall listener is a zero-network provider sentinel. It must
+    // remain unreachable when the real mounted native summarizer calls stream.
+    ctx.on('llm/stream', () => (async function* () { providerDispatches++; throw new Error('unpaid sentinel') })(), { global: true })
+    const compactor = ctx.agentPresets.serviceFor(root, 'compaction')
+    assert.equal(compactor.config.auto, true)
+    assert.equal(compactor.config.maxTokens, 65536, 'production compactor configuration is preserved')
+    await assert.rejects(compactor.summarize({ messages: [] }, root), /usage-or-runtime-error/)
+    inspected = true
+  } })
+  try {
+    assert.equal(inspected, true)
+    assert.equal(providerDispatches, 0)
+    assert.equal(requests, 0)
+    assert.equal(diagnoseModelRuntime(harness.snapshot()).counts['auxiliary-call'], 1)
+    t.diagnostic(JSON.stringify({ actualNativeCompaction: true, auto: true, rejectedAuxiliaryStreams: 1, providerDispatches, requests }))
+  } finally { await harness.dispose() }
+})
+
+for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'cap', 'route', 'capacity']) {
+  test(`native real root and child lifecycle stream boundary: ${scenario}`, options, async t => {
+    const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+    const { createUserMessage, isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+    const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-stream-loop-'))
+    t.after(() => rm(workspace, { recursive: true, force: true }))
+    let dispatches = 0, admitted = 0, latched = 0
+    const seen = []
+    const harness = await createNativeHarness({ installAnchor: anchor,
+      packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
+      onRequest() { if (scenario === 'cap' && admitted === 1) throw new Error('request-cap'); admitted++ },
+      onFailure() { latched++ },
+    }, { inspectNative: async ({ ctx, root }) => {
+      ctx.on('llm/stream', request => (async function* () {
+        dispatches++
+        assert.equal(isAgentLoopRequest(request), true, 'actual native loop brand, never manufactured by this test')
+        assert.equal(request.maxTokens, 8192)
+        seen.push({ maxTokens: request.maxTokens, effort: request.reasoningEffort })
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '137' } }
+        if (scenario !== 'missing-usage') yield { type: 'usage', usage: { inputTokens: scenario === 'invalid-usage' ? -1 : 2, outputTokens: 3 } }
+        yield { type: 'finish', reason: { kind: scenario === 'error' ? 'error' : 'stop' } }
+      })(), { global: true })
+      const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+      const child = await ctx.agents.create({ sessionId: 'stream-loop-child', parentAgent: root,
+        agentOptions: { ...resolveChildAgentOptions(root, undefined, 1),
+          ...(scenario === 'route' ? { model: 'deepseek-v4-pro' } : {}),
+          ...(scenario === 'capacity' ? { maxTokens: 65536 } : {}) },
+        meta: childSessionMeta(root, 1, false), setup: childCtx => applyChildComposition(childCtx, root, {}),
+      })
+      const turn = async agent => {
+        agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Reply 137.' }] }))
+        await agent.whenIdle()
+      }
+      try {
+        if (scenario === 'success') await Promise.all([turn(root), turn(child.agent)])
+        else { await turn(root); await turn(child.agent) }
+        assert.equal(dispatches, scenario === 'success' ? 2 : 1)
+        assert.equal(admitted, dispatches)
+        assert.equal(latched > 0, scenario !== 'success')
+        if (scenario === 'success') {
+          assert.equal(seen[0].effort, seen[1].effort)
+          for (const agent of [root, child.agent]) assert.equal(agent.session.snapshotEvents().findLast(e => e.type === 'turn/end').data.reason.kind, 'completed')
+        }
+      } finally { await child.dispose() }
+    } })
+    try {
+      const snapshot = harness.snapshot()
+      assert.equal(snapshot.streamAccounting.records.length, admitted)
+      if (scenario === 'success') {
+        assert.deepEqual(snapshot.streamAccounting.records.map(r => r.usage), Array(2).fill({ inputTokens: 2, outputTokens: 3 }))
+        assert.ok(snapshot.streamAccounting.records.every(r => r.complete && r.ended))
+        assert.deepEqual(diagnoseModelRuntime(snapshot).failureCodes, [])
+      } else assert.ok(diagnoseModelRuntime(snapshot).failureCodes.length > 0)
+      t.diagnostic(JSON.stringify({ scenario, nativeLoopStreams: dispatches, admitted, latched, paidRequests: 0 }))
+    } finally { await harness.dispose() }
+  })
+}
+
+test('actual automatic pressure compaction caught by native pre-step still fails the verifier without a helper dispatch', options, async t => {
+  const { createNativeHarness, runModelVerification } = await import('../verify-model.mjs')
+  const outputDir = await mkdtemp(join(tmpdir(), 'taskforce-native-auto-report-'))
+  t.after(() => rm(outputDir, { recursive: true, force: true }))
+  let dispatches = 0, nativeCompactionErrors = 0
+  const report = await runModelVerification({ modelCalls: true, installAnchor: anchor, provider: 'deepseek-official', model: 'deepseek-flash', outputDir }, {
+    createHarness: config => createNativeHarness(config, { inspectNative: async ({ ctx, root }) => {
+      const entry = [...ctx.loader.entries()].find(entry => entry.options.id === 'llm-deepseek')
+      await entry.update({ config: { ...entry.options.config, models: [{ id: 'deepseek-flash', contextWindow: 131072 }] } })
+      await ctx.loader.await()
+      assert.equal(ctx.agentPresets.serviceFor(root, 'compaction').config.auto, true)
+      ctx.on('session/event', (_session, event) => {
+        if (event.type === 'compaction/end' && event.data.error !== undefined) nativeCompactionErrors++
+      }, { global: true })
+      ctx.on('agent/pre-step', async ({ agent }, next) => {
+        const c = ctx.agentPresets.serviceFor(agent, 'compaction')
+        t.diagnostic(JSON.stringify({ pressure: c.ctx.tokenMeter.measure(agent.session).totalTokens, capacity: (await c.ctx.llm.resolveModelInfo('deepseek-official', 'deepseek-flash')).context?.contextWindow }))
+        return next()
+      }, { global: true, prepend: true })
+      // A long local response creates real token-meter pressure. The next
+      // genuine native pre-step invokes the unchanged mounted compactor.
+      ctx.on('llm/stream', () => (async function* () {
+        dispatches++
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '137 ' + 'local pressure fixture '.repeat(12000) } }
+        yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })(), { global: true })
+    } }),
+  })
+  assert.equal(report.ok, false)
+  assert.equal(report.failure, 'usage-or-runtime-error')
+  assert.equal(report.requests, 1)
+  assert.equal(dispatches, 1)
+  assert.equal(report.usage.inputTokens, 2)
+  assert.equal(nativeCompactionErrors, 1)
+  assert.equal(report.runtimeDiagnostics.counts['auxiliary-call'], 1)
+  assert.equal(report.runtimeDiagnostics.counts['compaction-error'], 1)
+  assert.equal(report.stages[0].ok, true)
+  assert.equal(report.stages[1].ok, false)
+  assert.doesNotMatch(JSON.stringify(report), /local pressure fixture/)
+  t.diagnostic(JSON.stringify({ automaticPressureCompaction: true, nativeCompactionErrors, admittedAgentStreams: report.requests,
+    helperDispatches: 0, paidRequests: 0, failedStage: report.stages.at(-1).name }))
+})
+
+test('native child isolated compaction service cannot bypass the global boundary', options, async t => {
+  const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-child-helper-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let dispatches = 0
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
+    onRequest() { throw new Error('unexpected agent request') },
+  }, { inspectNative: async ({ ctx, root }) => {
+    ctx.on('llm/stream', () => (async function* () { dispatches++; throw new Error('unpaid sentinel') })(), { global: true })
+    const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+    const child = await ctx.agents.create({ sessionId: 'stream-helper-child', parentAgent: root,
+      agentOptions: resolveChildAgentOptions(root, undefined, 1), meta: childSessionMeta(root, 1, false),
+      setup: childCtx => applyChildComposition(childCtx, root, {}),
+    })
+    try {
+      const compactor = ctx.agentPresets.serviceFor(child.agent, 'compaction')
+      assert.notEqual(compactor, ctx.agentPresets.serviceFor(root, 'compaction'))
+      assert.equal(compactor.config.auto, true)
+      await assert.rejects(compactor.summarize({ messages: [] }, child.agent), /usage-or-runtime-error/)
+    } finally { await child.dispose() }
+  } })
+  try {
+    assert.equal(dispatches, 0)
+    assert.equal(diagnoseModelRuntime(harness.snapshot()).counts['auxiliary-call'], 1)
+  } finally { await harness.dispose() }
+})
+
+test('native verifier request cap rejects the next prepared stream without losing observed usage', options, async t => {
+  const { createNativeHarness, runModelVerification } = await import('../verify-model.mjs')
+  const outputDir = await mkdtemp(join(tmpdir(), 'taskforce-native-cap-report-'))
+  t.after(() => rm(outputDir, { recursive: true, force: true }))
+  let dispatches = 0
+  const report = await runModelVerification({ modelCalls: true, installAnchor: anchor, provider: 'deepseek-official', model: 'deepseek-flash', outputDir, requestCap: 1 }, {
+    createHarness: config => createNativeHarness(config, { inspectNative: ({ ctx }) => {
+      ctx.on('llm/stream', () => (async function* () {
+        dispatches++
+        yield { type: 'block-end', index: 0, block: { type: 'text', text: '137' } }
+        yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+        yield { type: 'finish', reason: { kind: 'stop' } }
+      })(), { global: true })
+    } }),
+  })
+  assert.equal(report.ok, false)
+  assert.equal(report.failure, 'request-cap')
+  assert.equal(report.requests, 1)
+  assert.equal(dispatches, 1)
+  assert.equal(report.usage.inputTokens, 2)
+  assert.equal(report.stages[1].requests, 0)
+})

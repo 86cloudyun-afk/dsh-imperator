@@ -112,8 +112,10 @@ function diagnosticName(event, tool, calls, eventIndex) {
   return diagnosticTools.has(name) ? name : null
 }
 const runtimeCategories = ['step-error', 'native-tool-error', 'ptc-tool-error', 'noncompleted-turn',
-  'missing-message', 'missing-usage', 'invalid-usage', 'duplicate-message', 'route-mismatch', 'no-requests']
-const durableRuntimeCategories = runtimeCategories.slice(0, 4)
+  'missing-message', 'missing-usage', 'invalid-usage', 'duplicate-message', 'route-mismatch', 'no-requests', 'pending-stream']
+const boundaryCategories = ['auxiliary-call', 'stream-attribution', 'capacity-mismatch', 'stream-error', 'stream-admission-error', 'compaction-error']
+runtimeCategories.push(...boundaryCategories)
+const durableRuntimeCategories = [...runtimeCategories.slice(0, 4), ...boundaryCategories]
 const noncompletedReasons = ['aborted', 'blocked', 'error', 'max-tokens', 'interrupted', 'forked']
 function accounting(snapshot, requests, route, { before, previousRequests = new Set(), requireRequests = false } = {}) {
   const usage = Object.fromEntries(usageKeys.map(key => [key, 0]))
@@ -142,6 +144,8 @@ function accounting(snapshot, requests, route, { before, previousRequests = new 
       const location = { sessionIndex, eventIndex, turn: count(data?.turn) ? data.turn : null,
         step: count(data?.step) ? data.step : null }
       const tool = toolEvent(event)
+      if (event.type === 'compaction/summary') add('auxiliary-call', location)
+      if (event.type === 'compaction/end' && data?.error !== undefined) add('compaction-error', location)
       if (event.type === 'step/error') add('step-error', location)
       if (tool?.phase === 'result' && tool.isError) {
         const toolName = diagnosticName(event, tool, nativeCalls, eventIndex)
@@ -171,6 +175,24 @@ function accounting(snapshot, requests, route, { before, previousRequests = new 
   for (const key of requests) {
     if (scopedRequests.has(key) && !matched.has(key)) add('missing-message', { requestIndex })
     requestIndex++
+  }
+  if (snapshot.streamAccounting) {
+    // Native consumed-stream usage is authoritative; assistant events above
+    // independently verify durable message/route/usage correspondence.
+    for (const field of usageKeys) usage[field] = 0
+    for (const [requestIndex, record] of snapshot.streamAccounting.records.entries()) {
+      if (!scopedRequests.has(record.key)) continue
+      if (!record.ended) add('pending-stream', { requestIndex })
+      for (const field of usageKeys) if (count(record.usage?.[field])) usage[field] += record.usage[field]
+    }
+    for (const category of runtimeCategories) {
+      const n = (snapshot.streamAccounting.failures[category] ?? 0) - (before?.streamAccounting?.failures[category] ?? 0)
+      if (n > 0) {
+        counts[category] += n
+        detailCount += n
+        if (details.length < 20) details.push({ category })
+      }
+    }
   }
   if (requireRequests && !scopedRequests.size) add('no-requests', {})
   const failureCodes = runtimeCategories.filter(category => counts[category] > 0)
@@ -204,7 +226,8 @@ export async function runModelVerification(options = {}, { createHarness = creat
     hostVersion: null, nodeVersion: process.version, provider: config.provider, model: config.model,
   }, requestCap: config.requestCap, stageTimeoutMs: config.stageTimeoutMs, requests: 0,
   outputCapacity: { configuredMaxTokens: MODEL_MAX_OUTPUT_TOKENS,
-    source: createHarness === createNativeHarness ? 'native-configuration' : 'custom-harness-unverified' },
+    source: createHarness === createNativeHarness ? 'native-stream-boundary' : 'custom-harness-unverified' },
+  auxiliaryPolicy: 'reject-before-dispatch',
   usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, stages: [], failure: null }
   const git = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8', timeout: 5000 })
   if (git.status === 0 && /^[0-9a-f]{40}$/.test(git.stdout.trim())) report.provenance.gitCommit = git.stdout.trim()
@@ -212,7 +235,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
   const onRequest = ({ agentId, turn, step }) => {
     if (stopped) fail('stopped')
     // A different agent may still have an in-flight request with no usage yet.
-    // Only durable step/tool/turn failures stop admission at this boundary.
+    // Only durable failures stop admission; pending concurrent streams do not.
     if (harness) {
       const { runtimeDiagnostics } = accounting(safeSnapshot(harness), requests, config)
       if (durableRuntimeCategories.some(category => runtimeDiagnostics.counts[category] > 0)) {
@@ -249,7 +272,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
   }
   try {
     writeModelFixture(workspace)
-    harness = await createHarness({ ...config, workspace, packageRoot: ROOT, onRequest })
+    harness = await createHarness({ ...config, workspace, packageRoot: ROOT, onRequest, onFailure: () => { runtimeStopped = true; stopped = true; harness?.cancel() } })
     report.provenance.hostVersion = /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(harness.hostVersion) ? harness.hostVersion : null
     if (report.provenance.hostVersion !== '0.2.0-rc.2') fail('host-version')
     for (const stage of MODEL_STAGES) {
@@ -269,7 +292,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
       const after = safeSnapshot(harness)
       const { total, workers, newWorkers, newTasks, reuse } = recordObservation(after)
       if (capHit) fail('request-cap')
-      if (!total.valid || requests.size === beforeRequests) fail('usage-or-runtime-error')
+      if (runtimeStopped || !total.valid || requests.size === beforeRequests) fail('usage-or-runtime-error')
       if (after.settled !== true) fail('unsettled-tree')
       let independentChecks
       if (stage.name === 'readonly') {
@@ -298,8 +321,9 @@ export async function runModelVerification(options = {}, { createHarness = creat
     report.failure = capHit ? 'request-cap' : runtimeStopped ? 'usage-or-runtime-error' : ['timeout', 'request-cap', 'duplicate-request', 'host-version', 'usage-or-runtime-error', 'unsettled-tree', 'readonly-contract', 'repair-worker-count', 'reuse-contract', 'incomplete-acceptance', 'evidence-policy', 'strict-receipt', 'independent-tests', 'invalid-observation'].includes(error?.verificationCode) ? error.verificationCode : 'runtime-error'
   } finally {
     stopped = true
+    let finalSnapshot
     if (harness) {
-      try { recordObservation(safeSnapshot(harness)) } catch { /* retain last confirmed counters */ }
+      try { finalSnapshot = safeSnapshot(harness); recordObservation(finalSnapshot) } catch { /* retain last confirmed counters */ }
     }
     if (stageRecord) {
       stageRecord.requests = requests.size - stageRequestStart
@@ -315,6 +339,17 @@ export async function runModelVerification(options = {}, { createHarness = creat
     } finally {
       process.exitCode = previousExit
       rmSync(workspace, { recursive: true, force: true })
+    }
+    // Cancellation/disposal drains native iterators after the last session
+    // snapshot. Read their bounded counters even after disposable storage is
+    // gone, so late known usage is retained without reopening that storage.
+    if (finalSnapshot && harness?.streamSnapshot) {
+      const durationMs = stageRecord?.durationMs
+      try {
+        const { total } = recordObservation({ ...finalSnapshot, streamAccounting: harness.streamSnapshot() })
+        if (report.ok && (runtimeStopped || !total.valid)) { report.ok = false; report.failure = 'usage-or-runtime-error' }
+      } catch { report.ok = false; report.failure = 'invalid-observation' }
+      if (stageRecord) stageRecord.durationMs = durationMs
     }
     report.requests = requests.size
     report.durationMs = Date.now() - started
@@ -404,8 +439,81 @@ export function observeModelTasks(store, rootId, workspace) {
   })
 }
 
+/** Controlled fixed-fixture boundary, not a production governor. rc.2 marks
+ * exact loop envelopes and resolves prepared config before llm/stream. A native
+ * agent/request supplies coordinates and signal, never a request count. Only
+ * consumption of its matching branded envelope can consume that admission.
+ * Helpers (including the unchanged automatic compactor) fail closed. */
+export function createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure = () => {} }) {
+  const pending = new Map(), records = [], failures = {}
+  let stopped = false
+  const latch = category => {
+    failures[category] = (failures[category] ?? 0) + 1
+    stopped = true
+    onFailure()
+  }
+  const reject = category => { latch(category); fail('usage-or-runtime-error') }
+  return {
+    observeRequest(payload) {
+      pending.set(payload.agent.id, { agent: payload.agent, turn: payload.turn, step: payload.step, signal: payload.signal })
+    },
+    intercept(options, next) {
+      // Capture the matching lifecycle admission at stream construction. Later
+      // requests cannot silently reattribute a delayed/unused lazy iterator.
+      const admission = pending.get(options.sessionId)
+      return (async function* () {
+        if (stopped) fail('usage-or-runtime-error')
+        if (!isAgentLoopRequest(options)) reject('auxiliary-call')
+        if (!Object.isFrozen(options) || !admission || pending.get(options.sessionId) !== admission
+          || tracked.get(options.sessionId) !== admission.agent || options.signal !== admission.signal
+          || !count(admission.turn) || !count(admission.step)) reject('stream-attribution')
+        if (options.provider !== provider || options.model !== model) reject('route-mismatch')
+        if (options.maxTokens !== MODEL_MAX_OUTPUT_TOKENS) reject('capacity-mismatch')
+        if (options.signal?.aborted) reject('stream-error')
+        pending.delete(options.sessionId)
+        try { onRequest({ agentId: admission.agent.id, turn: admission.turn, step: admission.step }) }
+        catch (error) { latch('stream-admission-error'); throw error }
+        const record = { key: `${admission.agent.id}:${admission.turn}:${admission.step}`, complete: false, ended: false, usage: null }
+        records.push(record)
+        let exhausted = false, terminal = false, failed = false
+        const bad = category => { failed = true; reject(category) }
+        try {
+          for await (const chunk of next()) {
+            if (terminal) bad('stream-error')
+            if (chunk.type === 'usage') {
+              const value = chunk.usage
+              if (!value || !count(value.inputTokens) || !count(value.outputTokens)
+                || usageKeys.some(field => value[field] !== undefined && !count(value[field]))) bad('invalid-usage')
+              // SDK BlockAssembler uses the latest cumulative usage frame.
+              record.usage = Object.fromEntries(usageKeys.filter(field => value[field] !== undefined).map(field => [field, value[field]]))
+            }
+            if (chunk.type === 'finish') {
+              terminal = true
+              if (!['stop', 'tool-calls'].includes(chunk.reason?.kind)) bad('stream-error')
+            }
+            yield chunk
+          }
+          exhausted = true
+          if (!terminal) bad('stream-error')
+          if (!record.usage) bad('missing-usage')
+          record.complete = true
+        } catch (error) {
+          if (!failed) { failed = true; latch('stream-error') }
+          throw error
+        } finally {
+          // An early return/abort is not a complete consumed response, even if
+          // a caller catches it or already saw a usage or terminal frame.
+          record.ended = true
+          if (!exhausted && !failed) latch('stream-error')
+        }
+      })()
+    },
+    snapshot: () => structuredClone({ records, failures }),
+  }
+}
+
 /** Official profile/registry path only; no custom provider client and no approval bypass. */
-export async function createNativeHarness({ installAnchor, packageRoot, workspace, provider, model, onRequest }, { inspectNative } = {}) {
+export async function createNativeHarness({ installAnchor, packageRoot, workspace, provider, model, onRequest, onFailure }, { inspectNative } = {}) {
   const anchor = resolveInstallAnchor({ installAnchor })
   if (installationVersion(anchor) !== '0.2.0-rc.2') fail('host-version')
   const fixture = await controlledProfile(anchor, packageRoot)
@@ -430,14 +538,17 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     writeFileSync(fixture.overlay, readFileSync(fixture.overlay, 'utf8') + `\n- id: session-title-llm\n  disabled: true\n- id: llm-retry\n  disabled: true\n- id: llm-deepseek\n  config:\n    maxTokens: ${MODEL_MAX_OUTPUT_TOKENS}\n    streamIdleTimeoutMs: 30000\n`)
     const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
     app = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web', patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
-    const { createUserMessage } = await nativeModule(anchor, '@deepseek-ai/dsh-llm')
+    const { createUserMessage, isAgentLoopRequest } = await nativeModule(anchor, '@deepseek-ai/dsh-llm')
+    const boundary = createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure })
+    app.ctx.on('llm/stream', (options, next) => boundary.intercept(options, next), { global: true, prepend: true })
     const rootId = `taskforce-model-${randomUUID()}`
     app.ctx.on('agent/created', ({ agent }) => {
+      if (agent.id !== rootId && !tracked.has(agent.session.header.parentSession)) return
       tracked.set(agent.id, agent)
       activationCounts.set(agent.id, (activationCounts.get(agent.id) ?? 0) + 1)
     })
     app.ctx.on('agent/request', (payload, next) => {
-      onRequest({ agentId: payload.agent.id, turn: payload.turn, step: payload.step })
+      boundary.observeRequest(payload)
       return next()
     })
     const registry = app.ctx.get('agentPresets')
@@ -445,8 +556,8 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
       agentOptions: { provider, model, maxTokens: MODEL_MAX_OUTPUT_TOKENS },
       setup: async (ctx, agent) => { await registry.mount(ctx, 'taskforce'); agent.session.append('agent-preset/selected', { agentPreset: 'taskforce' }) } })
     tracked.set(rootId, handle.agent)
-    // Native verification seam: inspect actual SDK configuration without
-    // enqueuing input or dispatching a model request. Not exposed by the CLI.
+    // Native unpaid verification seam: inspect SDK wiring or drive genuine
+    // lifecycles behind a local stream sentinel. Not exposed by the CLI.
     await inspectNative?.({ ctx: app.ctx, root: handle.agent })
     // A reused cold child has the same session id but a fresh Agent. Keep its latest
     // live object; its durable session history contains prior usage and notices.
@@ -464,9 +575,9 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     function snapshot() {
       const store = app.ctx.get('taskforceStore')
       const tasks = observeModelTasks(store, rootId, workspace)
-      return { sessions: sessions(), tasks, settled }
+      return { sessions: sessions(), tasks, settled, streamAccounting: boundary.snapshot() }
     }
-    return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, cancel, dispose }
+    return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, streamSnapshot: boundary.snapshot, cancel, dispose }
   } catch (error) { try { await dispose() } catch { /* preserve original setup failure */ } throw error }
 }
 

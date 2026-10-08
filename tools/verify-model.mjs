@@ -12,6 +12,7 @@ import { strictExecutionEvidence } from '../lib/store/execution.js'
 import { toolEvent } from '../lib/plugins/tool-events.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const MODEL_MAX_OUTPUT_TOKENS = 8192
 const fail = code => { throw Object.assign(new Error(code), { verificationCode: code }) }
 const count = value => Number.isSafeInteger(value) && value >= 0
 const tick = () => new Promise(resolveTick => setTimeout(resolveTick, 10))
@@ -202,6 +203,8 @@ export async function runModelVerification(options = {}, { createHarness = creat
     gitCommit: null, sourceSha256: productFingerprint(), packageSha256: config.packageSha256 ?? null,
     hostVersion: null, nodeVersion: process.version, provider: config.provider, model: config.model,
   }, requestCap: config.requestCap, stageTimeoutMs: config.stageTimeoutMs, requests: 0,
+  outputCapacity: { configuredMaxTokens: MODEL_MAX_OUTPUT_TOKENS,
+    source: createHarness === createNativeHarness ? 'native-configuration' : 'custom-harness-unverified' },
   usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, stages: [], failure: null }
   const git = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: ROOT, encoding: 'utf8', timeout: 5000 })
   if (git.status === 0 && /^[0-9a-f]{40}$/.test(git.stdout.trim())) report.provenance.gitCommit = git.stdout.trim()
@@ -402,7 +405,7 @@ export function observeModelTasks(store, rootId, workspace) {
 }
 
 /** Official profile/registry path only; no custom provider client and no approval bypass. */
-export async function createNativeHarness({ installAnchor, packageRoot, workspace, provider, model, onRequest }) {
+export async function createNativeHarness({ installAnchor, packageRoot, workspace, provider, model, onRequest }, { inspectNative } = {}) {
   const anchor = resolveInstallAnchor({ installAnchor })
   if (installationVersion(anchor) !== '0.2.0-rc.2') fail('host-version')
   const fixture = await controlledProfile(anchor, packageRoot)
@@ -424,7 +427,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     if (failures.length) throw new AggregateError(failures, 'native cleanup failed')
   }
   try {
-    writeFileSync(fixture.overlay, readFileSync(fixture.overlay, 'utf8') + '\n- id: session-title-llm\n  disabled: true\n- id: llm-retry\n  disabled: true\n- id: llm-deepseek\n  config:\n    maxTokens: 4096\n    streamIdleTimeoutMs: 30000\n')
+    writeFileSync(fixture.overlay, readFileSync(fixture.overlay, 'utf8') + `\n- id: session-title-llm\n  disabled: true\n- id: llm-retry\n  disabled: true\n- id: llm-deepseek\n  config:\n    maxTokens: ${MODEL_MAX_OUTPUT_TOKENS}\n    streamIdleTimeoutMs: 30000\n`)
     const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
     app = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web', patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     const { createUserMessage } = await nativeModule(anchor, '@deepseek-ai/dsh-llm')
@@ -439,9 +442,12 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     })
     const registry = app.ctx.get('agentPresets')
     handle = await app.ctx.get('agents').create({ sessionId: rootId, meta: { cwd: workspace },
-      agentOptions: { provider, model, maxTokens: 4096 },
+      agentOptions: { provider, model, maxTokens: MODEL_MAX_OUTPUT_TOKENS },
       setup: async (ctx, agent) => { await registry.mount(ctx, 'taskforce'); agent.session.append('agent-preset/selected', { agentPreset: 'taskforce' }) } })
     tracked.set(rootId, handle.agent)
+    // Native verification seam: inspect actual SDK configuration without
+    // enqueuing input or dispatching a model request. Not exposed by the CLI.
+    await inspectNative?.({ ctx: app.ctx, root: handle.agent })
     // A reused cold child has the same session id but a fresh Agent. Keep its latest
     // live object; its durable session history contains prior usage and notices.
     const sessions = () => nativeSessions(tracked)

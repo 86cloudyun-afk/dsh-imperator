@@ -592,3 +592,13 @@ test('native and PTC error codes are finite enums with exact counters beyond bou
   const unknown = diagnoseModelRuntime({ sessions: [{ events: events.slice(-7) }] })
   assert.ok(unknown.details.every(x => x.errorCode === 'unknown' && x.toolName === null))
 })
+
+test('model report declares the fixed output capacity without claiming custom harness effectiveness', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t)
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  assert.equal(report.ok, true)
+  assert.deepEqual(report.outputCapacity, { configuredMaxTokens: 8192, source: 'custom-harness-unverified' })
+  assert.deepEqual(JSON.parse(readFileSync(join(h.outputDir, 'report.json'))).outputCapacity, report.outputCapacity)
+  assert.equal(report.requestCap, 80)
+})

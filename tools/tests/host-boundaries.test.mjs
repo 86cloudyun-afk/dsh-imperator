@@ -504,3 +504,53 @@ test('native padded real owner completes strict verification with exact receipt 
   assert.equal((await call(worker, 'task_submit', { task_id: id, note: 'verified padded owner' })).ok, true)
   assert.equal((await call(main, 'task_accept', { task_id: id })).ok, true)
 })
+
+test('native model harness applies fixed output capacity through provider, agent and genuine child options without calls', options, async t => {
+  const { createNativeHarness } = await import('../verify-model.mjs')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-capacity-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let observed = false, requests = 0
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-v4-pro',
+    onRequest() { requests++; throw new Error('capacity probe forbids model requests') },
+  }, { inspectNative: async ({ ctx, root }) => {
+    observed = true
+    assert.equal(root.options.maxTokens, 8192)
+    const provider = await ctx.llm.resolveModelInfo('deepseek-official', 'capacity-probe-uncatalogued')
+    assert.equal(provider.defaultMaxTokens, 8192, 'actual provider fallback must match the fixed capacity')
+    const rootConfig = (await ctx.llm.prepareCall(root.options)).config
+    assert.equal(rootConfig.maxTokens, 8192)
+    // A catalog entry can override the provider fallback, but must not
+    // override the explicit root or inherited child allowance.
+    const entry = [...ctx.loader.entries()].find(entry => entry.options.id === 'llm-deepseek')
+    assert.ok(entry)
+    await entry.update({ config: { ...entry.options.config, models: [{ id: root.options.model, maxTokens: 16384 }] } })
+    await ctx.loader.await()
+    const catalog = await ctx.llm.resolveCallConfig({ provider: root.options.provider, model: root.options.model })
+    assert.equal(catalog.maxTokens, 16384)
+    assert.equal((await ctx.llm.prepareCall(root.options)).config.maxTokens, 8192)
+    const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+    const child = await ctx.agents.create({ sessionId: 'capacity-probe-child', parentAgent: root,
+      agentOptions: resolveChildAgentOptions(root, undefined, 1), meta: childSessionMeta(root, 1, false),
+      setup: childCtx => applyChildComposition(childCtx, root, {}),
+    })
+    try {
+      assert.equal(child.agent.options.maxTokens, 8192)
+      const childConfig = (await ctx.llm.prepareCall(child.agent.options)).config
+      assert.equal(childConfig.maxTokens, 8192)
+      assert.equal(childConfig.reasoningEffort, rootConfig.reasoningEffort)
+      // Prove actual request-option precedence against a different provider default,
+      // using public resolution only; never consume a prepared stream.
+      const explicit = await ctx.llm.resolveCallConfig({ ...root.options, maxTokens: 4096 })
+      assert.equal(explicit.maxTokens, 4096)
+      assert.equal(explicit.reasoningEffort, rootConfig.reasoningEffort)
+      assert.equal(requests, 0)
+      t.diagnostic(JSON.stringify({ providerDefaultMaxTokens: provider.defaultMaxTokens,
+        catalogDefaultMaxTokens: catalog.maxTokens, rootMaxTokens: rootConfig.maxTokens,
+        childMaxTokens: childConfig.maxTokens, explicitOverrideMaxTokens: explicit.maxTokens,
+        effortUnchanged: childConfig.reasoningEffort === rootConfig.reasoningEffort, modelRequests: requests }))
+    } finally { await child.dispose() }
+  } })
+  try { assert.equal(observed, true, 'native configuration probe must inspect the actual harness wiring'); assert.equal(requests, 0) }
+  finally { await harness.dispose() }
+})

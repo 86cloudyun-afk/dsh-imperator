@@ -27,6 +27,8 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'verify-p3.mjs', 'verify-scope-guard.mjs', 'verify-child-control.mjs',
   ])
   assert.equal(calls[6].args[0], '--test')
+  assert(calls[6].args.some(path => path.endsWith('/model-regression.test.mjs')),
+    'offline model regression uses injected harnesses without paid provider calls')
   assert(calls[6].args.some(path => path.endsWith('/owner-session.test.mjs')),
     'real owner/session and fact audit behavior must be registered in the offline runner')
   assert(calls[6].args.some(path => path.endsWith('/execution-receipts.test.mjs')),

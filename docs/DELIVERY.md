@@ -50,3 +50,21 @@ ECHO 采用调用发起顺序，晚到旧成功不清空新失败；native/PTC �
 CLI 机制参考：[官方 DSH 包说明](https://www.npmjs.com/package/@deepseek-ai/dsh)。固定版本实际安装与运行证据由 CI 记录。
 
 0.2.1 补充修复 issue #7：退出 TaskForce 后撤销本插件作用域限制，并阻止等待中的 TaskForce 钩子向已切换的会话注入消息。标准模式隔离是本版交付门槛；历史 0.2.0 包不包含此修复。见 `PRESET_ISOLATION.md`。
+
+## Opt-in 固定模型回归（0.3）
+
+离线 `npm test` 包含 `tools/tests/model-regression.test.mjs` 的 mock 超时、错误、usage、验收、复用与独立 grader 行为测试，不联网调用模型。真实模型验收另行显式执行，要求精确的官方 `@deepseek-ai/dsh@0.2.0-rc.2` 安装锚点：
+
+```bash
+node tools/verify-model.mjs --model-calls \
+  --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.json \
+  --provider deepseek-official --model deepseek-flash \
+  --request-cap 80 --stage-timeout-ms 180000 \
+  --output-dir /absolute/path/to/model-report
+```
+
+可选 `--package-sha256 <64位小写SHA256>` 绑定实际交付 tarball 的摘要；调用者应先独立计算该摘要。报告 `report.json` 绑定包版本、完整 git commit（源码树可取时）、产品源码 SHA256、可选包摘要、宿主/Node 版本与 provider/model。每阶段给出请求、输入/输出/缓存 tokens、时长、新建/复用/返工、事实和验收数量、固定独立断言数量；失败阶段仍保留已知计数。只有四阶段独立判据、真实任务闭环、完整 usage 与清理全部通过，`ok` 才为 true，CLI 才退出 0。
+
+本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
+
+没有显式 opt-in、非法请求/timeout 参数、超时、超过全局请求上限、provider/tool 错误、usage 缺失、未收口任务、错误执行者复用、无有效 strict 回执或独立断言失败均退出非零。不得用单条模型总结、模型改写后的测试退出码、静态提示词字数或 mock 成功代替真实模型验收。

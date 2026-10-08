@@ -108,3 +108,26 @@ ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”
 工具扫描保留 turn/step cursor，以及 native/PTC 命名空间、原始结果坐标、重复与乱序结果、通知 ID 和 ECHO 确认位置。后到的真实 PTC dispatch 可以回溯标记 run_code wrapper。snapshot 不提交未关闭的当前推理步；因此重复读取不会累计虚假的 STALL。仍使用 STALL observe、`stepDownRequests: 0`，store 与工具权限边界不变。
 
 成本边界：每次仍有 O(n) 前缀引用比较及引用数组复制；首次或新增对象的深冻结认证与 JSON 图大小相关。guard snapshot 仍扫描失败调用尾部，最坏 O(调用数)；todo 和可见 context 去重仍读取相应历史，surface compaction 会重新判断可见性。缓存保留事件引用与调用/通知元数据，空间随历史增长。这里只减少可信不可变历史的重复 reducer 处理，不承诺完整 pre-step 为 O(新增事件)，也不把处理计数当作真实模型延迟或成本测量。
+
+## 0.3 低风险短流程与固定模型回归
+
+低风险只读问题由主会话直接调查；需要执行时，一个可验收任务、一名执行者，把定位、回归、修复和提交组织在一起。只在关键里程碑记录产物与证据，提交后一次主控验收，不要求每步写 fact/decision 或重复复述。续作先 `task_child_send` 复用原执行者；高风险或证据矛盾仍需独立复核。此前「派发前记录」的完整决策摘要用于复杂或高风险任务，简单任务把边界与判据写进任务即可。
+
+这次压缩只改变 persona 和工具说明的表达。可信身份、主会话执行禁令、宿主 approval/sandbox/guards、终态与晚到 blocker、legacy 证据、execution 严格回执、软预算及有效思考契约继续有效。`STALL observe` 和 `stepDownRequests: 0` 不变。持久 governor 的可信宿主 API 已见下述交付说明；未经接线验证的 native managed 派发仍不能宣称受全树硬额度保护。
+
+`tools/verify-model.mjs` 可安全 import；`runModelVerification(options)` 要求 `modelCalls: true`。CLI 必须显式 `--model-calls`，否则在宿主启动前失败。默认 `npm test` 只跑注入离线 harness 的行为回归，不发 provider 请求。
+
+固定四阶段使用同一隔离临时工作区和同一主会话：
+
+| 阶段 | 独立判据 |
+|---|---|
+| readonly | 读发票回答 137 分；0 子代理、0 任务、工作区不变。 |
+| repair | 只新建 1 名直属执行者；1 个 accepted 任务；外部 grader 检查空数组、整数、小数精度和负数，共 4 项。 |
+| reuse | `task_child_send` 指向原执行者且该执行者实际发起模型请求；0 新执行者；新任务 accepted；外部 grader 共 8 项（前 4 项、NaN、正负 Infinity 的 TypeError、混合有限数回归）。 |
+| strict | 复用原执行者；新 execution 任务 accepted；固定文件清单与命令；重新验证当前源码、宿主日志及本代真实 owner 回执；外部 grader 8 项。 |
+
+grader 在工作区外运行固定断言，不运行模型自行改写的测试来决定最终通过；删除测试、打印成功或提前 exit(0) 都不能替代 grader 完成。strict 固定命令为 `node --test money.test.mjs`，清单为 `money.mjs` 和 `money.test.mjs`。任务豁免不计通过。模型请求错误、工具错误、非正常 turn/end、缺 usage、不完整验收、超额、超时或清理失败均不能标记 `ok: true`。
+
+runner 走官方 `controlledProfile`、registry mount 和 native followup，记录所有真实子代激活并等待各层宿主结算通知及主会话再次空闲。上限默认且最大 80 个全树请求（允许调低），每阶段默认 180000 ms；重试和自动标题模型调用关闭。失败时取消所有跟踪 agent，dispose 主句柄与应用，每步清理最多等待 10 秒，最终清除临时 profile/home/workspace 并还原环境和退出码。
+
+报告只持久化白名单元数据，不保存模型推理、对话、原始工具返回、证据内容或 credentials。任务/会话历史及 native 日志位于运行期间的临时 home，清理后移除。报告含固定阶段名称、数值指标、独立判据结果、固定失败码和版本/摘要；模型原文、异常消息及任意事实陈述不能进入报告。源码指纹覆盖排序后的 `package.json`、`cordis.patch.yml`、`lib/` 与 `tools/` 路径和文件字节；文档、报告和 git 元数据不计入。缓存 tokens 按宿主语义单列，`inputTokens` 是未缓存输入，缺省 cache 字段计 0。报告是单次受控样例，不能独自证明普遍性能提升。

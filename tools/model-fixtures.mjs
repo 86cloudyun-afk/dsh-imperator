@@ -6,12 +6,12 @@ import { randomUUID } from 'node:crypto'
 
 export const STRICT_COMMAND = 'node --test money.test.mjs'
 export const STRICT_FILES = ['money.mjs', 'money.test.mjs']
-const boundary = 'money.mjs 必须保持自包含、同步的 ES 模块，仅使用标准 ECMAScript 内建；不得导入其他模块或依赖 process/Buffer 等 Node 宿主全局。money.test.mjs 可正常导入 node:test。只在当前工作目录操作，不提交 Git，不修改目录外文件。使用任务事实库完成提交和主控验收；不使用人工豁免。'
+const boundary = 'money.mjs 必须保持自包含、同步的 ES 模块，仅使用标准 ECMAScript 内建；不得导入其他模块或依赖 process/Buffer 等 Node 宿主全局。money.test.mjs 可正常导入 node:test。只在当前工作目录操作，不提交 Git，不修改目录外文件。使用任务事实库完成提交和主控验收；只在关键里程碑合并记录实际测试结果、日志和产物指针，提交后主控只读核对证据并一次验收；不使用人工豁免。'
 export const MODEL_STAGES = Object.freeze([
   { name: 'readonly', prompt: '只读 README.md，回答发票总额是多少分。不要创建任务、子代理或修改文件。' },
-  { name: 'repair', prompt: `修复 money.mjs 的 sumMoney 金额精度：空数组=0、[10,20]=30、[0.1,0.2]精确=0.3、[-1.1,0.2]精确=-0.9。保留导出，运行现有 money.test.mjs 并保留日志和产物依据。一个可验收任务、一名执行者。${boundary}` },
-  { name: 'reuse', prompt: `追加要求：sumMoney 对 NaN、+Infinity、-Infinity 输入抛 TypeError，仍支持有限负数与小数。补充回归并运行全部测试、保留日志。新开一个任务，使用 task_child_send 复用上一轮执行者，不新建代理。${boundary}` },
-  { name: 'strict', prompt: `新开一个 evidence_policy=execution 的严格验收任务；verification_files 精确为 ${JSON.stringify(STRICT_FILES)}，verification_command 精确为 ${JSON.stringify(STRICT_COMMAND)}。复用原执行者认领，用 task_verify 取得真实宿主回执，再提交，由主控核对 task_board 后 task_accept。保留所有金额和非有限数行为。主会话不得执行命令。${boundary}` },
+  { name: 'repair', prompt: `修复 money.mjs 的 sumMoney 金额精度：空数组=0、[10,20]=30、[0.1,0.2]精确=0.3、[-1.1,0.2]精确=-0.9。保留导出，运行现有 money.test.mjs 并保留日志和产物依据。新开一个 evidence_policy=legacy 的可验收任务、一名执行者。${boundary}` },
+  { name: 'reuse', prompt: `追加要求：sumMoney 对 NaN、+Infinity、-Infinity 输入抛 TypeError，仍支持有限负数与小数。补充回归并运行全部测试、保留日志。新开一个 evidence_policy=legacy 的任务，使用 task_child_send 复用上一轮执行者，不新建代理。${boundary}` },
+  { name: 'strict', prompt: `新开一个 evidence_policy=execution 的严格验收任务；verification_files 精确为 ${JSON.stringify(STRICT_FILES)}，verification_command 精确为 ${JSON.stringify(STRICT_COMMAND)}。本阶段无新增功能要求；复用原执行者认领，以一次 task_verify 完成本阶段测试并取得真实宿主回执，实际失败时修正后重验，再提交，由主控核对 task_board 后 task_accept。保留所有金额和非有限数行为。主会话不得执行命令。${boundary}` },
 ])
 
 export function writeModelFixture(workspace) {

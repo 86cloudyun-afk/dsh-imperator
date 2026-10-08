@@ -107,12 +107,50 @@ test('successful fixed stages include independent 4/8 checks, reuse, acceptance 
   assert.deepEqual(report.stages.map(s => s.independentChecks), [1, 4, 8, 8])
   assert.deepEqual(report.stages.map(s => s.newWorkers), [0, 1, 0, 0])
   assert.equal(report.stages[2].reuse, 1)
+  assert.deepEqual(report.stages[3].closure.tasks.map(task => task.evidencePolicy), ['legacy', 'legacy', 'execution'])
   assert.equal(report.requests, 7)
   assert.equal(report.usage.inputTokens, 14)
   assert.match(report.provenance.sourceSha256, /^[0-9a-f]{64}$/)
   assert.equal(report.provenance.packageVersion, JSON.parse(readFileSync(join(root, 'package.json'))).version)
   assert.equal(h.disposed(), true)
   assert.doesNotMatch(JSON.stringify(report), /sk-secret|reasoning|credentials|marker/)
+})
+
+for (const stageName of ['repair', 'reuse']) {
+  test(`${stageName} rejects execution policy even with accepted tasks and a valid receipt`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, undefined, ({ stage, tasks }) => {
+      if (stage.name !== stageName) return
+      tasks.at(-1).evidence_policy = 'execution'
+      tasks.at(-1).strictVerified = true
+    })
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.ok, false)
+    assert.equal(report.failure, 'evidence-policy')
+    const stage = report.stages.at(-1)
+    assert.equal(stage.name, stageName)
+    assert.equal(stage.ok, false)
+    assert.equal(stage.accepted, 1)
+    assert.equal(stage.closure.ok, true, 'policy mismatch is distinct from accepted-task closure')
+    assert.equal(stage.closure.tasks.at(-1).evidencePolicy, 'execution')
+    assert.equal(stage.closure.tasks.at(-1).strictVerified, true)
+    assert.deepEqual(stage.runtimeDiagnostics.failureCodes, [])
+    assert.equal(h.disposed(), true)
+  })
+}
+
+test('strict stage still rejects legacy policy even when the receipt flag is true', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, undefined, ({ stage, tasks }) => {
+    if (stage.name !== 'strict') return
+    tasks.at(-1).evidence_policy = 'legacy'
+    tasks.at(-1).evidence = 1
+  })
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  assert.equal(report.ok, false)
+  assert.equal(report.failure, 'strict-receipt')
+  assert.equal(report.stages.at(-1).name, 'strict')
+  assert.equal(report.stages.at(-1).closure.ok, true)
 })
 
 test('product fingerprint follows content and paths, not timestamps or unrelated reports', async t => {

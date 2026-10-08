@@ -234,6 +234,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
         } else if (newWorkers !== 0 || workers.length !== 1 || workers[0].id !== workerId || reuse < 1) fail('reuse-contract')
         if (![...requests].some(key => !beforeRequestKeys.has(key) && key.startsWith(workerId + ':'))) fail('reuse-contract')
         if (!stageRecord.closure.ok) fail('incomplete-acceptance')
+        if (stage.name !== 'strict' && newTasks[0].evidence_policy !== 'legacy') fail('evidence-policy')
         if (stage.name === 'strict' && (newTasks[0].evidence_policy !== 'execution' || newTasks[0].strictVerified !== true)) fail('strict-receipt')
         const result = gradeMoney(workspace, stage.name !== 'repair')
         independentChecks = result.checks
@@ -244,7 +245,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
     }
     report.ok = report.stages.length === MODEL_STAGES.length
   } catch (error) {
-    report.failure = capHit ? 'request-cap' : runtimeStopped ? 'usage-or-runtime-error' : ['timeout', 'request-cap', 'duplicate-request', 'host-version', 'usage-or-runtime-error', 'unsettled-tree', 'readonly-contract', 'repair-worker-count', 'reuse-contract', 'incomplete-acceptance', 'strict-receipt', 'independent-tests', 'invalid-observation'].includes(error?.verificationCode) ? error.verificationCode : 'runtime-error'
+    report.failure = capHit ? 'request-cap' : runtimeStopped ? 'usage-or-runtime-error' : ['timeout', 'request-cap', 'duplicate-request', 'host-version', 'usage-or-runtime-error', 'unsettled-tree', 'readonly-contract', 'repair-worker-count', 'reuse-contract', 'incomplete-acceptance', 'evidence-policy', 'strict-receipt', 'independent-tests', 'invalid-observation'].includes(error?.verificationCode) ? error.verificationCode : 'runtime-error'
   } finally {
     stopped = true
     if (harness) {

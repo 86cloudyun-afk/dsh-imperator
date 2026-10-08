@@ -122,9 +122,11 @@ ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”
 | 阶段 | 独立判据 |
 |---|---|
 | readonly | 读发票回答 137 分；0 子代理、0 任务、工作区不变。 |
-| repair | 只新建 1 名直属执行者；1 个 accepted 任务；外部 grader 检查空数组、整数、小数精度和负数，共 4 项。 |
-| reuse | `task_child_send` 指向原执行者且该执行者实际发起模型请求；0 新执行者；新任务 accepted；外部 grader 共 8 项（前 4 项、NaN、正负 Infinity 的 TypeError、混合有限数回归）。 |
+| repair | 只新建 1 名直属执行者；1 个 legacy 任务 accepted；外部 grader 检查空数组、整数、小数精度和负数，共 4 项。 |
+| reuse | `task_child_send` 指向原执行者且该执行者实际发起模型请求；0 新执行者；新 legacy 任务 accepted；外部 grader 共 8 项（前 4 项、NaN、正负 Infinity 的 TypeError、混合有限数回归）。 |
 | strict | 复用原执行者；新 execution 任务 accepted；固定文件清单与命令；重新验证当前源码、宿主日志及本代真实 owner 回执；外部 grader 8 项。 |
+
+repair/reuse 的提示与实际任务 policy 均固定为 `legacy`，便于与原金额修复/续作工作量比较；若观察到其他 policy，即使任务 accepted 且有真实回执也以 `evidence-policy` 失败。第四阶段单独测量 execution 严格闭环，不新增功能要求，以固定 task_verify 完成本阶段测试；真实失败须修正后重验，仍需主控验收和独立 8 项判据。此固定回归不评价模型自主选择证据策略。执行者仍须实际运行测试并保留日志/产物依据，关键里程碑合并记录，提交后主控只读核对证据并一次验收。
 
 grader 在工作区外运行固定断言，不运行模型自行改写的测试来决定最终通过；删除测试、打印成功或提前 exit(0) 都不能替代 grader 完成。strict 固定命令为 `node --test money.test.mjs`，清单为 `money.mjs` 和 `money.test.mjs`。任务豁免不计通过。模型请求错误、工具错误、非正常 turn/end、缺 usage、不完整验收、超额、超时或清理失败均不能标记 `ok: true`。
 

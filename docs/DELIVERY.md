@@ -79,6 +79,8 @@ node tools/verify-model.mjs --model-calls \
 
 没有显式 opt-in、非法请求/timeout 参数、超时、超过全局请求上限、provider/tool 错误、usage 缺失、未收口任务、错误执行者复用、无有效 strict 回执或独立断言失败均退出非零。不得用单条模型总结、模型改写后的测试退出码、静态提示词字数或 mock 成功代替真实模型验收。
 
+金额修复与同执行者续作阶段固定使用 `evidence_policy=legacy`，提示及观察到的实际任务策略必须一致，否则报告 `evidence-policy` 失败。第四阶段仍要求 execution 真实严格回执与主控验收。这保证基线工作量的可比性，不测量自主策略选择；独立判据、请求上限和 timeout 不变。
+
 固定金额回归仅评价自包含 ESM 的同步 `sumMoney` 和标准 ECMAScript 内建；不支持 money.mjs 导入其他模块、访问 Node 宿主全局或异步返回。该约束已写入固定模型提示；测试文件仍允许 node:test。grader 在一次性子进程的新 `vm.SourceTextModule` realm 执行模型源码，输入也在该 realm 创建，判据和完成协议留在外层。所需 `--experimental-vm-modules` 仅由 grader 子进程开启，使用 Node 内建能力，无新增依赖；它不是通用模块或 OS 沙箱。
 
 执行阶段的 `closure` 诊断只记录固定失败码（new-task-count/task-status/owner-mismatch/waiver/legacy-evidence）、任务/新任务数量和最多 20 条任务的 ID、枚举状态、ownerMatches、evidenceCount、waived、证据策略与 strictVerified；超出部分仍参与全部判定，`truncated` 明示详情截断。不写 owner/session 原文、事实、附注、模型输出或错误消息。waived 依据当前接受记录的系统裁决标记及本代结构化 execution_waiver 记录；普通事实或附注提及「不使用人工豁免」不算实际豁免。

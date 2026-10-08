@@ -12,6 +12,7 @@ const SCRIPTS = [
   'verify-p3.mjs', 'verify-scope-guard.mjs', 'verify-child-control.mjs',
 ]
 const TESTS = [
+  'governor.test.mjs',
   'sqlite.test.mjs',
   'store-atomicity.test.mjs',
   'store-evidence.test.mjs',

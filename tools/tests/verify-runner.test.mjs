@@ -35,6 +35,8 @@ test('offline runs six scripts and explicit test files, then marks host integrat
     'bounded board and full-history pagination must run in the offline runner')
   assert(calls[6].args.some(path => path.endsWith('/incremental-projection.test.mjs')),
     'incremental immutable-history projections must run in the offline runner')
+  assert(calls[6].args.some(path => path.endsWith('/governor.test.mjs')),
+    'durable governor admission must run in the offline runner')
   // 目录锚定：期望集合由 tools/tests 的实际内容推导——孤儿测试（在目录里但未注册）与幽灵条目
   // （注册了但文件缺失）都会在此失败，且新增测试文件无需第二处手工同步。
   const expectedOfflineTests = readdirSync(join(root, 'tools/tests'))

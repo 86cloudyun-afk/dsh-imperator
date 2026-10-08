@@ -16,6 +16,7 @@
   "exports": {
     ".": "./lib/index.js",
     "./store": "./lib/store/index.js",
+    "./governor": "./lib/governor/index.js",
     "./tools": "./lib/tools/index.js",
     "./package.json": "./package.json"
   },

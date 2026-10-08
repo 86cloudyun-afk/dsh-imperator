@@ -347,3 +347,117 @@ test('native root with actual session ID lead keeps root mutation authority and 
   assert.equal((await call('task_close', { task_id: cancelId, result: 'failed', note: 'root cancels' })).ok, true)
   assert.equal(store.board(cancelId, 'lead').facts[0].actor_session, 'lead')
 })
+
+for (const operation of ['claim-and-submit', 'sibling-submit']) {
+  test(`native distinct worker IDs with surrounding whitespace retain exact ownership: ${operation}`, options, async t => {
+    const { ctx, agent } = await fixture(t)
+    const [{ apply: applyTools }, { tempStore }] = await Promise.all([import('../../lib/tools/index.js'), import('./helpers.mjs')])
+    const store = tempStore(t), main = agent('exact-root')
+    const padded = agent(' worker ', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'exact-root' })
+    const plain = agent('worker', main, { origin: 'subagent', delegationDepth: 1, parentSession: 'exact-root' })
+    const byId = new Map([main, padded, plain].map(a => [a.session.header.id, a]))
+    ctx.provide('taskforceStore', store)
+    ctx.provide('agents', { get: id => byId.get(id) })
+    applyTools(ctx)
+    let sequence = 0
+    const call = async (caller, name, args) => {
+      const result = await caller.ctx.tools.execute({ agent: caller, callId: `exact-owner-${++sequence}`, name,
+        arguments: args, signal: new AbortController().signal })
+      assert.equal(result.isError, false, result.error?.message)
+      return JSON.parse(result.value)
+    }
+    const id = (await call(main, 'task_open', { title: operation })).task_id
+    const claimed = await call(padded, 'task_claim', { task_id: id, child_id: 'shared-label' })
+    if (operation === 'sibling-submit') {
+      const before = store.taskOf(id, 'exact-root')
+      assert.equal((await call(plain, 'task_submit', { task_id: id })).code, 'E_TASK_CONFLICT', 'plain sibling must not inherit the padded real owner identity')
+      assert.deepEqual(store.taskOf(id, 'exact-root'), before)
+      assert.equal((await call(plain, 'task_claim', { task_id: id, child_id: 'shared-label' })).code, 'E_TASK_CONFLICT')
+      assert.equal((await call(plain, 'task_close', { task_id: id, result: 'failed' })).code, 'E_TASK_CONFLICT')
+      return
+    }
+    assert.equal(claimed.owner_session, ' worker ', 'the host owner session must be stored verbatim')
+    assert.equal((await call(padded, 'task_claim', { task_id: id, child_id: 'other-nickname' })).already, true)
+    await call(padded, 'task_fact', { task_id: id, kind: 'fact', statement: 'exact actor audit' })
+    assert.equal((await call(padded, 'task_submit', { task_id: id, note: 'actual padded worker' })).ok, true)
+    assert(store.board(id, 'exact-root').facts.every(f => f.actor_session === ' worker ' && f.by === 'worker'))
+    assert.equal((await call(padded, 'task_close', { task_id: id, result: 'failed', note: 'actual padded owner' })).ok, true)
+    assert.equal(store.board(id, 'exact-root').facts[0].actor_session, ' worker ')
+  })
+}
+
+test('native roots differing by surrounding whitespace cannot read or mutate each other through task pages or legacy reads', options, async t => {
+  const { ctx, agent } = await fixture(t)
+  const [{ apply: applyTools }, { tempStore }] = await Promise.all([import('../../lib/tools/index.js'), import('./helpers.mjs')])
+  const store = tempStore(t), padded = agent(' root '), plain = agent('root')
+  const byId = new Map([padded, plain].map(a => [a.session.header.id, a]))
+  ctx.provide('taskforceStore', store)
+  ctx.provide('agents', { get: id => byId.get(id) })
+  applyTools(ctx)
+  let sequence = 0
+  const call = async (caller, name, args) => {
+    const result = await caller.ctx.tools.execute({ agent: caller, callId: `exact-run-${++sequence}`, name,
+      arguments: args, signal: new AbortController().signal })
+    assert.equal(result.isError, false, result.error?.message)
+    return JSON.parse(result.value)
+  }
+  const id = (await call(padded, 'task_open', { title: 'padded root secret' })).task_id
+  assert.equal((await call(plain, 'task_board', {})).tasks.length, 0, 'distinct root IDs must not share the same task scope')
+  assert.equal((await call(plain, 'task_board', { task_id: id })).code, 'E_CROSS_RUN')
+  assert.equal((await call(plain, 'task_close', { task_id: id, result: 'failed' })).code, 'E_CROSS_RUN')
+  assert.equal(store.taskOf(id, ' root ').task.run_id, ' root ')
+  assert.equal(store.board({}, 'root').tasks.length, 0)
+  assert.throws(() => store.taskOf(id, 'root'), { code: 'E_CROSS_RUN' })
+  assert.throws(() => store.board(id, 'root'), { code: 'E_CROSS_RUN' })
+  await call(padded, 'task_fact', { task_id: id, kind: 'artifact', statement: 'private artifact', evidence_path: 'PRIVATE_ARTIFACT' })
+  await call(padded, 'task_submit', { task_id: id })
+  assert.equal((await call(padded, 'task_accept', { task_id: id })).ok, true)
+  const foreignHistory = await call(plain, 'task_board', { task_id: id, view: 'facts' })
+  assert.equal(foreignHistory.code, 'E_CROSS_RUN')
+  assert.doesNotMatch(JSON.stringify(foreignHistory), /PRIVATE_ARTIFACT|private artifact/)
+  assert((await call(padded, 'task_board', { task_id: id, view: 'facts' })).facts.some(f => f.evidence === 'PRIVATE_ARTIFACT'))
+  assert.throws(() => store.boardPage({ task_id: id, view: 'facts' }, 'root'), { code: 'E_CROSS_RUN' })
+})
+
+test('native padded real owner completes strict verification with exact receipt ownership and audit', options, async t => {
+  const { ctx, agent } = await fixture(t)
+  const [{ LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, bash, { apply: applyTools }, { tempStore }] = await Promise.all([
+    native('@deepseek-ai/dsh-subprocess-local'), native('@deepseek-ai/dsh-bash-local'), native('@deepseek-ai/dsh-shell-env'),
+    native('@deepseek-ai/dsh-tool-bash'), import('../../lib/tools/index.js'), import('./helpers.mjs'),
+  ])
+  const { writeFile } = await import('node:fs/promises')
+  const cwd = await mkdtemp(join(tmpdir(), 'taskforce-padded-receipt-'))
+  t.after(() => rm(cwd, { recursive: true, force: true }))
+  await writeFile(join(cwd, 'source.js'), 'source\n')
+  new LocalSubprocessRuntime(ctx)
+  new ShellEnvRegistry(ctx)
+  new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
+  bash.apply(ctx, { enableRunInBackground: false, promoteOnTimeout: false })
+  const store = tempStore(t), main = agent('exact-receipt-root', undefined, { cwd })
+  const worker = agent(' worker ', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'exact-receipt-root' })
+  const sibling = agent('worker', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'exact-receipt-root' })
+  const byId = new Map([main, worker, sibling].map(a => [a.session.header.id, a]))
+  ctx.provide('taskforceStore', store)
+  ctx.provide('agents', { get: id => byId.get(id) })
+  applyTools(ctx)
+  applyScope(ctx)
+  for (const a of [main, worker, sibling]) await ctx.serial('agent/created', { agent: a })
+  let sequence = 0
+  const call = async (caller, name, args) => {
+    const result = await caller.ctx.tools.execute({ agent: caller, callId: `exact-receipt-${++sequence}`, name,
+      arguments: args, signal: new AbortController().signal })
+    assert.equal(result.isError, false, result.error?.message)
+    return JSON.parse(result.value)
+  }
+  const command = "printf 'exact owner receipt\\n'"
+  const id = (await call(main, 'task_open', { title: 'padded strict owner', evidence_policy: 'execution',
+    verification_files: ['source.js'], verification_command: command })).task_id
+  await call(worker, 'task_claim', { task_id: id, child_id: 'shared-label' })
+  assert.equal((await call(worker, 'task_verify', { task_id: id, command })).verified, true)
+  const receipt = store.board(id, 'exact-receipt-root').receipts[0]
+  assert.equal(receipt.owner_session, ' worker ')
+  assert.equal(receipt.actor_session, ' worker ')
+  assert.equal((await call(sibling, 'task_verify', { task_id: id, command })).code, 'E_TASK_CONFLICT')
+  assert.equal((await call(worker, 'task_submit', { task_id: id, note: 'verified padded owner' })).ok, true)
+  assert.equal((await call(main, 'task_accept', { task_id: id })).ok, true)
+})

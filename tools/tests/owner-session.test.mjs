@@ -288,3 +288,67 @@ test('legacy unbound label cancellation accepts its old caller slot and records 
   assert.equal(snapshot(store, id).facts.at(-1).created_by, 'legacy-label')
   assert.equal(snapshot(store, id).facts.at(-1).actor_session, 'real-session')
 })
+
+test('legacy padded lead caller cannot submit a sibling bound task or obtain root mutation roles', t => {
+  const store = tempStore(t), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'sibling-label' }, 'run-a', 'sibling', 'sibling')
+  const before = snapshot(store, id)
+  assert.throws(() => store.submitTask({ task_id: id }, 'run-a', ' lead ', 'other-worker'), { code: STORE_CODES.conflict })
+  assert.throws(() => store.closeTask({ task_id: id, result: 'failed' }, 'run-a', ' lead ', 'other-worker'), { code: STORE_CODES.conflict })
+  assert.deepEqual(snapshot(store, id), before)
+  store.submitTask({ task_id: id }, 'run-a', 'sibling', 'sibling')
+  assert.throws(() => store.acceptTask({ task_id: id, waiver_reason: 'not root' }, 'run-a', ' lead '), { code: STORE_CODES.notLead })
+  assert.throws(() => store.rejectTask({ task_id: id, reason: 'not root' }, 'run-a', ' lead '), { code: STORE_CODES.notLead })
+  store.rejectTask({ task_id: id, reason: 'root rejects' }, 'run-a', 'lead')
+  const rejected = snapshot(store, id)
+  assert.throws(() => store.claimTask({ task_id: id, child_id: 'replacement' }, 'run-a', ' lead ', 'other-worker'), { code: STORE_CODES.conflict })
+  assert.deepEqual(snapshot(store, id), rejected)
+})
+
+for (const callerId of [' ', '', ' sibling-label ']) {
+  test(`legacy explicit caller ${JSON.stringify(callerId)} cannot use omitted-host bypass or normalized owner matching`, t => {
+    const store = tempStore(t), id = task(store)
+    store.claimTask({ task_id: id, child_id: 'sibling-label' }, 'run-a')
+    const before = snapshot(store, id)
+    assert.throws(() => store.closeTask({ task_id: id, result: 'failed' }, 'run-a', callerId), { code: STORE_CODES.conflict })
+    assert.deepEqual(snapshot(store, id), before)
+  })
+}
+
+test('legacy bound caller and appended authority session retain exact comparisons while audit formatting stays normalized', t => {
+  const store = tempStore(t), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'sibling-label' }, 'run-a', 'sibling', 'sibling')
+  const before = snapshot(store, id)
+  for (const [callerId, actorSessionId] of [[' sibling ', undefined], ['other-worker', ' sibling ']]) {
+    assert.throws(() => store.submitTask({ task_id: id }, 'run-a', callerId, actorSessionId), { code: STORE_CODES.conflict })
+    assert.deepEqual(snapshot(store, id), before)
+  }
+  const fact = store.recordFact({ task_id: id, statement: 'audit formatting' }, 'run-a', ' sibling ', ' audit-session ')
+  const row = store.handle.prepare('SELECT * FROM fact WHERE id = ?').get(fact.fact_id)
+  assert.equal(row.created_by, 'sibling')
+  assert.equal(row.actor_session, 'audit-session')
+  assert.equal(store.submitTask({ task_id: id }, 'run-a', 'lead', ' actual-root ').status, 'submitted')
+})
+
+test('only genuinely omitted or null legacy callers keep the unbound host cancellation bypass', t => {
+  const store = tempStore(t)
+  for (const callerId of [undefined, null]) {
+    const id = task(store)
+    store.claimTask({ task_id: id, child_id: 'sibling-label' }, 'run-a')
+    assert.equal(store.closeTask({ task_id: id, result: 'failed' }, 'run-a', callerId).status, 'cancelled')
+  }
+})
+
+test('direct host exact nonblank run keys remain distinct, blanks keep unassigned and full key length is bounded', t => {
+  const store = tempStore(t)
+  const id = store.openTask('exact padded run', ' root ').task_id
+  assert.equal(store.taskOf(id, ' root ').task.run_id, ' root ')
+  assert.equal(store.board({}, 'root').tasks.length, 0)
+  assert.throws(() => store.taskOf(id, 'root'), { code: STORE_CODES.crossRun })
+  for (const run of [undefined, null, '', ' ']) {
+    assert.equal(store.openTask('unassigned', run).run_id, null)
+  }
+  const maximum = ` ${'r'.repeat(198)} `
+  assert.equal(store.openTask('maximum exact key', maximum).run_id, maximum)
+  assert.throws(() => store.openTask('overlong exact key', ` ${'r'.repeat(199)} `), /run_id 过长/)
+})

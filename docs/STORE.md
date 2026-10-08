@@ -99,6 +99,9 @@ exec.agent  (宿主在 agent 循环里塞进每次工具执行)
 
 1. **`runId` 是独立的位置参数，绝不放进入参对象**（`openTask(input, runId)`）。
    一旦它成为 `input.run_id`，模型就能伪造归属。
+   非空白 run ID 按完整原字符串存储和比较（包括首尾空白），完整长度上限 200；
+   省略、`null` 与空白字符串仍表示未归属。旧版已去空白的历史键无法可靠还原，
+   不自动重命名或猜填；宿主访问旧数据须使用库中原有的精确存储键。
 2. 子代理判据 = `header.origin === 'subagent'` 或 `delegationDepth > 0`。
    **`parentSession` 单独存在不算子代理** —— 它同时表达 fork 血缘，手工 fork 出来的主会话
    不应因此丢掉验收权。
@@ -125,6 +128,10 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 结构缺少有效 ID 或布尔角色时拒绝；模型字段不能指定这两个值。结构化调用的审计只取其真实
 `sessionId`，不会由显示标签或追加位置参数覆盖。旧宿主字符串 `lead` 位置参数仍代表可信主会话角色；
 旧字符串 caller、缺省参数与独立审计 session 位置保持兼容，未提供审计 ID 时不猜填。
+旧权限比较保留原始输入：只有逐字 `lead` 是主会话角色，只有实际省略/null 可走未绑定宿主直连；
+带空白 caller 与权限 session 不因显示/审计的 trim 取得另一身份或额外权限。
+`ownerSessionId` 的非空白真实 ID 同样完整保存，结构化 `sessionId` 与 `actor_session`
+逐字匹配；`' worker '` 与 `'worker'` 是不同执行者。显示标签及旧宿主审计格式继续归一化。
 
 | 方法 | 入参 | 返回 |
 |---|---|---|
@@ -200,7 +207,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | 规则 | 判据 |
 |---|---|
 | 子代理只能 `task_submit` | 提交后进 `submitted`，**不是完成**；仍出现在默认看板 |
-| 只有主会话能 `task_accept` / `task_reject` | 身份判据在**工具层强制**（`identity.isRoot`），数据层再用 `actor === 'lead'` 二次校验（纵深防御） |
+| 只有主会话能 `task_accept` / `task_reject` | 身份判据在**工具层强制**（`identity.isRoot`），数据层再核对可信结构化 `isRoot`；旧宿主字符串仅逐字 `lead` 表示主会话角色 |
 | **终态冻结**（v3） | 已收口任务的结论**不被任何普通写入改写**：`closeTask(failed)` 分支**先查原状态**，`claim` / `submit` / `accept` / `close` / 非 blocker 落事实 一律拒绝（`E_TERMINAL` + 可读错误），错误里指路 `task_reject` |
 | **取消要证明资格**（本版） | `closeTask(failed)` 在终态闸门之后追加 `requireCancelAuthority`：只有**主会话**或**该任务当前 owner** 能取消（`caller` 由工具层按真实调用者派生，模型参数不参与）；同一 run 的竞争子代理被 `E_TASK_CONFLICT` 拒绝，**任务状态、事实与交接一字未改**。取消是终态且破坏性的动作，不能由竞争方代劳 —— 要停别人的任务就报告主会话。取消审计的 `created_by` 记为**真实调用者**（主会话叫停写 `lead`），不再无条件写成 `row.owner` |
 | **提交的署名同样反映真实调用者**（本版） | `submitTask`（含 `task_close(done\|partial)` 别名）落审计时，`created_by` 记**真实调用者**：主会话代提交写 `lead`，子代理写自己的 sessionId（缺省 = 宿主直连，沿用 `row.owner`）。避免"主会话代交"被误记成原 owner 自己提交 |

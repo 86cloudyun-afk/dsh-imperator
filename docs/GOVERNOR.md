@@ -10,14 +10,15 @@ execution adapter routes every relevant entry point through admission.
 
 `new TaskforceGovernor(store)` shares the `TaskforceStore` SQLite connection and
 transaction helpers. Additive `governor_run`, `governor_reservation`,
-`governor_hold`, and `governor_audit` tables live in the existing
+`governor_hold`, `governor_retry_charge`, and `governor_audit` tables live in the existing
 `$DSH_HOME/taskforce/taskforce.db`. Construction is lazy. Every call obtains the
 current store-owned connection; closed stores stay closed, and invalidated
 connections are reopened only through the store. Do not close its handle yourself.
 
 `BEGIN IMMEDIATE` serializes admission, cumulative accounting, resource holds,
-and audit. Cumulative counters derive from retained reservation rows: they cannot
-be lost by updating a separate counter. Rollback restores the entire mutation.
+and audit. Cumulative new counts derive from retained reservation rows. Per-task retry counts
+derive from append-only charge rows committed with each reservation; both histories
+survive settlement and reopening. Rollback restores the entire mutation.
 `reserved`, `running`, and `unknown` all occupy slots and holds. There is no TTL,
 automatic release, queue, native dispatch, automatic delivery, or process reaper.
 Nested calls must receive the same trusted **root run ID** from the host; the core
@@ -32,9 +33,21 @@ Default limits per root run:
 | Cumulative new | 3 | Never refunded, even for never-started settlement |
 | Cumulative retry | 2 per real task ID | Never refunded or reset by a milestone |
 
-`new`, `reuse`, and `retry` are host-classified intents. A retry counts against its
-real task; `reuse` consumes active capacity but does not increment `new` or `retry`.
-The host must not relabel a new execution as reuse or replace the root run/task
+`new`, `reuse`, and `retry` preserve the host's executor classification: only `new`
+increments the cumulative new count. **Task retry charging is independent of that
+classification.** The store durably increments `task.evidence_generation` on each
+rejection/reopening; reclaiming the task preserves it. Admission records the current
+rework generation and charges each increase since the task's last recorded generation,
+including rejection history before its first admission. An explicit `retry` intent
+charges at least one, even with no new rejection. When one admission is both explicit
+retry and observed rework, these charges overlap rather than adding twice: the charge
+is `max(explicit retry ? 1 : 0, newly observed rework generations)`.
+
+Thus a reused or newly created executor performing rework still consumes the same
+per-task allowance. Same-generation reuse without another rejection consumes active
+capacity without a further retry debit; the host must still classify extra execution
+retries explicitly. Same-key replay never adds charges, even after another rejection.
+The host must not relabel physical new sessions as reuse or replace the root run/task
 identity to reset a budget. Unknown/milestone/root-run override input fields are
 rejected. One active admission per task is a conservative extra restriction:
 parallel executions of a single task must wait for proven settlement.
@@ -76,7 +89,10 @@ has since assigned a real owner. Terminal tasks cannot receive new admissions or
 - `bind({ reservation_id, generation, session_id }, runId, authority)`:
   records the exact current task owner and moves `reserved` to `running`.
   This is the conservative dispatch boundary; call it before effects can start.
-  It does not start a session. Same-generation, same-session running bind is
+  It does not start a session. If a rejection/reopening changes the task's rework
+  generation after admission, bind fails with `E_GOVERNOR_FENCE` and retains holds;
+  prove settlement and obtain a newly charged admission before dispatch.
+  With an unchanged task revision, same-generation, same-session running bind is
   idempotent. Unknown reservations cannot be rebound or dispatched again.
 - `markUnknown({ reservation_id, generation, reason }, runId, authority)`:
   moves reserved/running work to unknown, retaining all capacity and locks.
@@ -87,7 +103,7 @@ has since assigned a real owner. Terminal tasks cannot receive new admissions or
   capacity atomically, retaining cumulative counts and reservation/audit history.
 - `snapshot(runId)`: reads one consistent transaction and returns `limits`,
   `active_total`, `active_writers`, `created_total`, `unknown_total`, per-task
-  `retries`, `reservations`, `holds`, and `audit`. This host diagnostic contains
+  `retries`, `reservations`, `holds`, `retry_charges`, and `audit`. This host diagnostic contains
   full run history; it is not a bounded model-facing board.
 - `extendBudget({ reason, max_active?, max_writers?, max_created?, max_retries? }, runId, authority)`:
   trusted lead only. Values are new positive safe-integer limits, not increments.
@@ -108,6 +124,31 @@ new admission, even if the referenced prior reservation was already settled.
 This database fence cannot stop an old OS process; native ownership and recovery
 remain blocked. Do not dispatch until the outermost transaction has committed
 when composing these calls with another store transaction.
+
+## Additive retry-accounting migration
+
+Existing reservation payloads, IDs, admission generations, state and audit are
+preserved. On first connection initialization, missing retry-charge records are
+backfilled transactionally into the additive `governor_retry_charge` table.
+Old reservations did not record task rejection generations, so exact overlap between
+explicit retries and observed rework cannot be reconstructed. Migration conservatively
+retains every old explicit retry charge **plus** the task's currently observable
+rejection history, recording `source: 'legacy'`; ordinary admissions record
+`source: 'admission'`. The newest legacy reservation carries the otherwise unaccounted
+rework baseline. This can overcharge overlap and include a pending rework revision.
+A task already over its limit then refuses further new operation keys with
+`E_BUDGET_EXHAUSTED`, while historical operation-key lookups remain available. A lead
+can review and audit an absolute budget extension. No old intent or hold is erased,
+and reopening does not repeat the migration charge. Because migration cannot establish
+the original task revision of a legacy admission, its bind calls fail with
+`E_GOVERNOR_FENCE`; lookup, unknown marking and proven settlement remain available.
+After settlement, a fresh admission checks the migrated allowance and captures the
+current revision. Migration does not invent permission to dispatch legacy work.
+
+Upgrade all governor callers together. An old binary cannot enforce the new rule;
+a running upgraded caller fails closed if it sees a reservation missing its durable
+retry-accounting row and must reopen the governor to migrate it. Migration is not
+proof that any OS execution stopped, and idle/cancel observations do not infer rework.
 
 ## Settlement and recovery
 

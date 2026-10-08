@@ -316,3 +316,157 @@ test('governor schema and admission survive initialization rolled back by outer 
   assert.equal(g.snapshot('run').created_total, 0)
   assert.equal(g.reserve(input(id), 'run', lead).generation, 1)
 })
+
+function rejectAndReclaim(store, id) {
+  store.submitTask({ task_id: id }, 'run', { isRoot: false, sessionId: 'child' })
+  store.rejectTask({ task_id: id, reason: 'observable rework' }, 'run', { isRoot: true, sessionId: 'root' })
+  store.claimTask({ task_id: id, child_id: 'display' }, 'run', { isRoot: false, sessionId: 'child' }, 'child')
+}
+function finishRejected(store, g, r) {
+  store.submitTask({ task_id: r.task_id }, 'run', { isRoot: false, sessionId: 'child' })
+  store.rejectTask({ task_id: r.task_id, reason: 'observable rework' }, 'run', { isRoot: true, sessionId: 'root' })
+  g.settle(ref(r, { proof: { kind: 'terminal', outcome: 'failed', quiescent: true, evidence: 'host verified stopped subtree' } }), 'run', lead)
+  store.claimTask({ task_id: r.task_id, child_id: 'display' }, 'run', { isRoot: false, sessionId: 'child' }, 'child')
+}
+
+for (const kind of ['reuse', 'new']) {
+  test(`real rejected-task rework charges retries independently of ${kind}, across replay and reopen`, t => {
+    let { store, governor: g } = setup(t)
+    // Isolate retry enforcement from the independent cumulative-new limit.
+    if (kind === 'new') g.extendBudget({ max_created: 5, reason: 'exercise independent real-task retry cap' }, 'run', lead)
+    const id = task(store)
+    let r = g.reserve(input(id, 'initial', { kind: 'new' }), 'run', worker)
+    g.bind(ref(r, { session_id: 'child' }), 'run', worker)
+    for (let retry = 1; retry <= 2; retry++) {
+      finishRejected(store, g, r)
+      assert.equal(store.taskOf({ task_id: id }, 'run').task.status, 'claimed')
+      const request = input(id, `rework-${retry}`, { generation: retry, kind })
+      r = g.reserve(request, 'run', worker)
+      assert.equal(g.snapshot('run').retries[id], retry, 'physical executor kind must not erase task rework')
+      assert.deepEqual(g.reserve(request, 'run', worker), r)
+      store.close()
+      store = new TaskforceStore(store.root)
+      t.after(() => store.close())
+      g = new TaskforceGovernor(store)
+      assert.deepEqual(g.reserve(request, 'run', worker), r)
+      assert.equal(g.snapshot('run').retries[id], retry)
+      g.bind(ref(r, { session_id: 'child' }), 'run', worker)
+    }
+    finishRejected(store, g, r)
+    const before = g.snapshot('run')
+    assert.throws(() => g.reserve(input(id, 'third-rework', { generation: 3, kind }), 'run', worker), code('E_BUDGET_EXHAUSTED'))
+    assert.deepEqual(g.snapshot('run'), before)
+    assert.equal(before.created_total, kind === 'new' ? 3 : 1)
+    // Even an old settled replay after another rejection remains lookup-only.
+    assert.equal(g.reserve(input(id, 'rework-1', { generation: 1, kind }), 'run', worker).state, 'settled')
+    assert.equal(g.snapshot('run').retries[id], 2)
+  })
+}
+
+test('explicit retry and observed same-admission rework charge once; unchanged-revision reuse does not reset or double charge', t => {
+  const { store, governor: g } = setup(t)
+  const id = task(store)
+  rejectAndReclaim(store, id)
+  never(g, g.reserve(input(id, 'explicit-rework', { kind: 'retry' }), 'run', worker))
+  assert.equal(g.snapshot('run').retries[id], 1)
+  never(g, g.reserve(input(id, 'same-revision-reuse', { generation: 1 }), 'run', worker))
+  assert.equal(g.snapshot('run').retries[id], 1)
+  never(g, g.reserve(input(id, 'another-explicit-retry', { generation: 2, kind: 'retry' }), 'run', worker))
+  assert.equal(g.snapshot('run').retries[id], 2)
+  rejectAndReclaim(store, id)
+  assert.throws(() => g.reserve(input(id, 'actual-next-rework', { generation: 3 }), 'run', worker), code('E_BUDGET_EXHAUSTED'))
+})
+
+test('pre-admission rejection history cannot be reset by first governor admission', t => {
+  const { store, governor: g } = setup(t)
+  const id = task(store)
+  for (let i = 0; i < 3; i++) rejectAndReclaim(store, id)
+  assert.throws(() => g.reserve(input(id), 'run', worker), code('E_BUDGET_EXHAUSTED'))
+  assert.equal(g.snapshot('run').reservations.length, 0)
+})
+
+test('real rework debit rolls back with audit failure and retries exactly once after reopening', t => {
+  const { store, governor: g } = setup(t)
+  const id = task(store)
+  rejectAndReclaim(store, id)
+  const request = input(id, 'audit-rework', { resources: ['repo'] })
+  const before = g.snapshot('run')
+  store.open().exec("CREATE TEMP TRIGGER fail_rework_audit BEFORE INSERT ON governor_audit BEGIN SELECT RAISE(ABORT,'rework audit failure'); END")
+  assert.throws(() => g.reserve(request, 'run', worker), /rework audit failure/)
+  assert.deepEqual(g.snapshot('run'), before)
+  store.open().exec('DROP TRIGGER fail_rework_audit')
+  const r = g.reserve(request, 'run', worker)
+  assert.equal(g.snapshot('run').retries[id], 1)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  t.after(() => reopened.close())
+  const g2 = new TaskforceGovernor(reopened)
+  assert.deepEqual(g2.reserve(request, 'run', worker), r)
+  assert.equal(g2.snapshot('run').retries[id], 1)
+  assert.equal(g2.snapshot('run').holds.length, 1)
+})
+
+test('legacy reservations acquire additive retry accounting without erasing explicit charges or real rejection history', t => {
+  const store = tempStore(t), id = task(store)
+  // The task history is generated by public APIs; only the old governor schema
+  // and old persisted intents are fixture SQL, matching the shipped v1 format.
+  rejectAndReclaim(store, id)
+  rejectAndReclaim(store, id)
+  const db = store.open()
+  db.exec(`CREATE TABLE governor_reservation (
+    reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id INTEGER NOT NULL,
+    operation_key TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL,
+    mode TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+    owner_session TEXT, session_id TEXT, settlement TEXT,
+    UNIQUE(run_id, operation_key), UNIQUE(task_id, generation)
+  )`)
+  const requests = ['new', 'reuse', 'retry'].map((kind, i) => input(id, `legacy-${i}`, { kind, generation: i }))
+  for (const [i, request] of requests.entries()) {
+    const { operation_key, ...payload } = request
+    db.prepare('INSERT INTO governor_reservation VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(`legacy-id-${i}`, 'run', id, operation_key, JSON.stringify(payload), i + 1, 'read', request.kind, i === 2 ? 'reserved' : 'settled', 'child', null, JSON.stringify({ kind: 'never_started' }))
+  }
+  const g = new TaskforceGovernor(store)
+  assert.throws(() => withWriteTransaction(db, () => {
+    assert.equal(g.snapshot('run').retries[id], 3)
+    throw new Error('rollback legacy migration')
+  }), /rollback legacy migration/)
+  assert.equal(db.prepare("SELECT 1 FROM sqlite_master WHERE name = 'governor_retry_charge'").get(), undefined)
+  // Old rows did not capture rejection generations: conservatively preserve
+  // the explicit charge AND two observed reworks, without guessing overlap.
+  assert.equal(g.snapshot('run').retries[id], 3)
+  assert.equal(g.snapshot('run').created_total, 1)
+  assert.equal(g.reserve(requests[0], 'run', worker).reservation_id, 'legacy-id-0')
+  const pending = g.reserve(requests[2], 'run', worker)
+  assert.equal(pending.state, 'reserved')
+  // A migration baseline cannot invent the revision of the old admission.
+  assert.throws(() => g.bind(ref(pending, { session_id: 'child' }), 'run', worker), code('E_GOVERNOR_FENCE'))
+  assert.equal(g.snapshot('run').active_total, 1)
+  never(g, pending)
+  assert.throws(() => g.reserve(input(id, 'after-migration', { generation: 3 }), 'run', worker), code('E_BUDGET_EXHAUSTED'))
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  t.after(() => reopened.close())
+  const g2 = new TaskforceGovernor(reopened)
+  assert.equal(g2.snapshot('run').retries[id], 3)
+  assert.equal(g2.reserve(requests[2], 'run', worker).reservation_id, 'legacy-id-2')
+  g2.extendBudget({ max_retries: 4, reason: 'reviewed conservative legacy overlap' }, 'run', lead)
+  g2.reserve(input(id, 'after-migration', { generation: 3 }), 'run', worker)
+  assert.equal(g2.snapshot('run').retries[id], 3)
+})
+
+test('rejection after reservation fences bind until rework is admitted and charged', t => {
+  const { store, governor: g } = setup(t)
+  const id = task(store), request = input(id, 'before-rejection', { mode: 'write', resources: ['repo'] })
+  const r = g.reserve(request, 'run', worker)
+  rejectAndReclaim(store, id)
+  // Same-key lookup must remain idempotent but cannot authorize the new revision.
+  assert.deepEqual(g.reserve(request, 'run', worker), r)
+  assert.throws(() => g.bind(ref(r, { session_id: 'child' }), 'run', worker), code('E_GOVERNOR_FENCE'))
+  assert.equal(g.snapshot('run').holds.length, 1)
+  assert.equal(g.snapshot('run').active_total, 1)
+  never(g, r)
+  const rework = g.reserve(input(id, 'after-rejection', { generation: 1, resources: ['repo'] }), 'run', worker)
+  assert.equal(g.snapshot('run').retries[id], 1)
+  assert.equal(g.bind(ref(rework, { session_id: 'child' }), 'run', worker).state, 'running')
+})

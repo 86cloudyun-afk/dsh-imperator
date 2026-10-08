@@ -69,28 +69,69 @@ async function deadline(work, ms, onTimeout) {
 }
 const eventsOf = session => session.events ?? []
 const usageKeys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWriteTokens']
-function accounting(snapshot, requests, route) {
+// Literal names only: never trust event tool names, session IDs or error text
+// as report strings. Unknown native/plugin tools still fail the same gate.
+const diagnosticTools = new Set([
+  'bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'str_replace_editor',
+  'run_code', 'job_output', 'job_list', 'job_kill', 'skill', 'subagent', 'fork',
+  'send_message', 'interrupt_agent', 'list_agents', 'list_subagent_models',
+  'task_open', 'task_claim', 'task_fact', 'task_submit', 'task_verify', 'task_accept',
+  'task_reject', 'task_close', 'task_board', 'task_child_spawn', 'task_child_fork',
+  'task_child_send', 'task_child_interrupt', 'task_child_list',
+])
+const runtimeCategories = ['step-error', 'native-tool-error', 'ptc-tool-error', 'noncompleted-turn',
+  'missing-message', 'missing-usage', 'invalid-usage', 'duplicate-message', 'route-mismatch', 'no-requests']
+const durableRuntimeCategories = runtimeCategories.slice(0, 4)
+const noncompletedReasons = ['aborted', 'blocked', 'error', 'max-tokens', 'interrupted', 'forked']
+function accounting(snapshot, requests, route, { before, previousRequests = new Set(), requireRequests = false } = {}) {
   const usage = Object.fromEntries(usageKeys.map(key => [key, 0]))
-  let valid = true
+  const counts = Object.fromEntries(runtimeCategories.map(key => [key, 0]))
+  const details = []
+  let detailCount = 0
+  const add = (category, location) => {
+    counts[category]++
+    detailCount++
+    if (details.length < 20) details.push({ category, ...location })
+  }
+  const scopedRequests = new Set([...requests].filter(key => !previousRequests.has(key)))
   const matched = new Set()
-  for (const session of snapshot.sessions) for (const event of eventsOf(session)) {
-    const tool = toolEvent(event)
-    if (event.type === 'step/error' || tool?.phase === 'result' && tool.isError
-      || event.type === 'turn/end' && event.data?.reason?.kind !== 'completed') valid = false
-    if (event.type !== 'assistant/message') continue
-    const key = `${session.id}:${event.data.turn}:${event.data.step}`
-    if (!requests.has(key)) continue
-    if (matched.has(key)) { valid = false; continue }
-    matched.add(key)
-    if (event.data.message?.source?.provider !== route.provider || event.data.message?.source?.model !== route.model) valid = false
-    const value = event.data.usage
-    if (!value || !count(value.inputTokens) || !count(value.outputTokens)) { valid = false; continue }
-    for (const field of usageKeys) {
-      if (value[field] !== undefined && !count(value[field])) valid = false
-      else usage[field] += value[field] ?? 0
+  const offsets = new Map(before?.sessions.map(s => [s.id, eventsOf(s).length]) ?? [])
+  for (const [sessionIndex, session] of snapshot.sessions.entries()) {
+    for (const [eventIndex, event] of eventsOf(session).entries()) {
+      if (eventIndex < (offsets.get(session.id) ?? 0)) continue
+      const data = event.data
+      const location = { sessionIndex, eventIndex, turn: count(data?.turn) ? data.turn : null,
+        step: count(data?.step) ? data.step : null }
+      const tool = toolEvent(event)
+      if (event.type === 'step/error') add('step-error', location)
+      if (tool?.phase === 'result' && tool.isError) add(tool.ptc ? 'ptc-tool-error' : 'native-tool-error', {
+        ...location, toolName: diagnosticTools.has(tool.name) ? tool.name : null, unknownTool: !diagnosticTools.has(tool.name),
+      })
+      if (event.type === 'turn/end' && data?.reason?.kind !== 'completed') add('noncompleted-turn', {
+        ...location, reasonKind: noncompletedReasons.includes(data?.reason?.kind) ? data.reason.kind : 'unknown',
+      })
+      if (event.type !== 'assistant/message') continue
+      const key = `${session.id}:${data?.turn}:${data?.step}`
+      if (!scopedRequests.has(key)) continue
+      if (matched.has(key)) { add('duplicate-message', location); continue }
+      matched.add(key)
+      if (data.message?.source?.provider !== route.provider || data.message?.source?.model !== route.model) add('route-mismatch', location)
+      const value = data.usage
+      if (value == null) { add('missing-usage', location); continue }
+      if (!count(value.inputTokens) || !count(value.outputTokens)) { add('invalid-usage', location); continue }
+      if (usageKeys.some(field => value[field] !== undefined && !count(value[field]))) add('invalid-usage', location)
+      for (const field of usageKeys) if (value[field] === undefined || count(value[field])) usage[field] += value[field] ?? 0
     }
   }
-  return { usage, valid: valid && matched.size === requests.size }
+  let requestIndex = 0
+  for (const key of requests) {
+    if (scopedRequests.has(key) && !matched.has(key)) add('missing-message', { requestIndex })
+    requestIndex++
+  }
+  if (requireRequests && !scopedRequests.size) add('no-requests', {})
+  const failureCodes = runtimeCategories.filter(category => counts[category] > 0)
+  return { usage, valid: failureCodes.length === 0,
+    runtimeDiagnostics: { failureCodes, counts, details, truncated: detailCount > details.length } }
 }
 function calls(snapshot, name) {
   return snapshot.sessions.flatMap(s => eventsOf(s).filter(e => e.type === 'tool/call' && e.data?.name === name))
@@ -107,7 +148,8 @@ export async function runModelVerification(options = {}, { createHarness = creat
   const config = validate(options)
   const started = Date.now()
   const requests = new Set()
-  let harness, stopped = false, capHit = false, stageRecord, stageStart, stageRequestStart = 0, stageUsageStart
+  let harness, stopped = false, capHit = false, runtimeStopped = false, workerId
+  let stageRecord, stageStart, stageRequestStart = 0, stageUsageStart, stageBefore, stagePreviousRequests
   const report = { ok: false, provenance: {
     packageVersion: JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version,
     gitCommit: null, sourceSha256: productFingerprint(), packageSha256: config.packageSha256 ?? null,
@@ -119,22 +161,54 @@ export async function runModelVerification(options = {}, { createHarness = creat
   const workspace = mkdtempSync(join(tmpdir(), 'taskforce-model-work-'))
   const onRequest = ({ agentId, turn, step }) => {
     if (stopped) fail('stopped')
+    // A different agent may still have an in-flight request with no usage yet.
+    // Only durable step/tool/turn failures stop admission at this boundary.
+    if (harness) {
+      const { runtimeDiagnostics } = accounting(safeSnapshot(harness), requests, config)
+      if (durableRuntimeCategories.some(category => runtimeDiagnostics.counts[category] > 0)) {
+        runtimeStopped = true; stopped = true; harness.cancel(); fail('usage-or-runtime-error')
+      }
+    }
     if (requests.size >= config.requestCap) { capHit = true; stopped = true; harness?.cancel(); fail('request-cap') }
     const key = `${agentId}:${turn}:${step}`
     if (requests.has(key)) { stopped = true; fail('duplicate-request') }
     requests.add(key)
+  }
+  function recordObservation(after) {
+    const total = accounting(after, requests, config)
+    report.usage = total.usage
+    report.runtimeDiagnostics = total.runtimeDiagnostics
+    if (!stageRecord) return { total }
+    const workers = after.sessions.filter(s => s.id !== harness.rootId)
+    const newWorkers = workers.filter(s => !stageBefore.sessions.some(old => old.id === s.id)).length
+    const newTasks = after.tasks.filter(t => !stageBefore.tasks.some(old => old.id === t.id))
+    const reuseCalls = calls(after, 'task_child_send').slice(calls(stageBefore, 'task_child_send').length)
+    const reuse = reuseCalls.filter(e => {
+      try { const args = typeof e.data.arguments === 'string' ? JSON.parse(e.data.arguments) : e.data.arguments; return args?.target_id === workerId } catch { return false }
+    }).length
+    const rework = calls(after, 'task_reject').length - calls(stageBefore, 'task_reject').length
+    Object.assign(stageRecord, { requests: requests.size - stageRequestStart, durationMs: Date.now() - stageStart,
+      usage: Object.fromEntries(usageKeys.map(key => [key, total.usage[key] - stageUsageStart[key]])), newWorkers, reuse, rework,
+      facts: newTasks.reduce((n, task) => n + (count(task.facts) ? task.facts : 0), 0), accepted: newTasks.filter(t => t.status === 'accepted').length,
+      runtimeDiagnostics: accounting(after, requests, config, { before: stageBefore, previousRequests: stagePreviousRequests, requireRequests: true }).runtimeDiagnostics })
+    if (stageRecord.name !== 'readonly') {
+      const observedWorker = stageRecord.name === 'repair' && workers.length === 1 && workers[0].parent === harness.rootId ? workers[0].id : workerId
+      stageRecord.closure = diagnoseModelClosure(after.tasks, newTasks.length, observedWorker)
+    }
+    return { total, workers, newWorkers, newTasks, reuse }
   }
   try {
     writeModelFixture(workspace)
     harness = await createHarness({ ...config, workspace, packageRoot: ROOT, onRequest })
     report.provenance.hostVersion = /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(harness.hostVersion) ? harness.hostVersion : null
     if (report.provenance.hostVersion !== '0.2.0-rc.2') fail('host-version')
-    let workerId
     for (const stage of MODEL_STAGES) {
       const before = safeSnapshot(harness)
       const beforeRequests = requests.size
       const beforeRequestKeys = new Set(requests)
       const beforeUsage = accounting(before, requests, config).usage
+      stageBefore = before
+      stagePreviousRequests = beforeRequestKeys
       const beforeFiles = workspaceFingerprint(workspace)
       stageStart = Date.now()
       stageRequestStart = beforeRequests
@@ -143,22 +217,10 @@ export async function runModelVerification(options = {}, { createHarness = creat
       report.stages.push(stageRecord)
       await deadline(() => harness.runStage(stage), config.stageTimeoutMs, () => { stopped = true; harness.cancel() })
       const after = safeSnapshot(harness)
-      const total = accounting(after, requests, config)
-      report.usage = total.usage
+      const { total, workers, newWorkers, newTasks, reuse } = recordObservation(after)
       if (capHit) fail('request-cap')
       if (!total.valid || requests.size === beforeRequests) fail('usage-or-runtime-error')
       if (after.settled !== true) fail('unsettled-tree')
-      const workers = after.sessions.filter(s => s.id !== harness.rootId)
-      const newWorkers = workers.filter(s => !before.sessions.some(old => old.id === s.id)).length
-      const newTasks = after.tasks.filter(t => !before.tasks.some(old => old.id === t.id))
-      const reuseCalls = calls(after, 'task_child_send').slice(calls(before, 'task_child_send').length)
-      const reuse = reuseCalls.filter(e => {
-        try { const args = typeof e.data.arguments === 'string' ? JSON.parse(e.data.arguments) : e.data.arguments; return args?.target_id === workerId } catch { return false }
-      }).length
-      const rework = calls(after, 'task_reject').length - calls(before, 'task_reject').length
-      Object.assign(stageRecord, { requests: requests.size - beforeRequests, durationMs: Date.now() - stageStart,
-        usage: Object.fromEntries(usageKeys.map(key => [key, total.usage[key] - beforeUsage[key]])), newWorkers, reuse, rework,
-        facts: newTasks.reduce((n, task) => n + (count(task.facts) ? task.facts : 0), 0), accepted: newTasks.filter(t => t.status === 'accepted').length })
       let independentChecks
       if (stage.name === 'readonly') {
         const rootSession = after.sessions.find(s => s.id === harness.rootId)
@@ -171,7 +233,6 @@ export async function runModelVerification(options = {}, { createHarness = creat
           workerId = workers[0].id
         } else if (newWorkers !== 0 || workers.length !== 1 || workers[0].id !== workerId || reuse < 1) fail('reuse-contract')
         if (![...requests].some(key => !beforeRequestKeys.has(key) && key.startsWith(workerId + ':'))) fail('reuse-contract')
-        stageRecord.closure = diagnoseModelClosure(after.tasks, newTasks.length, workerId)
         if (!stageRecord.closure.ok) fail('incomplete-acceptance')
         if (stage.name === 'strict' && (newTasks[0].evidence_policy !== 'execution' || newTasks[0].strictVerified !== true)) fail('strict-receipt')
         const result = gradeMoney(workspace, stage.name !== 'repair')
@@ -183,11 +244,11 @@ export async function runModelVerification(options = {}, { createHarness = creat
     }
     report.ok = report.stages.length === MODEL_STAGES.length
   } catch (error) {
-    report.failure = capHit ? 'request-cap' : ['timeout', 'request-cap', 'duplicate-request', 'host-version', 'usage-or-runtime-error', 'unsettled-tree', 'readonly-contract', 'repair-worker-count', 'reuse-contract', 'incomplete-acceptance', 'strict-receipt', 'independent-tests', 'invalid-observation'].includes(error?.verificationCode) ? error.verificationCode : 'runtime-error'
+    report.failure = capHit ? 'request-cap' : runtimeStopped ? 'usage-or-runtime-error' : ['timeout', 'request-cap', 'duplicate-request', 'host-version', 'usage-or-runtime-error', 'unsettled-tree', 'readonly-contract', 'repair-worker-count', 'reuse-contract', 'incomplete-acceptance', 'strict-receipt', 'independent-tests', 'invalid-observation'].includes(error?.verificationCode) ? error.verificationCode : 'runtime-error'
   } finally {
     stopped = true
     if (harness) {
-      try { report.usage = accounting(safeSnapshot(harness), requests, config).usage } catch { /* retain last confirmed counters */ }
+      try { recordObservation(safeSnapshot(harness)) } catch { /* retain last confirmed counters */ }
     }
     if (stageRecord) {
       stageRecord.requests = requests.size - stageRequestStart

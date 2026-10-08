@@ -10,7 +10,7 @@ const moduleUrl = new URL('../verify-model.mjs', import.meta.url)
 const api = () => import(moduleUrl.href).catch(() => ({}))
 const root = resolve(new URL('../..', import.meta.url).pathname)
 const goodMoney = 'export function sumMoney(a) { if (a.some(x => !Number.isFinite(x))) throw new TypeError(); return a.reduce((s,x) => s + Math.round(x*100),0)/100 }'
-function setup(t, fault) {
+function setup(t, fault, afterStage = () => {}) {
   const outputDir = mkdtempSync(join(tmpdir(), 'model-report-test-'))
   t.after(() => rmSync(outputDir, { recursive: true, force: true }))
   let disposed = false
@@ -25,6 +25,10 @@ function setup(t, fault) {
         if (fault === 'timeout') return new Promise(() => {})
         if (fault === 'error') throw new Error('reasoning sk-secret marker credentials')
         await onRequest({ agentId: 'root', turn: n, step: 1 })
+        if (fault === 'concurrent-pending') {
+          await onRequest({ agentId: 'root', turn: n, step: 2 })
+          sessions[0].events.push({ type: 'assistant/message', data: { turn: n, step: 2, usage: { inputTokens: 1, outputTokens: 1 }, message: { source: { provider: 'test-provider', model: 'test-model' }, content: [] } } })
+        }
         if (fault === 'cap') await onRequest({ agentId: 'root', turn: n, step: 2 })
         sessions[0].events.push({ type: 'assistant/message', data: { turn: n, step: 1, usage: fault === 'usage' ? undefined : { inputTokens: 2, outputTokens: 3, cacheReadTokens: 1 }, message: { source: { provider: 'test-provider', model: fault === 'route' ? 'unexpected' : 'test-model' }, content: [{ type: 'text', text: '137; reasoning sk-secret marker' }] } } })
         if (fault === 'readonly-write') writeFileSync(join(workspace, 'README.md'), 'changed')
@@ -50,6 +54,7 @@ function setup(t, fault) {
           if (stage.name !== 'repair' && fault !== 'no-reuse') sessions[0].events.push({ type: 'tool/call', data: { name: 'task_child_send', arguments: JSON.stringify({ target_id: fault === 'wrong-target' ? 'other' : 'worker' }) } })
           tasks.push({ id: n, status: fault === 'acceptance' ? 'submitted' : 'accepted', owner_session: 'worker', evidence_policy: stage.name === 'strict' ? 'execution' : 'legacy', facts: 2, evidence: stage.name === 'strict' ? 0 : 1, waived: false, strictVerified: stage.name === 'strict' && fault !== 'receipt' })
         }
+        await afterStage({ stage, sessions, tasks, onRequest, turn: n })
       },
       snapshot: () => ({ sessions, tasks, settled: fault !== 'unsettled' }),
       cancel() {}, async dispose() { disposed = true; if (fault === 'cleanup') { process.exitCode = 0; throw new Error('sk-secret') } },
@@ -334,3 +339,133 @@ test('closure diagnostics bound details but retain all failure categories withou
   assert.equal(detail.status, 'unknown')
   assert.equal(detail.evidenceCount, null)
 })
+
+const runtimeCases = [
+  ['step-error', { type: 'step/error', data: { turn: 2, step: 1, error: 'sk-secret' } }],
+  ['native-tool-error', { type: 'tool/result', data: { turn: 2, step: 1, message: { source: { toolName: 'task_submit', callId: 'sk-secret' }, isError: true, content: 'sk-secret' } } }],
+  ['ptc-tool-error', { type: 'tool/ptc-dispatch', data: { name: 'read', isError: true, rootCallId: 'sk-secret', error: 'sk-secret' } }],
+  ['noncompleted-turn', { type: 'turn/end', data: { turn: 2, reason: { kind: 'error', error: 'sk-secret' } } }],
+]
+for (const [category, event] of runtimeCases) {
+  for (const nextRequest of [false, true]) test(`${category} preserves observations and ${nextRequest ? 'blocks another request' : 'fails a settled stage'}`, async t => {
+    const { runModelVerification } = await api()
+    let admitted = 0
+    const h = setup(t, undefined, ({ stage, sessions, onRequest, turn }) => {
+      if (stage.name !== 'repair') return
+      sessions[1].events.push(event)
+      if (nextRequest) { onRequest({ agentId: 'root', turn, step: 2 }); admitted++ }
+    })
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.ok, false)
+    assert.equal(report.failure, 'usage-or-runtime-error')
+    assert.equal(admitted, 0)
+    assert.equal(report.requests, 3, 'blocked request is not an actual provider request')
+    assert.equal(report.stages[0].ok, true)
+    const stage = report.stages[1]
+    assert.equal(stage.newWorkers, 1)
+    assert.equal(stage.facts, 2)
+    assert.equal(stage.accepted, 1)
+    assert.equal(stage.closure.ok, true)
+    assert.deepEqual(stage.runtimeDiagnostics.failureCodes, [category])
+    assert.equal(stage.runtimeDiagnostics.counts[category], 1)
+    assert.equal(report.runtimeDiagnostics.counts[category], 1)
+    assert.doesNotMatch(readFileSync(join(h.outputDir, 'report.json'), 'utf8'), /sk-secret/)
+  })
+}
+
+test('pending usage does not block concurrent requests or weaken final accounting', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, 'concurrent-pending')
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  assert.equal(report.ok, true)
+  assert.equal(report.requests, 11)
+  assert.deepEqual(report.runtimeDiagnostics.failureCodes, [])
+})
+
+for (const category of ['missing-message', 'missing-usage', 'invalid-usage', 'duplicate-message', 'route-mismatch']) {
+  test(`${category} has a distinct runtime counter without erasing closure`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, undefined, ({ stage, sessions }) => {
+      if (stage.name !== 'repair') return
+      const events = sessions[1].events
+      const message = events.find(e => e.type === 'assistant/message')
+      if (category === 'missing-message') events.splice(events.indexOf(message), 1)
+      if (category === 'missing-usage') delete message.data.usage
+      if (category === 'invalid-usage') message.data.usage.cacheReadTokens = -1
+      if (category === 'duplicate-message') events.push(structuredClone(message))
+      if (category === 'route-mismatch') message.data.message.source.model = 'sk-secret'
+    })
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.ok, false)
+    assert.equal(report.failure, 'usage-or-runtime-error')
+    assert.deepEqual(report.stages[1].runtimeDiagnostics.failureCodes, [category])
+    assert.equal(report.stages[1].runtimeDiagnostics.counts[category], 1)
+    assert.equal(report.stages[1].newWorkers, 1)
+    assert.equal(report.stages[1].closure.ok, true)
+    assert.doesNotMatch(JSON.stringify(report), /sk-secret/)
+  })
+}
+
+test('runtime details are bounded, allowlisted and retain exact counts beyond the limit', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, undefined, ({ stage, sessions }) => {
+    if (stage.name !== 'repair') return
+    sessions[1].id = 'sk-secret-session'
+    for (let i = 0; i < 25; i++) sessions[1].events.push({ type: 'tool/result', data: {
+      turn: 'sk-secret', step: -1, message: { source: { toolName: i === 0 ? 'bash' : 'sk-secret-tool', callId: 'sk-secret' }, isError: true },
+    } })
+    sessions[1].events.push({ type: 'step/error', data: { error: 'sk-secret' } })
+  })
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  const diag = report.stages[1].runtimeDiagnostics
+  assert.equal(report.ok, false)
+  assert.equal(diag.counts['native-tool-error'], 25)
+  assert.equal(diag.counts['step-error'], 1)
+  assert.equal(diag.details.length, 20)
+  assert.equal(diag.truncated, true)
+  assert.equal(diag.details[0].toolName, 'bash')
+  assert.equal(diag.details[0].unknownTool, false)
+  assert.equal(diag.details[1].toolName, null)
+  assert.equal(diag.details[1].unknownTool, true)
+  assert.equal(diag.details[0].turn, null)
+  assert.equal(diag.details[0].step, null)
+  assert.equal(diag.details[0].sessionIndex, 1)
+  assert.equal(diag.details[0].eventIndex, 2)
+  assert.doesNotMatch(readFileSync(join(h.outputDir, 'report.json'), 'utf8'), /sk-secret/)
+})
+
+test('bash nonzero exit data does not create a runtime error', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, undefined, ({ sessions }) => {
+    sessions[0].events.push({ type: 'tool/result', data: { message: { source: { toolName: 'bash' }, isError: false, content: [{ type: 'text', text: 'exit code 1' }] } } })
+  })
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  assert.equal(report.ok, true)
+  assert.deepEqual(report.runtimeDiagnostics.failureCodes, [])
+})
+
+test('a thrown stage preserves its already observed worker, task and closure statistics', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, undefined, ({ stage }) => {
+    if (stage.name === 'repair') throw new Error('sk-secret')
+  })
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  assert.equal(report.failure, 'runtime-error')
+  assert.equal(report.stages[1].newWorkers, 1)
+  assert.equal(report.stages[1].facts, 2)
+  assert.equal(report.stages[1].accepted, 1)
+  assert.equal(report.stages[1].closure.ok, true)
+})
+
+for (const reason of ['aborted', 'blocked', 'error', 'max-tokens', 'interrupted', 'forked', 'sk-secret']) {
+  test(`noncompleted native reason ${reason === 'sk-secret' ? 'unknown' : reason} is reported as a fixed enum`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, undefined, ({ stage, sessions }) => {
+      if (stage.name === 'repair') sessions[1].events.push({ type: 'turn/end', data: { reason: { kind: reason } } })
+    })
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.ok, false)
+    assert.equal(report.stages[1].runtimeDiagnostics.details[0].reasonKind, reason === 'sk-secret' ? 'unknown' : reason)
+    assert.doesNotMatch(JSON.stringify(report), /sk-secret/)
+  })
+}

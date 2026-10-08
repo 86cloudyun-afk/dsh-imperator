@@ -8,6 +8,7 @@ import { foldSubagentFlow } from '../lib/plugins/working-context.mjs'
 import { foldGuardSignal } from '../lib/plugins/guard.mjs'
 import { controlledProfile, installationVersion, nativeModule, resolveInstallAnchor } from './host-runtime.mjs'
 import { option } from './verify-preset.mjs'
+import { diagnoseModelRuntime } from './verify-model.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 
@@ -32,6 +33,8 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     // Trusted test hook for native cleanup failure injection; not a CLI flag.
     configureShutdown?.(application, fixture.root)
     const { ctx } = application
+    let modelRequests = 0
+    ctx.on('agent/request', () => { modelRequests++; throw new Error('native verifier forbids model requests') })
     const registry = ctx.get('agentPresets')
     const roster = async () => (await registry.list()).filter(row => row.id === 'taskforce')
     const healthy = async () => {
@@ -190,6 +193,43 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal(foldGuardSignal(session.snapshotEvents(), { echoFailures: 3 }).signal, undefined)
     session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
     pass('native cancelled delegation, scoped IDs and result replacement replay')
+
+    // Execute real failures without a model, then persist the exact public
+    // AgentLoop result shape (source has callId, never toolName).
+    for (const [index, name] of ['todo_write', 'unknown-diagnostic-probe'].entries()) {
+      const turn = 3, step = index + 1, callId = 'diagnostic-reused-id'
+      const called = child.agent.session.append('tool/call', { turn, step, callId, name, arguments: '{}' })
+      const result = await child.agent.ctx.tools.execute({ agent: child.agent, name, arguments: {}, callId,
+        signal: new AbortController().signal })
+      assert.equal(result.isError, true)
+      const message = createToolResultMessage({ callId, content: result.content, isError: result.isError })
+      assert.deepEqual(message.source, { kind: 'tool', callId })
+      child.agent.session.append('tool/result', { turn, step, message, error: result.error.info },
+        { surfaceOp: 'append', sourceEventSeqs: [called.seq] })
+    }
+    const diagnostics = diagnoseModelRuntime({ sessions: [parent, child].map(({ agent }) => ({
+      id: agent.id, events: agent.session.snapshotEvents(),
+    })) })
+    assert.equal(diagnostics.counts['native-tool-error'], 8)
+    assert.deepEqual(diagnostics.details.map(({ toolName, errorCode }) => [toolName, errorCode]), [
+      ...Array.from({ length: 3 }, () => ['subagent', 'ABORTED_BEFORE_DISPATCH']),
+      ...Array.from({ length: 3 }, () => ['read', 'FS_NOT_FOUND']),
+      ['todo_write', 'INVALID_ARGS'], [null, 'UNKNOWN_TOOL'],
+    ])
+    // Cover every actually mounted schema, including child-only execution tools.
+    for (const { agent } of [parent, child]) {
+      for (const { name } of agent.ctx.tools.schemas(agent)) {
+        const detail = diagnoseModelRuntime({ sessions: [{ events: [
+          { type: 'tool/call', data: { turn: 1, step: 1, callId: 'schema', name } },
+          { type: 'tool/result', data: { turn: 1, step: 1,
+            message: createToolResultMessage({ callId: 'schema', content: [], isError: true }) } },
+        ] }] }).details[0]
+        assert.equal(detail.toolName, name, 'mounted schema missing from diagnostic allowlist')
+        assert.equal(detail.unknownTool, false)
+      }
+    }
+    assert.equal(modelRequests, 0)
+    pass('native nameless failures retain scoped tool names and finite diagnostic codes without model requests')
 
     const opened = await task(parent.agent, 'task_open', { title: 'native tool closure' })
     const id = opened.task_id

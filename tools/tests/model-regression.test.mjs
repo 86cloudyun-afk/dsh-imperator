@@ -507,3 +507,88 @@ for (const reason of ['aborted', 'blocked', 'error', 'max-tokens', 'interrupted'
     assert.doesNotMatch(JSON.stringify(report), /sk-secret/)
   })
 }
+
+// rc.2 AgentLoop emits nameless result messages and persists ToolFailure.info
+// in data.error. Changing name correlation or enum filtering must fail these.
+test('native diagnostic names cover mounted root and worker tools through scoped call identity', async t => {
+  const { runModelVerification } = await api()
+  const names = ['todo_write', 'get_goal', 'create_goal', 'update_goal', 'task_child_stop',
+    'subagent_fork', 'ask_user_question', 'exit_plan_mode', 'web_search', 'web_fetch',
+    'str_replace_editor', 'write', 'edit', 'bash']
+  const h = setup(t, undefined, ({ stage, sessions }) => {
+    if (stage.name !== 'repair') return
+    names.forEach((name, index) => sessions[1].events.push(
+      { type: 'tool/call', data: { turn: 9, step: index, callId: 'reused', name, arguments: 'sk-secret' } },
+      { type: 'tool/result', data: { turn: 9, step: index, message: { source: { kind: 'tool', callId: 'reused' }, isError: true }, error: { name: 'ToolArgsError', code: 'INVALID_ARGS', reason: 'sk-secret' } } },
+    ))
+  })
+  const report = await runModelVerification(h.options, { createHarness: h.factory })
+  const diag = report.stages[1].runtimeDiagnostics
+  assert.equal(report.ok, false)
+  assert.equal(report.failure, 'usage-or-runtime-error')
+  assert.deepEqual(diag.details.map(x => x.toolName), names)
+  assert.ok(diag.details.every(x => x.unknownTool === false && x.errorCode === 'INVALID_ARGS'))
+  assert.equal(diag.errorCounts.INVALID_ARGS, names.length)
+  assert.doesNotMatch(JSON.stringify(report), /sk-secret/)
+})
+
+test('diagnostic correlation refuses cross-session, cross-step, cross-turn, missing and ambiguous identities', async () => {
+  const { diagnoseModelRuntime } = await api()
+  assert.equal(typeof diagnoseModelRuntime, 'function')
+  const call = (name, turn = 1, step = 1, callId = 'same') => ({ type: 'tool/call', data: { turn, step, callId, name } })
+  const result = (turn = 1, step = 1, callId = 'same') => ({ type: 'tool/result', data: { turn, step, message: { source: { callId }, isError: true } } })
+  const cases = [
+    [call('read', 2), result()], [call('read', 1, 2), result()],
+    [call('read'), call('write'), result()], [call('read'), call('read'), result()],
+    [call('read'), { ...result(), data: { ...result().data, callId: 'conflicting' } }],
+    [call('read'), { ...result(), data: { ...result().data, callId: 'conflicting', name: 'read' } }],
+    [call('read'), { ...result(), data: { ...result().data, name: 'write' } }],
+    [{ ...result(), data: { ...result().data, name: 'read', message: { isError: true, source: { toolName: 'write' } } } }],
+    [call('read'), result(undefined, undefined, '')],
+    [call('read'), { type: 'tool/result', data: { message: { source: { callId: 'same' }, isError: true } } }],
+    [result(), call('read')],
+    [{ type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } },
+      { type: 'tool/ptc-dispatch-start', data: { subCallId: 'same', name: 'read' } }, result()],
+  ]
+  for (const events of cases) {
+    const diag = diagnoseModelRuntime({ sessions: [{ id: 'a', events }] })
+    assert.equal(diag.details[0].toolName, null)
+    assert.equal(diag.details[0].unknownTool, true)
+  }
+  const crossSession = diagnoseModelRuntime({ sessions: [{ id: 'a', events: [call('read')] }, { id: 'b', events: [result()] }] })
+  assert.equal(crossSession.details[0].toolName, null)
+  const scoped = diagnoseModelRuntime({ sessions: [{ id: 'a', events: [call('read'), result(), call('write', 2), result(2)] }, { id: 'b', events: [call('edit'), result()] }] })
+  assert.deepEqual(scoped.details.map(x => x.toolName), ['read', 'write', 'edit'])
+  const ptc = diagnoseModelRuntime({ sessions: [{ events: [call('read'),
+    { type: 'tool/ptc-dispatch', data: { turn: 1, step: 1, subCallId: 'same', name: 'edit', isError: true } }, result()] }] })
+  assert.deepEqual(ptc.details.map(x => [x.category, x.toolName]), [['ptc-tool-error', 'edit'], ['native-tool-error', 'read']])
+})
+
+test('native and PTC error codes are finite enums with exact counters beyond bounded details', async () => {
+  const { diagnoseModelRuntime } = await api()
+  assert.equal(typeof diagnoseModelRuntime, 'function')
+  const codes = ['INVALID_ARGS', 'UNKNOWN_TOOL', 'ABORTED', 'ABORTED_BEFORE_DISPATCH', 'INVALID_TOOL_OUTPUT', 'CODE_RUN_FAILED',
+    'FS_NOT_FOUND', 'FS_NOT_DIRECTORY', 'FS_NOT_TEXT', 'FS_NOT_REGULAR_FILE', 'FS_TOO_LARGE', 'FS_PERMISSION_DENIED',
+    'FS_SANDBOX_DENIED', 'FS_IO_ERROR', 'FS_STALE_VERSION', 'FS_NOT_OBSERVED', 'FS_AMBIGUOUS_EDIT', 'FS_EDIT_NOT_FOUND', 'FS_ABORTED']
+  const events = codes.map(code => ({ type: 'tool/result', data: { message: { source: { toolName: 'read' }, isError: true, content: 'sk-secret' }, error: { name: 'sk-secret', code, reason: 'sk-secret' } } }))
+  events.push({ type: 'tool/ptc-dispatch', data: { name: 'read', isError: true, subCallId: 'sk-secret', error: { code: 'FS_NOT_FOUND' } } })
+  for (const code of ['sk-secret', '__proto__', 'toString', 'INVALID_ARGS\nsk-secret', { code: 'INVALID_ARGS' }, null]) {
+    events.push({ type: 'tool/result', data: { name: 'sk-secret', message: { isError: true }, error: { code, name: 'ToolArgsError', reason: 'INVALID_ARGS' } } })
+  }
+  // Never infer categories by scraping model-facing content or speculative fields.
+  events.push({ type: 'tool/result', data: { message: { isError: true, content: 'INVALID_ARGS' }, code: 'INVALID_ARGS' } })
+  const diag = diagnoseModelRuntime({ sessions: [{ id: 'sk-secret', events }] })
+  assert.equal(diag.details.length, 20)
+  assert.equal(diag.truncated, true)
+  assert.deepEqual(diag.details.slice(0, codes.length).map(x => x.errorCode), codes)
+  assert.equal(diag.details[19].category, 'ptc-tool-error')
+  assert.equal(diag.details[19].errorCode, 'FS_NOT_FOUND')
+  assert.equal(diag.counts['native-tool-error'], 26)
+  assert.equal(diag.counts['ptc-tool-error'], 1)
+  assert.equal(diag.errorCounts.FS_NOT_FOUND, 2)
+  assert.equal(diag.errorCounts.unknown, 7)
+  for (const code of codes.filter(code => code !== 'FS_NOT_FOUND')) assert.equal(diag.errorCounts[code], 1)
+  assert.doesNotMatch(JSON.stringify(diag), /sk-secret|__proto__|toString/)
+  const unknown = diagnoseModelRuntime({ sessions: [{ events: events.slice(-7) }] })
+  assert.ok(unknown.details.every(x => x.errorCode === 'unknown' && x.toolName === null))
+})

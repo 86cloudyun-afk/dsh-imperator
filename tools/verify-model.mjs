@@ -75,10 +75,41 @@ const diagnosticTools = new Set([
   'bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'str_replace_editor',
   'run_code', 'job_output', 'job_list', 'job_kill', 'skill', 'subagent', 'fork',
   'send_message', 'interrupt_agent', 'list_agents', 'list_subagent_models',
+  'todo_write', 'get_goal', 'create_goal', 'update_goal', 'task_child_stop',
+  'subagent_fork', 'ask_user_question', 'exit_plan_mode', 'web_search', 'web_fetch',
   'task_open', 'task_claim', 'task_fact', 'task_submit', 'task_verify', 'task_accept',
   'task_reject', 'task_close', 'task_board', 'task_child_spawn', 'task_child_fork',
   'task_child_send', 'task_child_interrupt', 'task_child_list',
 ])
+// rc.2 ToolFailure.info is persisted as event.data.error by AgentLoop and PTC.
+// Only public SDK codes: never parse content, reason, messages or class names.
+const diagnosticErrorCodes = new Set([
+  'INVALID_ARGS', 'UNKNOWN_TOOL', 'INVALID_TOOL_OUTPUT', 'CODE_RUN_FAILED',
+  'ABORTED', 'ABORTED_BEFORE_DISPATCH',
+  'FS_NOT_FOUND', 'FS_NOT_DIRECTORY', 'FS_NOT_TEXT', 'FS_NOT_REGULAR_FILE',
+  'FS_TOO_LARGE', 'FS_PERMISSION_DENIED', 'FS_SANDBOX_DENIED', 'FS_IO_ERROR',
+  'FS_STALE_VERSION', 'FS_NOT_OBSERVED', 'FS_AMBIGUOUS_EDIT', 'FS_EDIT_NOT_FOUND', 'FS_ABORTED',
+])
+// Native results omit tool names. Use explicit native coordinates only; the
+// session-local map never shares IDs with another session or PTC dispatch.
+function nativeDiagnosticKey(event, tool) {
+  const { turn, step } = event.data ?? {}
+  return !tool?.ptc && count(turn) && count(step) && typeof tool?.callId === 'string' && tool.callId.length > 0
+    ? JSON.stringify([turn, step, tool.callId]) : undefined
+}
+function diagnosticName(event, tool, calls, eventIndex) {
+  if (!tool.ptc && event.data?.callId != null && event.data?.message?.source?.callId != null
+    && event.data.callId !== event.data.message.source.callId) return null
+  const key = nativeDiagnosticKey(event, tool)
+  const matched = key === undefined ? undefined : calls.get(key)
+  if (matched === null || (matched && matched.eventIndex >= eventIndex)) return null
+  const direct = tool.name
+  if (event.data?.name !== undefined && event.data?.message?.source?.toolName !== undefined
+    && event.data.name !== event.data.message.source.toolName) return null
+  if (matched && direct !== undefined && direct !== matched.name) return null
+  const name = matched ? matched.name : direct
+  return diagnosticTools.has(name) ? name : null
+}
 const runtimeCategories = ['step-error', 'native-tool-error', 'ptc-tool-error', 'noncompleted-turn',
   'missing-message', 'missing-usage', 'invalid-usage', 'duplicate-message', 'route-mismatch', 'no-requests']
 const durableRuntimeCategories = runtimeCategories.slice(0, 4)
@@ -86,6 +117,7 @@ const noncompletedReasons = ['aborted', 'blocked', 'error', 'max-tokens', 'inter
 function accounting(snapshot, requests, route, { before, previousRequests = new Set(), requireRequests = false } = {}) {
   const usage = Object.fromEntries(usageKeys.map(key => [key, 0]))
   const counts = Object.fromEntries(runtimeCategories.map(key => [key, 0]))
+  const errorCounts = Object.fromEntries([...diagnosticErrorCodes, 'unknown'].map(key => [key, 0]))
   const details = []
   let detailCount = 0
   const add = (category, location) => {
@@ -97,6 +129,12 @@ function accounting(snapshot, requests, route, { before, previousRequests = new 
   const matched = new Set()
   const offsets = new Map(before?.sessions.map(s => [s.id, eventsOf(s).length]) ?? [])
   for (const [sessionIndex, session] of snapshot.sessions.entries()) {
+    const nativeCalls = new Map()
+    for (const [eventIndex, event] of eventsOf(session).entries()) {
+      if (event.type !== 'tool/call') continue
+      const tool = toolEvent(event), key = nativeDiagnosticKey(event, tool)
+      if (key !== undefined) nativeCalls.set(key, nativeCalls.has(key) ? null : { name: tool.name, eventIndex })
+    }
     for (const [eventIndex, event] of eventsOf(session).entries()) {
       if (eventIndex < (offsets.get(session.id) ?? 0)) continue
       const data = event.data
@@ -104,9 +142,14 @@ function accounting(snapshot, requests, route, { before, previousRequests = new 
         step: count(data?.step) ? data.step : null }
       const tool = toolEvent(event)
       if (event.type === 'step/error') add('step-error', location)
-      if (tool?.phase === 'result' && tool.isError) add(tool.ptc ? 'ptc-tool-error' : 'native-tool-error', {
-        ...location, toolName: diagnosticTools.has(tool.name) ? tool.name : null, unknownTool: !diagnosticTools.has(tool.name),
-      })
+      if (tool?.phase === 'result' && tool.isError) {
+        const toolName = diagnosticName(event, tool, nativeCalls, eventIndex)
+        const errorCode = diagnosticErrorCodes.has(data?.error?.code) ? data.error.code : 'unknown'
+        errorCounts[errorCode]++
+        add(tool.ptc ? 'ptc-tool-error' : 'native-tool-error', {
+          ...location, toolName, unknownTool: toolName === null, errorCode,
+        })
+      }
       if (event.type === 'turn/end' && data?.reason?.kind !== 'completed') add('noncompleted-turn', {
         ...location, reasonKind: noncompletedReasons.includes(data?.reason?.kind) ? data.reason.kind : 'unknown',
       })
@@ -131,7 +174,11 @@ function accounting(snapshot, requests, route, { before, previousRequests = new 
   if (requireRequests && !scopedRequests.size) add('no-requests', {})
   const failureCodes = runtimeCategories.filter(category => counts[category] > 0)
   return { usage, valid: failureCodes.length === 0,
-    runtimeDiagnostics: { failureCodes, counts, details, truncated: detailCount > details.length } }
+    runtimeDiagnostics: { failureCodes, counts, errorCounts, details, truncated: detailCount > details.length } }
+}
+/** Unpaid native probes use the same diagnostic projection as model accounting. */
+export function diagnoseModelRuntime(snapshot) {
+  return accounting(snapshot, new Set(), {}).runtimeDiagnostics
 }
 function calls(snapshot, name) {
   return snapshot.sessions.flatMap(s => eventsOf(s).filter(e => e.type === 'tool/call' && e.data?.name === name))

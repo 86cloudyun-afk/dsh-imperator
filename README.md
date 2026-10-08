@@ -16,7 +16,9 @@
 
 `task_board` 默认25项、最大100项；默认/summary 完整工具 JSON 上限65536 UTF-8 bytes，展示截短显式标记，独立晚到 blocker 游标及详情/历史页可取回原文。详情/原文页只限条数，不承诺同一字节上限；旧宿主 `board` API 保持兼容。
 
-冻结的原生事件追加使用增量 reducer；中段 replacement、可变恢复 seed 与策略变化回到全量重放。前缀检查/复制仍为 O(n)，不承诺整步 O(1)。固定四阶段真实模型回归需显式 opt-in；普通测试不产生付费模型请求。版本与验收状态见 [0.3 验收记录](docs/superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。
+冻结的原生事件追加使用增量 reducer；中段 replacement、可变恢复 seed 与策略变化回到全量重放。前缀检查/复制仍为 O(n)，不承诺整步 O(1)。执行者修改已有文件前须自己 native read；新任务/续作重新读，成功 native write/edit 后不需为连续编辑机械重读；观察缺失/版本变化须 read 并复核，shell cat/grep 不替代原生观察。固定四阶段真实模型回归需显式 opt-in；普通测试不产生付费模型请求。版本与验收状态见 [0.3 验收记录](docs/superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。
+
+候选 `5375975` 的实际解压包已通过 Node 22.23.2/24.19.0 全量原生闸与显式四阶段模型回归（55请求、1名执行者复用两次、3任务验收，无 waiver）。此前六次失败的278请求全部保留；8192输出额度与历史4096不同，不作普遍性能/费用改善承诺。文档补齐后的最终包与独立审核/CI/合并仍待 controller 核验；精确 SHA 和成本见验收记录。
 
 ## 两个正交的问题，一次解决
 

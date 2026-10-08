@@ -4,7 +4,7 @@
 
 本版增加可信 session 归属与作者审计、opt-in 严格执行回执、有界分页看板、冻结事件增量投影、独立 durable governor core 及固定四阶段 opt-in 模型回归。包版本为 0.3.0，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
 
-本版当前实测状态见 [0.3 验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)，待验收项不能当成通过。可交付门槛是：完整离线测试、原生契约与执行边界、实际隔离 web boot、任务工具闭环、卸载恢复、异常清理以及打包后验收通过。不保证没有未知缺陷，也不包含生产服务器部署。固定模型样例通过只证明报告所列样例，不能推断普遍性能或费用改善。
+成功候选 `5375975` 已完成逐字节归档核对、双 Node 解压包全量原生验证和显式四阶段模型闭环；文档补齐后的最终 archive 及审核/CI/合并仍待核验。模型候选与最终文档包的 SHA 不同，不能声称模型执行了最终文档包；产品 fingerprint 等价与最终包双 Node 闸由 controller 再查。本版当前实测状态见 [0.3 验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)，待验收项不能当成通过。可交付门槛是：完整离线测试、原生契约与执行边界、实际隔离 web boot、任务工具闭环、卸载恢复、异常清理以及打包后验收通过。不保证没有未知缺陷，也不包含生产服务器部署。固定模型样例通过只证明报告所列样例，不能推断普遍性能或费用改善。
 
 ## 包含内容与核验
 
@@ -31,6 +31,8 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 `execution` 仅在 `task_open` 显式设置，默认 `legacy`。`task_verify` 保留原生执行安全层；源码、日志、generation 或 owner 变化会使旧成功失效，最新非零/unknown/pending 不可被旧成功覆盖。人工 waiver 返回 `execution_verified:false`。有同 UID unrestricted shell 的执行者可直接改数据库，本功能是工具接口约束，不能替代 OS 隔离。
 
 默认 `task_board` 的 tasks/summary 每页25、最大100，完整工具 JSON 上限65536 UTF-8 bytes；截短字段与页尾预算缩减均可辨，游标仍能取全数据。详情和显式 facts/handoffs/late_blockers 原文页只限条数，不受摘要字节上限约束。原生冻结事件追加增量折叠，可变恢复 seed 或历史 replacement 全量重放；前缀扫描/复制仍 O(n)。
+
+执行者编辑既有文件前用自己的 native read 建立观察，新任务/续作重新读；成功 native write/edit 后允许连续编辑，不机械重读。FS_NOT_OBSERVED/FS_STALE_VERSION 时 read 并重新判断。原生观察按 Session 对象维护；真实冷恢复保留旧read历史也不恢复观察，root read 或 shell cat/grep/native grep 均不替代 worker read。实际 flush/dispose/resume 与 fresh/resumed spawn/fork 提示挂载已有无模型证据，详见验收记录。
 
 ## 在目标实例安装
 
@@ -81,10 +83,12 @@ node tools/verify-model.mjs --model-calls \
 
 没有显式 opt-in、非法请求/timeout 参数、超时、超过全局请求上限、provider/tool 错误、usage 缺失、未收口任务、错误执行者复用、无有效 strict 回执或独立断言失败均退出非零。不得用单条模型总结、模型改写后的测试退出码、静态提示词字数或 mock 成功代替真实模型验收。
 
-金额修复与同执行者续作阶段固定使用 `evidence_policy=legacy`，提示及观察到的实际任务策略必须一致，否则报告 `evidence-policy` 失败。第四阶段仍要求 execution 真实严格回执与主控验收。这保证基线工作量的可比性，不测量自主策略选择；独立判据、请求上限和 timeout 不变。
+金额修复与同执行者续作阶段固定使用 `evidence_policy=legacy`，提示及观察到的实际任务策略必须一致，否则报告 `evidence-policy` 失败。第四阶段仍要求 execution 真实严格回执与主控验收。这仅控制同名金额任务的证据策略；当前8192与历史4096额度、独立grader和工作量控制仍有差异，比较为描述性单次样本，不测量自主策略选择；独立判据、请求上限和 timeout 不变。
 
 固定金额回归仅评价自包含 ESM 的同步 `sumMoney` 和标准 ECMAScript 内建；不支持 money.mjs 导入其他模块、访问 Node 宿主全局或异步返回。该约束已写入固定模型提示；测试文件仍允许 node:test。grader 在一次性子进程的新 `vm.SourceTextModule` realm 执行模型源码，输入也在该 realm 创建，判据和完成协议留在外层。所需 `--experimental-vm-modules` 仅由 grader 子进程开启，使用 Node 内建能力，无新增依赖；它不是通用模块或 OS 沙箱。
 
 执行阶段的 `closure` 诊断只记录固定失败码（new-task-count/task-status/owner-mismatch/waiver/legacy-evidence）、任务/新任务数量和最多 20 条任务的 ID、枚举状态、ownerMatches、evidenceCount、waived、证据策略与 strictVerified；超出部分仍参与全部判定，`truncated` 明示详情截断。不写 owner/session 原文、事实、附注、模型输出或错误消息。waived 依据当前接受记录的系统裁决标记及本代结构化 execution_waiver 记录；普通事实或附注提及「不使用人工豁免」不算实际豁免。
 
 总报告及阶段的 `runtimeDiagnostics` 区分 step-error、native-tool-error、ptc-tool-error、noncompleted-turn、missing-message、missing-usage、invalid-usage、duplicate-message、route-mismatch；阶段未发起请求另记 no-requests。每类完整计数，最多保留 20 条详情（`truncated` 标明截断）：仅含数字 session/event/request 索引、合法 turn/step 数字、固定工具名白名单（未知名称为 null 和 unknownTool）及固定 turn 结束原因枚举。原始会话 ID、错误、工具内容、模型输出均不入报告。运行错误或 usage 不完整也保留已观测到的新执行者、任务事实、验收计数及 closure；这些观察不代表通过验收。已记录的 step/tool/非 completed turn 错误会阻止下一次请求，阻止的调用不计入请求数；并发尚未返回的 usage 不触发提前停止，阶段结束仍严格检查 usage 完整性。已有在途请求可能继续完成或被取消。bash 非零退出是普通工具结果；只有真实 isError/错误事件使运行闸失败。
+
+成功候选55请求229651ms，六次失败278请求1470626ms均计入账；七次合计333请求1700277ms。当前 repair/reuse 39请求171472ms，历史58请求144214ms：请求较少而时长更长，不是同额度受控比较。完整 usage、每次失败及原因不确定性见验收记录；固定模型通过只针对所列 fixture，不替代生产部署验收。

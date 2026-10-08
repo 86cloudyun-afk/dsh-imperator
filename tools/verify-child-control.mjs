@@ -178,7 +178,7 @@ function makeCtx({ subagents, agents, withStore = true } = {}) {
   if (withStore) {
     services.set('taskforceStore', {
       openTask: () => ({ task_id: 1 }),
-      board: () => ({ tasks: [] }),
+      boardPage: () => ({ tasks: [] }),
     })
   }
   if (subagents !== undefined) services.set('subagents', subagents)

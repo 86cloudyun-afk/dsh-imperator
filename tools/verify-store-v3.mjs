@@ -503,7 +503,7 @@ section('E. 工具层端到端 —— 错误码 / hint / late 标记 / 板上可
   const lateTasksE = boardE.late_blockers ?? []
   check('E05', '★默认看板（工具层）显示 late_blockers 区，任务在列而 tasks 列表不含它 —— 晚到阻塞不会消失',
     boardE.ok === true && boardE.late_blocked_tasks >= 1
-      && lateTasksE.some((t) => t.task_id === e1.task_id && t.blockers.some((b) => b.fact_id === childLateFact.fact_id))
+      && lateTasksE.some((t) => t.task_id === e1.task_id && t.fact_id === childLateFact.fact_id)
       && boardE.tasks.every((t) => t.id !== e1.task_id),
     JSON.stringify({ late_blocked_tasks: boardE.late_blocked_tasks, tasks: boardE.tasks.map((t) => t.id) }))
 

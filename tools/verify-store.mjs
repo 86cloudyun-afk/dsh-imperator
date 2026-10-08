@@ -489,12 +489,12 @@ const tBoardText = JSON.stringify(tBoard)
 const tBoardTask = tBoard.tasks.find((t) => t.id === tOpen.task_id)
 check(
   'S28',
-  '无参 task_board 紧凑：只列**本工作实例**的待办任务 + 每任务 ≤5 条摘要（整包 ' + tBoardText.length + ' 字符）',
+  '无参 task_board 紧凑：只列**本工作实例**的待办任务 + 每任务最新1条摘要（整包 ' + tBoardText.length + ' 字符）',
   tBoard.ok === true && tBoard.scope === 'open' && tBoard.open_tasks === 1
     && tBoard.run_id === LEAD_AGENT.id && tBoard.can_accept === true
-    && tBoard.tasks.every((t) => t.facts.length <= 5)
-    && tBoardTask !== undefined && tBoardTask.facts.length === 2 && tBoardTask.blockers === 1
-    && tBoardText.length < 1600,
+    && tBoard.tasks.every((t) => t.facts.length <= 1)
+    && tBoardTask !== undefined && tBoardTask.facts.length === 1 && tBoardTask.blockers === 1
+    && Buffer.byteLength(tBoardText) <= 65536,
   tBoardText.slice(0, 500),
 )
 

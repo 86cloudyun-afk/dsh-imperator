@@ -25,6 +25,7 @@ const TESTS = [
   'process-runner.test.mjs',
   'context-boundaries.test.mjs',
   'board-batching.test.mjs',
+  'board-pagination.test.mjs',
   'read-snapshot.test.mjs',
   'lifecycle-recovery.test.mjs',
   'ptc-events.test.mjs',

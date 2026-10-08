@@ -1,0 +1,295 @@
+import assert from 'node:assert/strict'
+import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
+import { tempStore } from './helpers.mjs'
+import { withWriteTransaction } from '../../lib/store/sqlite.js'
+import { apply as applyTools } from '../../lib/tools/index.js'
+
+function seed(store, count, facts = 8, run = 'run-a') {
+  store.open()
+  return withWriteTransaction(store.handle, () => Array.from({ length: count }, (_, i) => {
+    const id = store.openTask(`task-${i}`, run).task_id
+    for (let j = 0; j < facts; j++) store.recordFact({ task_id: id, statement: `fact-${i}-${j}` }, run)
+    return id
+  }))
+}
+function collect(store, args, key, run = 'run-a') {
+  const result = []
+  let cursor = args.cursor
+  do {
+    const page = store.boardPage({ ...args, cursor }, run)
+    result.push(...page[key])
+    assert.equal(page.pagination.has_more, page.pagination.next_cursor !== null)
+    cursor = page.pagination.next_cursor ?? undefined
+  } while (cursor !== undefined)
+  return result
+}
+function tools(store, id = 'run-a') {
+  const defs = []
+  applyTools({ logger: { warn() {} }, get: name => name === 'taskforceStore' ? store : undefined,
+    tools: { register: d => defs.push(d) } })
+  return args => defs.find(d => d.name === 'task_board').execute(args, { agent: { options: {}, session: { header: { id } } } })
+}
+
+test('1000 pending tasks have bounded defaults, full totals and complete descending keyset traversal', t => {
+  const store = tempStore(t), ids = seed(store, 1000)
+  assert.equal(typeof store.boardPage, 'function', 'paged store API is missing')
+  const first = store.boardPage({}, 'run-a')
+  assert.equal(first.tasks.length, 25)
+  assert.equal(first.pagination.limit, 25)
+  assert.equal(first.open_tasks, 1000)
+  assert.equal(first.totals.tasks, 1000)
+  assert.equal(first.totals.facts, 8000)
+  assert.ok(Buffer.byteLength(JSON.stringify(first)) <= 65536)
+  for (const row of first.tasks) { assert.equal(row.facts.length, 1); assert.equal(row.fact_count, 8) }
+  assert.deepEqual(collect(store, { limit: 100 }, 'tasks').map(r => r.id), ids.reverse())
+  assert.equal(store.board({}, 'run-a').tasks.length, 1000, 'host compatibility stays unpaged')
+})
+
+test('invalid page inputs are rejected rather than silently coerced or ignored', t => {
+  const store = tempStore(t), [id] = seed(store, 1)
+  for (const args of [{ limit: 0 }, { limit: 101 }, { limit: 1.5 }, { limit: '25' }, { limit: null },
+    { cursor: 0 }, { cursor: -1 }, { cursor: '2' }, { cursor: Number.MAX_SAFE_INTEGER + 1 },
+    { late_cursor: 0 }, { view: 'invalid' }, { view: 'facts' }, { view: 'handoffs' }]) {
+    assert.throws(() => store.boardPage(args, 'run-a'), { code: 'E_INPUT' }, JSON.stringify(args))
+  }
+  assert.equal(store.boardPage({ limit: 100 }, 'run-a').pagination.limit, 100)
+  assert.throws(() => store.boardPage({ view: 'tasks', task_id: id }, 'foreign'), { code: 'E_CROSS_RUN' })
+})
+
+test('full facts and handoffs are reachable from compatible detail continuations and match raw SQL', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 73)
+  const long = '原文😀'.repeat(2000)
+  store.recordFact({ task_id: id, statement: long }, 'run-a')
+  for (let i = 0; i < 23; i++) store.handle.prepare('INSERT INTO handoff(task_id,run_id,from_child,to_child,note,created_at) VALUES(?,?,?,?,?,?)')
+    .run(id, 'run-a', 'old', 'new', `handoff-${i}`, 'now')
+  const detail = store.boardPage({ task_id: id }, 'run-a')
+  assert.equal(detail.facts.length, 50)
+  assert.equal(detail.facts[0].statement, long)
+  assert.equal(detail.handoffs.length, 10)
+  assert.equal(detail.facts_pagination.has_more, true)
+  assert.equal(detail.handoffs_pagination.has_more, true)
+  assert.ok(Array.isArray(detail.receipts))
+  for (const view of ['facts', 'handoffs']) {
+    const rows = collect(store, { view, task_id: id, limit: 25 }, view)
+    assert.deepEqual(rows.map(r => r.id), store.handle.prepare(`SELECT id FROM ${view === 'facts' ? 'fact' : 'handoff'} WHERE task_id=? ORDER BY id DESC`).all(id).map(r => r.id))
+    const continuation = store.boardPage({ view, task_id: id, cursor: detail[`${view}_pagination`].next_cursor }, 'run-a')
+    assert.equal(continuation[view][0].id, rows[detail[view].length].id)
+    assert.throws(() => store.boardPage({ view, task_id: id }, 'foreign'), { code: 'E_CROSS_RUN' })
+  }
+})
+
+test('late blockers paginate by fact ID with full counts, even when the pending page is empty', t => {
+  const store = tempStore(t), ids = seed(store, 31, 0)
+  for (const id of ids) {
+    store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+    for (let j = 0; j < 2; j++) store.recordFact({ task_id: id, kind: 'blocker', statement: `late-${id}-${j}` }, 'run-a')
+  }
+  const first = store.boardPage({}, 'run-a')
+  assert.deepEqual(first.tasks, [])
+  assert.equal(first.late_blocked_tasks, 31)
+  assert.equal(first.totals.late_blockers, 62)
+  assert.equal(first.late_blockers.length, 25)
+  assert.equal(first.late_pagination.has_more, true)
+  const next = store.boardPage({ late_cursor: first.late_pagination.next_cursor }, 'run-a')
+  assert.ok(next.late_blockers[0].fact_id < first.late_blockers.at(-1).fact_id)
+  assert.equal(collect(store, { view: 'late_blockers' }, 'late_blockers').length, 62)
+})
+
+test('foreign attached rows cannot consume any scoped page or summary allowance including NULL run', t => {
+  const store = tempStore(t)
+  for (const run of ['run-a', null]) {
+    const [id] = seed(store, 1, 30, run)
+    for (let i = 0; i < 40; i++) store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,?,?,?,?)')
+      .run(id, 'foreign', 'blocker', 'FOREIGN_SECRET', 'CONFIRMED', 'now')
+    const page = store.boardPage({}, run)
+    assert.equal(page.tasks[0].fact_count, 30)
+    assert.equal(page.tasks[0].facts[0].statement, 'fact-0-29')
+    assert.equal(page.totals.facts, 30)
+    assert.equal(page.scope_integrity_totals.mismatched_facts, 40)
+    const facts = store.boardPage({ view: 'facts', task_id: id }, run)
+    assert.equal(facts.facts.length, 25)
+    assert.doesNotMatch(JSON.stringify({ page, facts }), /FOREIGN_SECRET/)
+  }
+})
+
+test('large display fields and many alerts stay within the complete tool wire budget with honest continuations', async t => {
+  const store = tempStore(t), ids = seed(store, 110, 1), huge = '文😀\\\"\n'.repeat(10000)
+  for (const id of ids) {
+    store.handle.prepare('UPDATE task SET title=?, owner=?, owner_session=? WHERE id=?').run(huge, huge, huge, id)
+    store.recordFact({ task_id: id, statement: huge, child_id: huge }, 'run-a')
+  }
+  const done = seed(store, 1, 0)[0]
+  store.closeTask({ task_id: done, result: 'failed' }, 'run-a')
+  for (let i = 0; i < 110; i++) store.recordFact({ task_id: done, kind: 'blocker', statement: huge, child_id: huge }, 'run-a')
+  for (const view of ['tasks', 'summary']) {
+    const wire = await tools(store)({ view, limit: 100 })
+    assert.ok(Buffer.byteLength(wire) <= 65536, `${view}: ${Buffer.byteLength(wire)} bytes`)
+    const page = JSON.parse(wire)
+    assert.equal(page.ok, true)
+    assert.equal(page.truncated, true)
+    assert.equal(page.totals.late_blockers, 110)
+    assert.equal(page.late_pagination.has_more, true)
+    if (view === 'tasks') {
+      assert.ok(page.tasks.length > 0)
+      assert.equal(page.tasks[0].owner_session, null, 'actionable identity is omitted, never shortened into a fake ID')
+      assert.equal(page.tasks[0].detail.task_id, page.tasks[0].id)
+    }
+  }
+  const all = collect(store, { limit: 100 }, 'tasks')
+  assert.equal(new Set(all.map(r => r.id)).size, 110)
+  const lateIds = []
+  let lateCursor
+  do {
+    const page = store.boardPage({ view: 'summary', limit: 100, late_cursor: lateCursor }, 'run-a')
+    lateIds.push(...page.late_blockers.map(row => row.fact_id))
+    lateCursor = page.late_pagination.next_cursor ?? undefined
+  } while (lateCursor !== undefined)
+  assert.deepEqual(lateIds, store.handle.prepare("SELECT id FROM fact WHERE task_id=? AND kind='blocker' ORDER BY id DESC").all(done).map(row => row.id))
+  assert.equal(store.boardPage({ view: 'late_blockers', limit: 1 }, 'run-a').late_blockers[0].statement, huge.trim())
+})
+
+test('keyset continuation ignores later inserts and reads only selected task summaries', t => {
+  const store = tempStore(t), ids = seed(store, 70)
+  const prepare = store.handle.prepare.bind(store.handle), lengths = []
+  store.handle.prepare = sql => {
+    const s = prepare(sql), all = s.all.bind(s)
+    s.all = (...args) => { const rows = all(...args); lengths.push(rows.length); return rows }
+    return s
+  }
+  const first = store.boardPage({ limit: 25 }, 'run-a')
+  const added = store.openTask('later insertion', 'run-a').task_id
+  const rest = collect(store, { cursor: first.pagination.next_cursor, limit: 25 }, 'tasks')
+  assert.deepEqual([...first.tasks, ...rest].map(r => r.id), ids.reverse())
+  assert.ok(!rest.some(r => r.id === added))
+  assert.ok(Math.max(...lengths) <= 26, `materialized ${Math.max(...lengths)} rows`)
+})
+
+
+test('tool envelope remains bounded for a long real child session ID without inventing another ID', async t => {
+  const store = tempStore(t)
+  seed(store, 1)
+  const root = { options: {}, session: { header: { id: 'run-a' } } }
+  const id = '真实😀'.repeat(30000)
+  const agent = { options: {}, session: { header: { id, parentSession: 'run-a', origin: 'subagent', delegationDepth: 1 } } }
+  const defs = []
+  applyTools({ logger: { warn() {} }, get(name) {
+    if (name === 'taskforceStore') return store
+    if (name === 'agents') return { get: value => value === 'run-a' ? root : undefined }
+  }, tools: { register: d => defs.push(d) } })
+  const wire = await defs.find(d => d.name === 'task_board').execute({}, { agent })
+  assert.ok(Buffer.byteLength(wire) <= 65536)
+  const result = JSON.parse(wire)
+  assert.equal(result.ok, true)
+  assert.equal(result.viewer, null)
+  assert.deepEqual(result.viewer_metadata, { role: 'child', omitted: true })
+})
+
+
+test('fact history retains every stored content and provenance field and excludes foreign handoffs', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 3)
+  const raw = store.handle.prepare('SELECT * FROM fact WHERE task_id=? ORDER BY id DESC').all(id)
+  const facts = store.boardPage({ view: 'facts', task_id: id }, 'run-a').facts
+  for (let i = 0; i < raw.length; i++) {
+    assert.deepEqual(Object.fromEntries(Object.keys(raw[i]).map(key => [key, facts[i][key]])), { ...raw[i] })
+  }
+  const put = store.handle.prepare('INSERT INTO handoff(task_id,run_id,from_child,to_child,note,created_at) VALUES(?,?,?,?,?,?)')
+  put.run(id, 'run-a', 'old', 'new', 'own', 'now')
+  for (let i = 0; i < 30; i++) put.run(id, 'foreign', 'old', 'new', 'FOREIGN_HANDOFF', 'now')
+  const handoffs = store.boardPage({ view: 'handoffs', task_id: id, limit: 1 }, 'run-a')
+  assert.equal(handoffs.total, 1)
+  assert.equal(handoffs.handoffs[0].note, 'own')
+  assert.equal(handoffs.pagination.has_more, false)
+})
+
+test('global submitted totals and scope corruption alarms remain visible outside the current task page', t => {
+  const store = tempStore(t), ids = seed(store, 30, 1)
+  store.submitTask({ task_id: ids[0] }, 'run-a')
+  store.closeTask({ task_id: ids[1], result: 'failed' }, 'run-a')
+  store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,?,?,?,?)')
+    .run(ids[1], 'foreign', 'blocker', 'FOREIGN_LATE', 'CONFIRMED', 'now')
+  for (const view of ['tasks', 'summary']) {
+    const page = store.boardPage({ view, limit: 1 }, 'run-a')
+    assert.equal(page.open_tasks, 29)
+    assert.equal(page.submitted_tasks, 1)
+    assert.equal(page.scope_integrity_totals.mismatched_facts, 1)
+    assert.equal(page.late_blocked_tasks, 0)
+    assert.equal(page.late_pagination.has_more, false)
+    assert.doesNotMatch(JSON.stringify(page), /FOREIGN_LATE/)
+  }
+})
+
+test('SQL count work is restricted to selected task IDs before sorting a mixed-status run', t => {
+  const store = tempStore(t), ids = seed(store, 120, 1)
+  for (let i = 0; i < ids.length; i++) store.handle.prepare('UPDATE task SET status=? WHERE id=?').run(['open', 'claimed', 'submitted', 'rejected'][i % 4], ids[i])
+  const counted = new Set()
+  store.handle.function('board_count_probe', taskId => { counted.add(taskId); return 1 })
+  const prepare = store.handle.prepare.bind(store.handle)
+  store.handle.prepare = sql => prepare(sql.includes(' AS fact_count,')
+    ? sql.replace('WHERE f.task_id=t.id AND', 'WHERE f.task_id=t.id AND board_count_probe(t.id) AND') : sql)
+  const page = store.boardPage({ limit: 1 }, 'run-a')
+  assert.equal(page.tasks[0].id, ids.at(-1))
+  assert.ok(counted.size <= 2, `computed task counts for ${counted.size} tasks while selecting 1+lookahead`)
+})
+
+test('task-filtered pending views keep global totals and the independent full-run late alarm entry', t => {
+  const store = tempStore(t), [pending, terminal] = seed(store, 2, 0)
+  store.closeTask({ task_id: terminal, result: 'failed' }, 'run-a')
+  store.recordFact({ task_id: terminal, kind: 'blocker', statement: 'late elsewhere' }, 'run-a')
+  for (const view of ['tasks', 'summary']) {
+    const result = store.boardPage({ view, task_id: pending }, 'run-a')
+    assert.equal(result.totals.tasks, 2)
+    assert.equal(result.totals.late_blockers, 1)
+    assert.equal(result.late_blocked_tasks, 1)
+    assert.equal(result.late_blockers[0].task_id, terminal)
+  }
+})
+
+
+test('board page totals, summaries and late alarms share one snapshot during a real concurrent insert', t => {
+  const store = tempStore(t, { journalMode: 'wal' }), [id] = seed(store, 1, 1)
+  const writer = new DatabaseSync(store.dbPath)
+  t.after(() => writer.close())
+  const prepare = store.handle.prepare.bind(store.handle)
+  let inserted = false
+  store.handle.prepare = sql => {
+    const statement = prepare(sql)
+    if (sql.startsWith('SELECT COUNT(*) AS tasks,')) {
+      const get = statement.get.bind(statement)
+      statement.get = (...args) => {
+        const result = get(...args)
+        if (!inserted) {
+          inserted = true
+          writer.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,?,?,?,?)')
+            .run(id, 'run-a', 'fact', 'concurrent-new', 'PLAUSIBLE', 'now')
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  const first = store.boardPage({}, 'run-a')
+  assert.equal(inserted, true)
+  assert.equal(first.totals.facts, 1)
+  assert.equal(first.tasks[0].fact_count, 1)
+  assert.equal(first.tasks[0].facts[0].statement, 'fact-0-0')
+  assert.equal(store.boardPage({}, 'run-a').totals.facts, 2)
+  assert.equal(store.handle.isTransaction, false)
+})
+
+test('compatible accepted detail checks evidence presence without materializing the full fact history', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 80)
+  store.submitTask({ task_id: id }, 'run-a')
+  store.acceptTask({ task_id: id }, 'run-a', 'lead')
+  const prepare = store.handle.prepare.bind(store.handle), lengths = []
+  store.handle.prepare = sql => {
+    const statement = prepare(sql), all = statement.all.bind(statement)
+    statement.all = (...args) => { const rows = all(...args); lengths.push(rows.length); return rows }
+    return statement
+  }
+  const detail = store.boardPage({ task_id: id }, 'run-a')
+  assert.equal(detail.facts.length, 50)
+  assert.equal(detail.facts_pagination.has_more, true)
+  assert.deepEqual(detail.validation_warnings, [])
+  assert.ok(Math.max(...lengths) <= 51, `materialized ${Math.max(...lengths)} fact rows for a detail page plus lookahead`)
+})

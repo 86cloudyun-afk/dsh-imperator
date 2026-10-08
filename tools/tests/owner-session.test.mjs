@@ -164,3 +164,50 @@ test('bound state errors stay ahead of ownership conflicts and late blockers ret
   assert.equal(store.board({}, 'run-a').late_blockers[0].blockers[0].actor_session, 'sibling')
   assert.equal(store.taskOf(id, 'run-a').task.status, 'cancelled')
 })
+
+test('root real-session preassignment permits the actual worker nickname retry while preserving the original display label', async t => {
+  const store = tempStore(t), call = caller(store), id = task(store)
+  const assigned = await call('task_claim', { task_id: id, child_id: 'real-worker' })
+  assert.equal(assigned.owner_session, 'real-worker')
+  store.handle.prepare('UPDATE task SET updated_at = ? WHERE id = ?').run('2026-01-01T00:00:00.000Z', id)
+  const before = snapshot(store, id)
+  const retry = await call('task_claim', { task_id: id, child_id: 'worker-label' }, worker)
+  assert.equal(retry.ok, true, 'a nickname cannot revoke the real owner authority')
+  assert.equal(retry.already, true)
+  assert.equal(retry.owner, 'real-worker', 'idempotent claim retains the existing display label')
+  assert.equal(retry.owner_session, 'real-worker')
+  const after = snapshot(store, id)
+  const { updated_at: beforeTime, ...beforeTask } = before.task
+  const { updated_at: afterTime, ...afterTask } = after.task
+  assert.notEqual(afterTime, beforeTime)
+  assert.equal(retry.claimed_at, afterTime)
+  assert.deepEqual(afterTask, beforeTask)
+  assert.deepEqual(after.facts, before.facts)
+  assert.deepEqual(after.handoffs, before.handoffs)
+  assert.equal((await call('task_claim', { task_id: id, child_id: 'worker-label' }, sibling)).code, STORE_CODES.conflict)
+  assert.deepEqual(snapshot(store, id), after, 'same nickname does not authorize a different real session')
+})
+
+test('host claim cannot rebind a claimed task to a different session under the same display label', t => {
+  const store = tempStore(t), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'worker-label' }, 'run-a', 'real-worker', 'real-worker')
+  const before = snapshot(store, id)
+  for (const actor of ['sibling', 'lead']) {
+    assert.throws(() => store.claimTask({ task_id: id, child_id: 'worker-label' }, 'run-a', actor, 'replacement'), { code: STORE_CODES.conflict })
+    assert.deepEqual(snapshot(store, id), before)
+  }
+  store.submitTask({ task_id: id }, 'run-a', 'real-worker', 'real-worker')
+  store.rejectTask({ task_id: id, reason: 'replacement required' }, 'run-a', 'lead', 'run-a')
+  const reassigned = store.claimTask({ task_id: id, child_id: 'worker-label' }, 'run-a', 'lead', 'replacement')
+  assert.equal(reassigned.reassigned, true)
+  assert.equal(reassigned.owner_session, 'replacement')
+  assert.equal(snapshot(store, id).handoffs.length, 1)
+})
+
+test('legacy unbound tasks still reject a nickname change as a label-based owner conflict', async t => {
+  const store = tempStore(t), call = caller(store), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'legacy-label' }, 'run-a')
+  const before = snapshot(store, id)
+  assert.equal((await call('task_claim', { task_id: id, child_id: 'worker-label' }, worker)).code, STORE_CODES.conflict)
+  assert.deepEqual(snapshot(store, id), before)
+})

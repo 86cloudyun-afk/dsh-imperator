@@ -14,6 +14,49 @@ const anchor = process.env.DSH_INSTALL_ANCHOR
 const native = async (name) => import(pathToFileURL(createRequire(anchor).resolve(name)).href)
 const options = { skip: !anchor && 'requires DSH_INSTALL_ANCHOR' }
 
+test('actual native immutable Session appends match full folds; mutable restored seeds replay', options, async () => {
+  const [{ Session }, { createToolResultMessage }, projections, guard, flow] = await Promise.all([
+    native('@deepseek-ai/dsh-session'), native('@deepseek-ai/dsh-llm'),
+    import('../../lib/plugins/event-projection.mjs'), import('../../lib/plugins/guard.mjs'),
+    import('../../lib/plugins/working-context.mjs'),
+  ])
+  const session = Session.create('projection-native')
+  const g = projections.createGuardProjection({ echoFailures: 2 })
+  const f = projections.createFlowProjection()
+  const read = () => {
+    const events = session.snapshotEvents()
+    assert.deepEqual(g.read(events), guard.foldGuardSignals(events, { echoFailures: 2 }))
+    assert.deepEqual(f.read(events), flow.foldSubagentFlow(events))
+    assert.equal(g.processedEvents, events.length)
+    assert.equal(f.processedEvents, events.length)
+    assert.deepEqual(f.read(events), flow.foldSubagentFlow(events))
+    assert.equal(f.processedEvents, events.length, 'same immutable native history must reuse its reducer')
+  }
+  session.append('turn/start', { turn: 1 }); read()
+  session.append('step/start', { turn: 1, step: 1 }); read()
+  session.append('tool/call', { turn: 1, step: 1, callId: 'child', name: 'subagent', arguments: '{}' }); read()
+  session.append('tool/result', { turn: 1, step: 1,
+    message: createToolResultMessage({ callId: 'child', content: [{ type: 'text', text: 'denied' }], isError: true }) },
+  { surfaceOp: 'append', sourceEventSeqs: [2] }); read()
+  session.append('step/end', { turn: 1, step: 1 }); read()
+  session.append('turn/end', { turn: 1, reason: { kind: 'completed' } }); read()
+  assert.equal(f.read(session.snapshotEvents()).dispatched, 1)
+  const restored = Session.fromRestore(session.header.id, structuredClone(session.snapshotEvents()),
+    structuredClone(session.header), 0, 'detached')
+  const events = restored.snapshotEvents()
+  assert.equal(Object.isFrozen(events[2].data), false)
+  const restoredGuard = projections.createGuardProjection({ echoFailures: 2 })
+  const restoredFlow = projections.createFlowProjection()
+  restoredGuard.read(events); restoredFlow.read(events)
+  events[2].data.name = 'read'
+  assert.equal(restored.snapshotEvents(), events, 'restored in-place mutation retains snapshot identity')
+  assert.deepEqual(restoredGuard.read(events), guard.foldGuardSignals(events, { echoFailures: 2 }))
+  assert.deepEqual(restoredFlow.read(events), flow.foldSubagentFlow(events))
+  assert.equal(restoredFlow.read(events).dispatched, 0, 'in-place mutation must change the result')
+  assert.equal(restoredGuard.processedEvents, events.length * 2)
+  assert.equal(restoredFlow.processedEvents, events.length * 3)
+})
+
 async function fixture(t) {
   const [{ Context }, { createScope }, { SessionStore }, { ToolRuntime }, { SystemPrompt }] = await Promise.all([
     native('@deepseek-ai/cordis'), native('@deepseek-ai/dsh-scope'),

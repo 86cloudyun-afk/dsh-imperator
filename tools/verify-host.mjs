@@ -79,11 +79,27 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
       evidence_policy: 'execution', verification_files: ['evidence.txt'], verification_command: 'printf native-verification' })
     assert.equal(strict.ok, true)
     await task(child.agent, 'task_claim', { task_id: strict.task_id, child_id: 'worker-label' })
+    const bound = ctx.get('taskforceStore').taskOf(strict.task_id, parent.agent.id).task
+    const renamed = await task(child.agent, 'task_claim', { task_id: strict.task_id, child_id: 'other-worker-label' })
+    assert.equal(renamed.already, true)
+    assert.equal(renamed.owner_session, child.agent.id)
+    assert.equal(renamed.owner, bound.owner)
+    assert.equal((await task(parent.agent, 'task_verify', { task_id: strict.task_id,
+      command: 'printf native-verification' })).code, 'E_VERIFICATION_ROLE')
     const receipt = await task(child.agent, 'task_verify', { task_id: strict.task_id, command: 'printf native-verification' })
     assert.equal(receipt.verified, true, JSON.stringify(receipt))
+    assert.equal(ctx.get('taskforceStore').board(strict.task_id, parent.agent.id).receipts[0].exit_code, 0)
     await task(child.agent, 'task_submit', { task_id: strict.task_id })
     assert.equal((await task(parent.agent, 'task_accept', { task_id: strict.task_id })).execution_verified, true)
     pass('native strict receipt closes through real preset tools without model requests')
+    const failed = await task(parent.agent, 'task_open', { title: 'native nonzero receipt',
+      evidence_policy: 'execution', verification_files: ['evidence.txt'], verification_command: 'exit 7' })
+    await task(child.agent, 'task_claim', { task_id: failed.task_id, child_id: 'worker-label' })
+    assert.equal((await task(child.agent, 'task_verify', { task_id: failed.task_id, command: 'exit 7' })).verified, false)
+    assert.equal(ctx.get('taskforceStore').board(failed.task_id, parent.agent.id).receipts[0].exit_code, 7)
+    await task(child.agent, 'task_submit', { task_id: failed.task_id })
+    assert.equal((await task(parent.agent, 'task_accept', { task_id: failed.task_id })).code, 'E_VERIFICATION_RECEIPT')
+    pass('native nonzero receipt cannot be accepted and root verification is denied')
     // Verify the live service, not an assumed global depth default.
     const { Config: subagentConfig } = await nativeModule(anchor, '@deepseek-ai/dsh-tool-subagent')
     const runtime = parent.agent.ctx.get('subagents')
@@ -196,12 +212,43 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
       meta: { cwd: fixture.root, origin: 'subagent', delegationDepth: 1, parentSession: parent.agent.id },
       setup: agentCtx => applyChildComposition(agentCtx, parent.agent, { persona: workerConfig.persona }) })
     handles.push(sibling)
+    const competitor = await task(parent.agent, 'task_open', { title: 'bound nickname competition' })
+    await task(child.agent, 'task_claim', { task_id: competitor.task_id, child_id: 'shared-nickname' })
+    const ownerBefore = ctx.get('taskforceStore').taskOf(competitor.task_id, parent.agent.id)
+    for (const [name, args] of [['task_claim', { child_id: 'shared-nickname' }], ['task_submit', {}],
+      ['task_close', { result: 'failed' }]]) {
+      assert.equal((await task(sibling.agent, name, { task_id: competitor.task_id, ...args })).code, 'E_TASK_CONFLICT')
+    }
+    assert.deepEqual(ctx.get('taskforceStore').taskOf(competitor.task_id, parent.agent.id), ownerBefore)
+    pass('native bound nickname is idempotent and a real competitor cannot claim, submit or cancel')
     assert.equal((await task(sibling.agent, 'task_claim', { task_id: id, child_id: 'replacement', actor: 'lead' })).code, 'E_TASK_CONFLICT')
     assert.equal((await task(parent.agent, 'task_claim', { task_id: id, child_id: 'replacement' })).owner, 'replacement')
     const board = await task(parent.agent, 'task_board', { task_id: id })
     assert.equal(board.task.status, 'claimed')
     assert.equal(board.handoffs.length, 1)
     pass('native task tools, role rejection, acceptance and audited reassignment')
+    const pagedIds = []
+    for (let i = 0; i < 31; i++) pagedIds.push((await task(parent.agent, 'task_open', {
+      title: `native page ${i} ${'标题😀'.repeat(2000)}` })).task_id)
+    const rawPage = await execute(parent.agent, 'task_board', {})
+    assert.equal(rawPage.isError, false, rawPage.error?.message)
+    assert.ok(Buffer.byteLength(rawPage.value, 'utf8') <= 65536)
+    let page = JSON.parse(rawPage.value)
+    assert.equal(page.ok, true)
+    assert.equal(page.pagination.limit, 25)
+    assert.ok(page.tasks.length > 0 && page.tasks.length <= 25)
+    assert.equal(page.pagination.has_more, true)
+    assert.ok(page.tasks.some(row => row.truncated), 'large titles must disclose clipping')
+    const seen = page.tasks.map(row => row.id)
+    while (page.pagination.has_more) {
+      page = await task(parent.agent, 'task_board', { cursor: page.pagination.next_cursor })
+      seen.push(...page.tasks.map(row => row.id))
+    }
+    assert.equal(new Set(seen).size, seen.length)
+    assert(pagedIds.every(id => seen.includes(id)), 'native cursors must recover every clipped task')
+    assert.equal((await task(parent.agent, 'task_board', { task_id: pagedIds[0] })).task.title,
+      `native page 0 ${'标题😀'.repeat(2000)}`)
+    pass('registered native task_board defaults are bounded and cursors preserve full task reachability')
     for (const handle of handles.splice(0).reverse()) await handle.dispose()
     assert.equal(agents.get('taskforce-probe-child'), undefined)
     assert.equal(agents.get('taskforce-probe-lead'), undefined)

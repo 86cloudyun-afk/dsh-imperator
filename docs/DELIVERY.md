@@ -1,18 +1,18 @@
-# TaskForce 0.2 交付、验收与回滚
+# Imperator 0.3.0 交付、验收与回滚
 
 ## 交付目标
 
-本版将 PR #4/#5 的研究型主会话、思考保护、归属隔离、快照读取与恢复补强，与 PR #6 的 DSH 原生兼容、PTC 执行守卫、两层委派和审计换人整合。包版本为 0.2.1，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
+本版增加可信 session 归属与作者审计、opt-in 严格执行回执、有界分页看板、冻结事件增量投影、独立 durable governor core 及固定四阶段 opt-in 模型回归。包版本为 0.3.0，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2，不能把版本范围声明当作所有未来版本均已测试。
 
-可交付口径是：完整离线测试、原生契约与执行边界、实际隔离 web boot、任务工具闭环、卸载恢复、异常清理以及打包后验收通过。不是“没有任何未知缺陷”的保证，也不包含生产服务器部署或外部模型效果验收。
+本版当前实测状态见 [0.3 验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)，待验收项不能当成通过。可交付门槛是：完整离线测试、原生契约与执行边界、实际隔离 web boot、任务工具闭环、卸载恢复、异常清理以及打包后验收通过。不保证没有未知缺陷，也不包含生产服务器部署。固定模型样例通过只证明报告所列样例，不能推断普遍性能或费用改善。
 
 ## 包含内容与核验
 
-`local-dsh-taskforce-0.2.1.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
+`local-dsh-taskforce-0.3.0.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
 
 ```sh
 mkdir taskforce-candidate
-tar -xzf local-dsh-taskforce-0.2.1.tgz -C taskforce-candidate
+tar -xzf local-dsh-taskforce-0.3.0.tgz -C taskforce-candidate
 cd taskforce-candidate/package
 npm test
 npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.json
@@ -22,6 +22,16 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 
 验证会创建独立临时 DSH_HOME，绑定回环地址临时端口，关闭浏览器和访问 URL 输出，并完成清理；不向模型投入消息，不读取已有实例的任务数据。只读元数据及测试结果在日志中出现，不输出模型密钥或访问令牌。
 
+## 0.3 数据迁移与运行边界
+
+固定包名 `@local/dsh-taskforce`、preset `taskforce`、显示名 `任务部队` 与数据库 `$DSH_HOME/taskforce/taskforce.db` 不变。开库在事务中补 `task.owner_session`、执行 policy/清单/命令/cwd/generation 与 `fact.actor_session`，创建 `execution_receipt` / `execution_waiver`；历史行不猜填真实身份或成功回执。旧未绑定路径保留具名警告；历史已 trim 的身份不能自动还原。管理员应核对原始会话记录，不能把昵称当可信身份。
+
+可信宿主显式创建 governor 时才在同库创建 run、reservation、retry charge、resource hold 与 audit 表。重启 unknown 保留额度与资源；保守 retry 迁移可能对无法证明的历史重叠多计 retry 额度，旧 reservation 不得作未证明的 bind，须可信主控审计恢复/扩展/结算。见 [GOVERNOR.md](GOVERNOR.md)。升级新增列/表不删除事实；恢复旧数据库备份会丢升级后的记录，回滚前必须保存并审查。
+
+`execution` 仅在 `task_open` 显式设置，默认 `legacy`。`task_verify` 保留原生执行安全层；源码、日志、generation 或 owner 变化会使旧成功失效，最新非零/unknown/pending 不可被旧成功覆盖。人工 waiver 返回 `execution_verified:false`。有同 UID unrestricted shell 的执行者可直接改数据库，本功能是工具接口约束，不能替代 OS 隔离。
+
+默认 `task_board` 的 tasks/summary 每页25、最大100，完整工具 JSON 上限65536 UTF-8 bytes；截短字段与页尾预算缩减均可辨，游标仍能取全数据。详情和显式 facts/handoffs/late_blockers 原文页只限条数，不受摘要字节上限约束。原生冻结事件追加增量折叠，可变恢复 seed 或历史 replacement 全量重放；前缀扫描/复制仍 O(n)。
+
 ## 在目标实例安装
 
 以下为操作员主动部署步骤，不由交付脚本自动执行。先确认目标 DSH 和 Node 版本，备份 profile 的 package.json、锁文件、cordis.patch.yml 及相关覆盖层。数据库备份必须在停止写入后完整复制，或使用 SQLite 在线备份；不要在 WAL 正在写入时只复制主 db 文件。
@@ -29,7 +39,7 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 在确认目标 profile 后，以其管理员身份安装经校验的本地包，例如 web profile：
 
 ```sh
-dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.2.1.tgz
+dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.3.0.tgz
 dsh --profile web --dump-config
 ```
 
@@ -45,7 +55,7 @@ dsh --profile web --dump-config
 
 ECHO 采用调用发起顺序，晚到旧成功不清空新失败；native/PTC 命名空间及 turn/step 限定调用身份。派发统计保留尝试、回执、失败三个字段，不充当持久调度额度。STALL 默认只观察且不降档。
 
-阶段 B/C 持久调度器与自动开发仍未实现；执行者的文件权限也不由服务层 run 隔离代替。实际模型输出、长时并发、费用、其他宿主版本和用户生产环境不在隔离无模型验收范围内。历史报告记录其候选版本；新版本状态以精确提交对应的 CI 与验收记录为准。
+durable governor core 已提供可信宿主 API，但 `createNativeGovernorAdapter()` 无条件返回 `E_SCHEDULER_CAPABILITY` 并列出 H01–H06，配置或回调不能解锁。原生派发仍只有软预算纪律，阶段 C 自动开发未实现；执行者的文件权限也不由服务层 run 隔离代替。实际模型输出、长时并发、费用、其他宿主版本和用户生产环境不在隔离无模型验收范围内。历史报告记录其候选版本；新版本状态以精确提交对应的 CI 与验收记录为准。
 
 CLI 机制参考：[官方 DSH 包说明](https://www.npmjs.com/package/@deepseek-ai/dsh)。固定版本实际安装与运行证据由 CI 记录。
 

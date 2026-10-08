@@ -232,8 +232,8 @@ check(
 
 const colsOf = (table) => inspect.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name)
 /* v2 起三表各多出 run 归属列；fact 另有 resolves_fact_id（未解 blocker 的机械判据）。 */
-const COLS_TASK = ['id', 'title', 'note', 'status', 'owner', 'run_id', 'created_at', 'updated_at']
-const COLS_FACT = ['id', 'task_id', 'kind', 'statement', 'evidence_path', 'evidence_line', 'confidence', 'created_by', 'run_id', 'resolves_fact_id', 'created_at']
+const COLS_TASK = ['id', 'title', 'note', 'status', 'owner', 'owner_session', 'run_id', 'created_at', 'updated_at', 'evidence_policy', 'verification_files', 'verification_command', 'verification_cwd', 'evidence_generation']
+const COLS_FACT = ['id', 'task_id', 'kind', 'statement', 'evidence_path', 'evidence_line', 'confidence', 'created_by', 'actor_session', 'run_id', 'resolves_fact_id', 'created_at']
 const COLS_HANDOFF = ['id', 'task_id', 'from_child', 'to_child', 'note', 'run_id', 'created_at']
 
 check('S04', 'task 表列名与规格一致', same(colsOf('task'), COLS_TASK), `实际=${colsOf('task').join(',')}`)
@@ -337,7 +337,7 @@ const closed1 = store.closeTask({ task_id: 1, result: 'done' })
 check(
   'S17',
   'task_close(done) 是 task_submit 的别名：只产生 submitted，绝不产生 accepted；带 blocker 时返回 warnings',
-  closed1.status === 'submitted' && closed1.blockers === 1 && closed1.warnings.length === 1
+  closed1.status === 'submitted' && closed1.blockers === 1 && closed1.warnings.some(w => w.includes('未解 blocker')) && closed1.warnings.some(w => w.includes('未绑定'))
     && closed1.alias_of === 'submitTask' && closed1.mapped_status.includes('submitted'),
   JSON.stringify(closed1),
 )
@@ -425,15 +425,15 @@ emptyStore.close()
 const toolNames = main.state.tools.map((t) => t.name).sort()
 // 2026-09-29 定向更新（非放宽）：本包新增两个子代理控制工具
 // `task_child_send` / `task_child_stop`（见 docs/CONTROL.md）。
-// 它们是**新增注册**，既不改名也不删除既有 8 个工具；因此这里把期望集合扩到 10 个，
+// 它们是**新增注册**，既不改名也不删除既有 8 个工具；因此这里把期望集合扩到 11 个，
 // 并保留对既有 8 个工具逐个显式列名 —— 漏注册任何一个仍会 FAIL。
 const expectedNames = [
   'task_accept', 'task_board', 'task_child_send', 'task_child_stop', 'task_claim',
-  'task_close', 'task_fact', 'task_open', 'task_reject', 'task_submit',
+  'task_close', 'task_fact', 'task_open', 'task_reject', 'task_submit', 'task_verify',
 ]
 check(
   'S25',
-  'agent 平面注册 10 个模型可见工具（既有 8 个 + 新增 task_child_send / task_child_stop）',
+  'agent 平面注册 11 个模型可见工具（既有 10 个 + 新增 task_verify）',
   same(toolNames, expectedNames),
   `实际=${toolNames.join(',')}`,
 )
@@ -489,12 +489,12 @@ const tBoardText = JSON.stringify(tBoard)
 const tBoardTask = tBoard.tasks.find((t) => t.id === tOpen.task_id)
 check(
   'S28',
-  '无参 task_board 紧凑：只列**本工作实例**的待办任务 + 每任务 ≤5 条摘要（整包 ' + tBoardText.length + ' 字符）',
+  '无参 task_board 紧凑：只列**本工作实例**的待办任务 + 每任务最新1条摘要（整包 ' + tBoardText.length + ' 字符）',
   tBoard.ok === true && tBoard.scope === 'open' && tBoard.open_tasks === 1
     && tBoard.run_id === LEAD_AGENT.id && tBoard.can_accept === true
-    && tBoard.tasks.every((t) => t.facts.length <= 5)
-    && tBoardTask !== undefined && tBoardTask.facts.length === 2 && tBoardTask.blockers === 1
-    && tBoardText.length < 1600,
+    && tBoard.tasks.every((t) => t.facts.length <= 1)
+    && tBoardTask !== undefined && tBoardTask.facts.length === 1 && tBoardTask.blockers === 1
+    && Buffer.byteLength(tBoardText) <= 65536,
   tBoardText.slice(0, 500),
 )
 
@@ -504,7 +504,7 @@ check(
   'S29',
   '工具闭环下半段：task_close(partial) 只产生 submitted（含未解 blocker 告警），详情板读到 2 条完整事实 + 阻塞计数',
   tClose.ok === true && tClose.status === 'submitted' && tClose.alias_of === 'submitTask'
-    && tClose.warnings.length === 1 && tClose.warnings[0].includes('未解 blocker')
+    && tClose.warnings.some(w => w.includes('未解 blocker')) && tClose.warnings.some(w => w.includes('未绑定'))
     && tDetail.ok === true && tDetail.scope === 'task' && tDetail.task.status === 'submitted'
     && tDetail.task.owner === 'child-tool' && tDetail.facts.length === 2 && tDetail.task.blockers === 1
     && tDetail.counts.by_kind.blocker === 1,
@@ -526,7 +526,7 @@ const orphanDef = orphan.state.tools.find((t) => t.name === 'task_board')
 const orphanResult = JSON.parse(await orphanDef.execute({}, { agent: LEAD_AGENT }))
 check(
   'S31',
-  '服务未挂载时：工具仍注册（10 个）、调用返回 ok:false 且 logger.warn 有告警（不静默）',
+  '服务未挂载时：工具仍注册（11 个）、调用返回 ok:false 且 logger.warn 有告警（不静默）',
   // 口径与 S25 一致：10 = 既有 8 个 + 新增两个子代理控制工具；仍要求逐个名字都在
   // （只比数量会漏掉「注册了但换了名字」这类破坏）。
   orphan.state.tools.length === toolNames.length

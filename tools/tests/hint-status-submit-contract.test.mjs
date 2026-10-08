@@ -58,7 +58,7 @@ test('E_STATUS hint distinguishes claim/submit transitions and their measured re
 
 function claimedTask(store) {
   const task_id = store.openTask({ title: '重复认领', note: '原始任务说明' }, 'run-a').task_id
-  const claimed = store.claimTask({ task_id, child_id: 'child-a' }, 'run-a')
+  const claimed = store.claimTask({ task_id, child_id: 'child-a' }, 'run-a', 'child-a', 'child-a')
   assert.equal(claimed.status, 'claimed')
   assert.equal(claimed.already, false)
   store.recordFact({ task_id, kind: 'fact', statement: '已有证据', child_id: 'child-a' }, 'run-a')
@@ -81,7 +81,7 @@ test('same-owner claimed retries preserve owner/state/audit and refresh updated_
     const before = claimSnapshot(store, task_id)
     assert.equal(before.task.updated_at, '2026-01-01T00:00:00.000Z')
     const retry = surface === 'store'
-      ? store.claimTask({ task_id, child_id: 'child-a' }, 'run-a')
+      ? store.claimTask({ task_id, child_id: 'child-a' }, 'run-a', 'child-a', 'child-a')
       : await call('task_claim', { task_id, child_id: 'child-a' }, child)
     const after = claimSnapshot(store, task_id)
     assert.equal(retry.already, true)
@@ -121,9 +121,9 @@ test('claim retries retain ownership, identity/run guards and the submitted stat
   assert.equal(retry.ok, true)
   assert.equal(retry.already, true)
   assert.notEqual(store.taskOf(task_id, 'run-a').task.updated_at, before.task.updated_at)
-  store.submitTask({ task_id }, 'run-a')
+  store.submitTask({ task_id }, 'run-a', 'child-a', 'child-a')
   const submitted = claimSnapshot(store, task_id)
-  assert.throws(() => store.claimTask({ task_id, child_id: 'child-a' }, 'run-a'), { code: 'E_STATUS' })
+  assert.throws(() => store.claimTask({ task_id, child_id: 'child-a' }, 'run-a', 'child-a', 'child-a'), { code: 'E_STATUS' })
   const denied = await call('task_claim', { task_id, child_id: 'child-a' }, child)
   assert.equal(denied.ok, false)
   assert.equal(denied.code, 'E_STATUS')

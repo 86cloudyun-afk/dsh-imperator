@@ -5,24 +5,9 @@ import { STORE_CODES } from '../../lib/store/index.js'
 import { tempStore } from './helpers.mjs'
 
 /**
- * **提交/结任务的审计署名改用真实调用者（audit attribution only）**。
- *
- * 本文件**不测试任何权限闸门** —— 提交路径（`submitTask`，含 `task_close(done|partial)`
- * 别名）**没有** owner 权限判定：`caller` 只用于把「提交验收」事实的 `created_by`
- * 写成真实调用者。同 run 的竞争方仍可提交他人 `claimed` 任务（非终态，可由主会话
- * `task_reject` 打回）。
- *
- * **为什么闸门不可实现**（负结果，记于 `docs/STORE.md` §九）：按 `#39` 取消闸门的同款
- * 设计实现后，`verify-store-v2.mjs` 的 **C09 / C10 / C12 三条核心用例 FAIL** ——
- * `task_claim` 的 `child_id` 是自由标签（C09 用代号 `'child-1'` 认领、却以真实 sessionId
- * 调用 `task_submit`），数据层无法把「调用者 sessionId」与「owner 标签」对应 ⇒
- * 闸门会误杀合法提交。可靠实现需要给 `task` 表加 `owner_session` 列（表迁移），留作后续立项。
- *
- * 本文件锁定的只是**署名**，外加三条**既有契约不许回退**（它们是刻意设计，不是漏洞）：
- *   ① `open`（无认领者）任务任何同 run 调用者都可提交 —— 既有语义明写"允许从
- *      `open`（未认领就交）提交"，并会给"没有认领者就直接提交"的 warning；
- *   ② `submitted` 上的重复提交幂等（`already:true`），横跨 owner / lead / 非 owner 三种 caller；
- *   ③ `rejected` 仍须先 `task_claim`（`E_STATUS`）。
+ * Legacy unbound tasks keep the historical submission/idempotence path.
+ * Real-session authorization is covered in owner-session.test.mjs;
+ * this file protects old positional callers and their display audit labels.
  */
 const RUN = 'run-a'
 const lead = { id: RUN, options: {}, session: { header: { id: RUN } } }
@@ -116,5 +101,5 @@ test('rejected 仍须先 task_claim（E_STATUS）—— 既有语义不回退', 
 
   const denied = await call('task_submit', { task_id: id }, childOf('worker-a'))
   assert.equal(denied.ok, false)
-  assert.equal(denied.code, STORE_CODES.status, 'rejected 仍走 E_STATUS（提交路径本就没有 owner 闸门，不该冒出 E_TASK_CONFLICT）')
+  assert.equal(denied.code, STORE_CODES.status, 'rejected 仍走 E_STATUS（状态边界优先于 owner 权限）')
 })

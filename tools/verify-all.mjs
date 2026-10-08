@@ -12,6 +12,8 @@ const SCRIPTS = [
   'verify-p3.mjs', 'verify-scope-guard.mjs', 'verify-child-control.mjs',
 ]
 const TESTS = [
+  'model-regression.test.mjs',
+  'governor.test.mjs',
   'sqlite.test.mjs',
   'store-atomicity.test.mjs',
   'store-evidence.test.mjs',
@@ -19,12 +21,14 @@ const TESTS = [
   'verify-runner.test.mjs',
   'deliberate-orchestration.test.mjs',
   'guard-causality.test.mjs',
+  'incremental-projection.test.mjs',
   'store-scope-integrity.test.mjs',
   'sqlite-failure-safety.test.mjs',
   'working-state.test.mjs',
   'process-runner.test.mjs',
   'context-boundaries.test.mjs',
   'board-batching.test.mjs',
+  'board-pagination.test.mjs',
   'read-snapshot.test.mjs',
   'lifecycle-recovery.test.mjs',
   'ptc-events.test.mjs',
@@ -50,6 +54,8 @@ const TESTS = [
   'hint-dispatch-order.test.mjs',
   'close-failed-owner-guard.test.mjs',
   'submit-audit-attribution.test.mjs',
+  'owner-session.test.mjs',
+  'execution-receipts.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

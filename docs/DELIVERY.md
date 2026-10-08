@@ -68,3 +68,5 @@ node tools/verify-model.mjs --model-calls \
 本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
 
 没有显式 opt-in、非法请求/timeout 参数、超时、超过全局请求上限、provider/tool 错误、usage 缺失、未收口任务、错误执行者复用、无有效 strict 回执或独立断言失败均退出非零。不得用单条模型总结、模型改写后的测试退出码、静态提示词字数或 mock 成功代替真实模型验收。
+
+固定金额回归仅评价自包含 ESM 的同步 `sumMoney` 和标准 ECMAScript 内建；不支持 money.mjs 导入其他模块、访问 Node 宿主全局或异步返回。该约束已写入固定模型提示；测试文件仍允许 node:test。grader 在一次性子进程的新 `vm.SourceTextModule` realm 执行模型源码，输入也在该 realm 创建，判据和完成协议留在外层。所需 `--experimental-vm-modules` 仅由 grader 子进程开启，使用 Node 内建能力，无新增依赖；它不是通用模块或 OS 沙箱。

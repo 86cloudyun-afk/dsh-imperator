@@ -216,3 +216,52 @@ export function sumMoney() { return 999; }
 `)
   assert.equal(gradeMoney(workspace).ok, false)
 })
+
+for (const extended of [false, true]) {
+  test(`model process._eval cannot manufacture ${extended ? 8 : 4} completed observations`, async t => {
+    const { gradeMoney } = await import('../model-fixtures.mjs')
+    const workspace = mkdtempSync(join(tmpdir(), 'model-grader-stdin-'))
+    t.after(() => rmSync(workspace, { recursive: true, force: true }))
+    writeFileSync(join(workspace, 'money.mjs'), String.raw`
+const source = process._eval;
+const match = source.match(/write\(1, ("(?:\\.|[^"\\])*") \+ observations\)/);
+let result = JSON.parse(match[1])
+  + 'value:0\nvalue:30\nvalue:0.3\nvalue:-0.9\n';
+if (source.includes('observe(sumMoney, [1,NaN])'))
+  result += 'type-error\ntype-error\ntype-error\nvalue:-1\n';
+process.stdout.write(result);
+process.exit(0);
+export function sumMoney() { return 999; }
+`)
+    assert.deepEqual(gradeMoney(workspace, extended), { ok: false, checks: extended ? 8 : 4 })
+  })
+}
+
+test('fixed pure module executes in its own realm without host globals or host input objects', async t => {
+  const { gradeMoney } = await import('../model-fixtures.mjs')
+  const workspace = mkdtempSync(join(tmpdir(), 'model-grader-realm-'))
+  t.after(() => rmSync(workspace, { recursive: true, force: true }))
+  writeFileSync(join(workspace, 'money.mjs'), `
+if (typeof process !== 'undefined' || typeof Buffer !== 'undefined') throw new Error('host global exposed');
+JSON.stringify = () => 'forged';
+const calculate = ${goodMoney.replace('export function sumMoney', 'function')};
+export function sumMoney(a) {
+  if (Object.getPrototypeOf(a) !== Array.prototype) throw new Error('host array exposed');
+  return calculate(a);
+}`)
+  assert.deepEqual(gradeMoney(workspace, true), { ok: true, checks: 8 })
+})
+
+for (const source of [
+  `import { readFileSync } from 'node:fs'; ${goodMoney}`,
+  `await import('node:process'); ${goodMoney}`,
+  `globalThis.constructor.constructor('return process')(); ${goodMoney}`,
+]) {
+  test('fixed money module fails closed on unsupported imports or host escape', async t => {
+    const { gradeMoney } = await import('../model-fixtures.mjs')
+    const workspace = mkdtempSync(join(tmpdir(), 'model-grader-module-'))
+    t.after(() => rmSync(workspace, { recursive: true, force: true }))
+    writeFileSync(join(workspace, 'money.mjs'), source)
+    assert.equal(gradeMoney(workspace, true).ok, false)
+  })
+}

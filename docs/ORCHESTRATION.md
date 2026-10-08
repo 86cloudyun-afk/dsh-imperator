@@ -131,3 +131,7 @@ grader 在工作区外运行固定断言，不运行模型自行改写的测试�
 runner 走官方 `controlledProfile`、registry mount 和 native followup，记录所有真实子代激活并等待各层宿主结算通知及主会话再次空闲。上限默认且最大 80 个全树请求（允许调低），每阶段默认 180000 ms；重试和自动标题模型调用关闭。失败时取消所有跟踪 agent，dispose 主句柄与应用，每步清理最多等待 10 秒，最终清除临时 profile/home/workspace 并还原环境和退出码。
 
 报告只持久化白名单元数据，不保存模型推理、对话、原始工具返回、证据内容或 credentials。任务/会话历史及 native 日志位于运行期间的临时 home，清理后移除。报告含固定阶段名称、数值指标、独立判据结果、固定失败码和版本/摘要；模型原文、异常消息及任意事实陈述不能进入报告。源码指纹覆盖排序后的 `package.json`、`cordis.patch.yml`、`lib/` 与 `tools/` 路径和文件字节；文档、报告和 git 元数据不计入。缓存 tokens 按宿主语义单列，`inputTokens` 是未缓存输入，缺省 cache 字段计 0。报告是单次受控样例，不能独自证明普遍性能提升。
+
+固定金额 fixture 的模块边界：`money.mjs` 必须是自包含的 ES 模块，导出同步 `sumMoney`，仅依赖标准 ECMAScript 内建。静态/动态 import、Node 宿主全局（如 process/Buffer）和异步 `sumMoney` 不在此固定回归的支持范围；`money.test.mjs` 仍可正常使用 node:test。固定阶段提示明确包含该要求。
+
+独立 grader 在一次性子进程中使用新的 `vm.SourceTextModule` realm（子进程启用内建 `--experimental-vm-modules`），不把 host 对象、函数或数组传给模型模块。固定输入数组和拒绝动态导入的 Error 都在该 realm 内创建，字符串/Wasm 代码生成禁用。观察记录、完成协议与 Node process 留在外层 grader；父进程对完整 4/8 项观察记录作固定比较。`process._eval` 即使保留外层 stdin 脚本，也不在模型 realm 中可见。此处仅建立固定纯金额函数与 grader 的普通 JS 模块边界，不宣称 Node vm 是通用安全沙箱，也不提供同 UID 文件系统或 OS 进程隔离。

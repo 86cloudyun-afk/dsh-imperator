@@ -56,6 +56,7 @@ const TESTS = [
   'submit-audit-attribution.test.mjs',
   'owner-session.test.mjs',
   'execution-receipts.test.mjs',
+  'unassigned-adopt-execution-audit.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

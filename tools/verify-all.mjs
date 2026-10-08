@@ -19,6 +19,7 @@ const TESTS = [
   'verify-runner.test.mjs',
   'deliberate-orchestration.test.mjs',
   'guard-causality.test.mjs',
+  'incremental-projection.test.mjs',
   'store-scope-integrity.test.mjs',
   'sqlite-failure-safety.test.mjs',
   'working-state.test.mjs',

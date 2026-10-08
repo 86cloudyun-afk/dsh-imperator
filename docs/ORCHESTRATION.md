@@ -85,7 +85,7 @@ npm run test:integration
 
 新增 `tools/tests/guard-causality.test.mjs` 接入 `npm test`，覆盖上述边界，并穷举 4 次调用的 16 种成功/失败分布 × 24 种结果到达顺序，共 384 组因果顺序对照。
 
-明确限制：通知确认依赖宿主持久保存并在恢复时提供 source 元数据；旧版本未标注 signal 的历史通知不能自动追认，裁剪掉调用或通知的事件片段不等于完整证据。缺少 callId 时宁可不认定 ECHO，不能用猜测换误报。此通知机制不是权限边界或全局持久额度。每次仍扫描完整可用事件历史并建立调用元数据，未宣称增量 O(1)、总延迟下降或真实模型效果已验收；STALL、超时和任务取消的既有风险说明仍适用。
+明确限制：通知确认依赖宿主持久保存并在恢复时提供 source 元数据；旧版本未标注 signal 的历史通知不能自动追认，裁剪掉调用或通知的事件片段不等于完整证据。缺少 callId 时宁可不认定 ECHO，不能用猜测换误报。此通知机制不是权限边界或全局持久额度。不可变历史使用下述增量投影，其他历史仍全量回放；未宣称增量 O(1)、总延迟下降或真实模型效果已验收；STALL、超时和任务取消的既有风险说明仍适用。
 
 
 ## 0.2 原生整合契约
@@ -95,3 +95,16 @@ npm run test:integration
 ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”的两个断言被明确改为此契约，场景未删除。调用身份为 native/PTC 命名空间 + turn + step + provider ID；持久通知与运行时去重使用完整身份。对同一步相互矛盾的身份仍保守处理。外层 run_code 仅在存在真实内层事件时透明，折叠仍只遍历输入事件一次。
 
 工作投影保持主分支返回形状：dispatched 是尝试数，delegatedResults 是所有已配对回执数，failedDispatches 单列失败。由这三者与通知计算未结算估计，失败不会残留占位；PTC 自描述回执可用于裁剪历史恢复，但估计仍不等于全树硬额度。
+
+
+## 0.3 不可变历史增量投影
+
+`createEventCursor().read(events)` 返回 `{ reset, events }`；后者是需要重放的全量历史或新增尾部。只有深冻结的 JSON 事件图可以缓存，验证过的不可变对象用 WeakSet 记忆。普通可变数组可以承载不可变事件，但数组引用相同、长度相同、末尾 seq/callId 相同均不构成追加证明：每次逐项比较整个旧前缀的事件引用；中段替换、重排、缩短或非深冻结输入都全量重放。存在 seq 时要求连续；无 seq 的兼容 JSON 历史仍按完整引用前缀判断。访问器、稀疏数组、循环或非 JSON 对象不能进入快速路径。
+
+`createGuardProjection(options).read(events)` 与 `createFlowProjection(delegationTools, settlement).read(events)` 复用纯函数 `foldGuardSignals` / `foldSubagentFlow` 的 append/snapshot reducer，并保持返回形状。`processedEvents` 是累计传入 reducer 的事件数（包含 reset 重放），不是总操作数。冻结 40000 条事件初读处理 40000 条，原历史重读不增加，追加一条后为 40001；结果与全量 fold 相同。阈值或工具集合变化会使该 projection 重新回放；settlement 是创建时固定的值，变更时创建新 projection。
+
+两个插件分别以 per-agent WeakMap 保存投影；会话对象、session ID、作用域对象变化或观察到离开 preset 时丢弃旧状态，disposed 时释放。DSH 0.2.0-rc.2 正常 append 深冻结新事件，而 restored seed 可在同一 seq、同一快照引用下被就地修改，所以恢复或兼容输入中的可变事件必须每次全量回放。配置重新激活使用新的闭包和缓存；请求档位阈值变化同样重新回放。
+
+工具扫描保留 turn/step cursor，以及 native/PTC 命名空间、原始结果坐标、重复与乱序结果、通知 ID 和 ECHO 确认位置。后到的真实 PTC dispatch 可以回溯标记 run_code wrapper。snapshot 不提交未关闭的当前推理步；因此重复读取不会累计虚假的 STALL。仍使用 STALL observe、`stepDownRequests: 0`，store 与工具权限边界不变。
+
+成本边界：每次仍有 O(n) 前缀引用比较及引用数组复制；首次或新增对象的深冻结认证与 JSON 图大小相关。guard snapshot 仍扫描失败调用尾部，最坏 O(调用数)；todo 和可见 context 去重仍读取相应历史，surface compaction 会重新判断可见性。缓存保留事件引用与调用/通知元数据，空间随历史增长。这里只减少可信不可变历史的重复 reducer 处理，不承诺完整 pre-step 为 O(新增事件)，也不把处理计数当作真实模型延迟或成本测量。

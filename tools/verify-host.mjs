@@ -75,6 +75,15 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal(written.isError, false, written.error?.message)
     assert.equal(readFileSync(artifact, 'utf8'), 'verified artifact\n')
     pass('real root tool boundary and child file execution')
+    const strict = await task(parent.agent, 'task_open', { title: 'native strict coding receipt',
+      evidence_policy: 'execution', verification_files: ['evidence.txt'], verification_command: 'printf native-verification' })
+    assert.equal(strict.ok, true)
+    await task(child.agent, 'task_claim', { task_id: strict.task_id, child_id: 'worker-label' })
+    const receipt = await task(child.agent, 'task_verify', { task_id: strict.task_id, command: 'printf native-verification' })
+    assert.equal(receipt.verified, true, JSON.stringify(receipt))
+    await task(child.agent, 'task_submit', { task_id: strict.task_id })
+    assert.equal((await task(parent.agent, 'task_accept', { task_id: strict.task_id })).execution_verified, true)
+    pass('native strict receipt closes through real preset tools without model requests')
     // Verify the live service, not an assumed global depth default.
     const { Config: subagentConfig } = await nativeModule(anchor, '@deepseek-ai/dsh-tool-subagent')
     const runtime = parent.agent.ctx.get('subagents')
@@ -175,7 +184,19 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal((await task(child.agent, 'task_submit', { task_id: id })).status, 'submitted')
     assert.equal((await task(parent.agent, 'task_accept', { task_id: id })).status, 'accepted')
     assert.equal((await task(parent.agent, 'task_reject', { task_id: id, reason: 'fresh executor required' })).status, 'rejected')
-    assert.equal((await task(child.agent, 'task_claim', { task_id: id, child_id: 'replacement', actor: 'lead' })).code, 'E_TASK_CONFLICT')
+    // A different display label cannot change the bound owner's authority.
+    const sameOwner = await task(child.agent, 'task_claim', { task_id: id, child_id: 'worker-nickname' })
+    assert.equal(sameOwner.ok, true)
+    assert.equal(sameOwner.owner, child.agent.id)
+    assert.equal(sameOwner.owner_session, child.agent.id)
+    await task(child.agent, 'task_submit', { task_id: id })
+    await task(parent.agent, 'task_reject', { task_id: id, reason: 'explicit owner reassignment' })
+    // Use a real sibling for the non-owner rejection probe (Task 1 contract).
+    const sibling = await agents.create({ sessionId: 'taskforce-probe-sibling', parentAgent: parent.agent,
+      meta: { cwd: fixture.root, origin: 'subagent', delegationDepth: 1, parentSession: parent.agent.id },
+      setup: agentCtx => applyChildComposition(agentCtx, parent.agent, { persona: workerConfig.persona }) })
+    handles.push(sibling)
+    assert.equal((await task(sibling.agent, 'task_claim', { task_id: id, child_id: 'replacement', actor: 'lead' })).code, 'E_TASK_CONFLICT')
     assert.equal((await task(parent.agent, 'task_claim', { task_id: id, child_id: 'replacement' })).owner, 'replacement')
     const board = await task(parent.agent, 'task_board', { task_id: id })
     assert.equal(board.task.status, 'claimed')

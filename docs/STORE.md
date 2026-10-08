@@ -1,7 +1,7 @@
-# 事实库 · 一页说明（0.3：真实 owner 与审计；v3：工作实例隔离 + 提交/验收分离 + 终态冻结与验收门槛）
+# 事实库 · 一页说明（0.3：真实 owner、审计与严格执行回执；v3：工作实例隔离 + 提交/验收分离 + 终态冻结与验收门槛）
 
 `lib/store/index.js`（host 平面插件，发布 `taskforceStore`）
-＋ `lib/tools/index.js`（agent 平面插件，注册 10 个模型可见工具：8 个 `task_*` 事实库工具 + `task_child_send` / `task_child_stop` 子代理控制工具，后者见 `docs/CONTROL.md`）
+＋ `lib/tools/index.js`（agent 平面插件，注册 11 个模型可见工具：9 个 `task_*` 事实库工具 + `task_child_send` / `task_child_stop` 子代理控制工具，后者见 `docs/CONTROL.md`）
 ＋ `tools/verify-store.mjs`（P2 既有自测：列 / 闭环 / 编译器等价）
 ＋ `tools/verify-store-v2.mjs`（v2 自测：run 隔离 / 权限 / 迁移）
 ＋ `tools/verify-store-v3.mjs`（v3 自测：终态冻结 / 晚到阻塞 / 验收门槛）
@@ -122,7 +122,9 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 
 | 方法 | 入参 | 返回 |
 |---|---|---|
-| `openTask` | `({ title, note? }, runId)` | `{ task_id, title, status, run_id, created_at }` |
+| `openTask` | `({ title, note?, evidence_policy?, verification_files?, verification_command? }, runId, trustedContext?)`（可信 context `{sessionId,cwd,isRoot}`；legacy 旧位置兼容） | `{ task_id, title, status, run_id, created_at }` |
+| `verificationTarget` | `(taskId, runId, caller)`；caller 是宿主可信 identity `{sessionId,isRoot}` | 本 run 的 execution 任务、真实 owner 与当前 generation；只有子会话 owner 可取执行目标 |
+| `recordExecution` | `(receipt, runId, caller)`；仅可信宿主 API，不是模型工具 | 同数据库先写 pending intent，再完成同一行；日志路径和快照由宿主生成；失败/unknown 不构成验证通过 |
 | `claimTask` | `({ task_id, child_id }, runId, actor?, ownerSessionId?)` | `{ task_id, owner, owner_session, status:'claimed', claimed_at, already, warnings[] }` |
 | `recordFact` | `({ task_id?, kind, statement, evidence_path?, evidence_line?, confidence?, child_id?, resolves_fact_id? }, runId, caller?, actorSessionId?)` | `{ fact_id, task_id, kind, confidence, resolves_fact_id, created_at, late, late_of_status, next? }`（`late:true` = 落在终态任务上的**晚到阻塞**；终态上非 blocker 一律 `E_TERMINAL`） |
 | `recordHandoff` | `({ task_id, from_child, to_child, note }, runId)` | `{ handoff_id, task_id, from_child, to_child, created_at }` |
@@ -203,7 +205,8 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 
 | 工具 | 参数 | 谁能调 | 行为 |
 |---|---|---|---|
-| `task_open` | `title`(必), `note?` | 主/子 | 开任务，归属 = 调用者的 run |
+| `task_open` | `title`(必), `note?`, `evidence_policy?`, `verification_files?`, `verification_command?` | legacy 主/子；execution 仅主 | 开任务，归属 = 调用者的 run；execution 固定可信主会话 cwd |
+| `task_verify` | `task_id`, `command`, `timeout_ms?` | 仅真实子会话 owner | 通过 native bash 执行固定命令，await 回执持久化后返回；主会话不可执行 |
 | `task_claim` | `task_id`(必), `child_id`(必) | 主/子 | `open`/`rejected` 可认领，同 owner 幂等；仅主控可在 `rejected` 时换 owner，原子写 decision 与 handoff；**终态不可认领** |
 | `task_fact` | `task_id`(必), `kind`(必, enum), `statement`(必), `evidence_path?`, `evidence_line?`, `confidence?`(enum), `resolves_fact_id?`, `child_id?` | 主/子 | 落一条事实；**终态任务上只有 `kind=blocker` 允许**（标 `late`，进 `late_blockers`），其余 `E_TERMINAL` |
 | `task_submit` | `task_id`(必), `note?` | 主/子 | **提交待验收**：`open`/`claimed` → `submitted`；`submitted` 幂等（`already:true`）；**`rejected` 不可直提（`E_STATUS`，须先 `task_claim`）** |
@@ -354,3 +357,20 @@ v3 覆盖（逐条对应审计缺陷，断言 id 里带 ★）：
   本层**不校验证据内容**（有路径 ≠ 内容正确）。内容是主会话的核对责任：
   读 `board({task_id})` 的事实与 `evidence`，必要时打开文件对行 —— 门槛只是把"零依据验收"挡在门外，
   它不能替代复核。同理，`evidence_basis` 只列 fact_id，不会把执行者给的路径写成"已核对的证据"。
+
+
+## execution 编码任务回执（0.3）
+
+`evidence_policy` 默认 `legacy`：原有事实依据门槛和服务 API 位置保持兼容。主会话可以在 `task_open` 声明 `execution`，同时给出非空 `verification_files` 相对文件清单与固定 `verification_command`；工作区来自可信 `exec.agent.session.header.cwd`，模型不能指定 `verification_cwd`。清单不得越界、缺失、指向目录或外部 symlink；它只声明这些文件的验收范围，不覆盖清单外文件。
+
+当前真实子会话 owner 调 `task_verify(task_id, command, timeout_ms?)`。命令必须逐字匹配创建时的固定命令（包括空白）；超时默认 60000，范围 1–120000 ms。工具先同步写入 pending intent，再 await 原生 `agent.ctx.tools.execute({name:'bash',agent,signal,parent:exec.token,rootCallId,...})`。bash 需要的 `description`、唯一 callId 和日志 UUID 均由宿主生成；不直接 spawn，不绕过审批、sandbox 或 guards。缺少 execute/context 或 native bash 不可达返回 `E_VERIFICATION_CAPABILITY`。
+
+`execution_receipt` 与任务在同一 SQLite 数据库，关联 run、task、generation、真实 owner/执行者、固定命令、可信 cwd、开始结束时间、native 调用关联、清单快照与结构化 outcome。stdout/stderr 由宿主写到 `store.root/receipts/<uuid>.<stream>.log`，回执保存 SHA256、实际字节数及完整性；不跟随 native spillPath，也不把渲染文本当原始日志。合计超过 2 MiB 时最多保存 2 MiB 观察内容并标记不完整。数据库完成写入失败会保留最新 pending intent；可能残留未被采信的 UUID 日志，须重新运行才能产生新回执。
+
+严格 `task_accept` 只检查最新回执，要求同 run、本 owner、本代、同命令/cwd/清单，canonical `kind:'foreground'`、实际 exitCode 0、signal=null、timedOut=false、aborted=false、无 sandbox denial/runnerFailed/stopped、完整输出。缺字段不会被默认补成成功。较新的非零、timeout、abort、promotion、拒绝、unknown 或 pending 覆盖旧成功，artifact 自述不能替代回执。
+
+验收时重新读取清单文件和实际日志并核对摘要。文件快照保留 SHA256、resolved path、大小、inode/dev 与 mtime/ctime；执行前后这些信息变化也会判失败，哪怕内容被写后还原。日志缺失/篡改、源码更改/替换或外部 symlink 都拒绝。reject 原子递增 `evidence_generation`；换 owner 后须由新真实执行者重新验证。显式 `waiver_reason` 仍能人工收口，返回 `execution_verified:false` 并写独立 `execution_waiver` 审计与带「人工豁免；非验证通过」的 decision，不能绕过跨 run、数据完整性或未解 blocker。
+
+详情板新增任务 policy/generation/固定命令/cwd/清单，以及最近至多 10 条 `receipts` 与 10 条 `execution_waivers` 元数据；日志内容保留在宿主文件中，不展开到板。错误码 `E_VERIFICATION_POLICY` / `E_VERIFICATION_COMMAND` / `E_VERIFICATION_RECEIPT` / `E_VERIFICATION_CAPABILITY` / `E_VERIFICATION_ROLE` 均有对应工具 hint。
+
+这些是工具接口层的宿主观测证据。相同 UID 的 unrestricted shell 可以物理改写数据库或回执目录；本功能不构成抗恶意物理篡改、进程隔离或全进程树 quiescence 的承诺。原生 timeout promotion 可能留后台工作，回执永远拒绝将它标成成功。

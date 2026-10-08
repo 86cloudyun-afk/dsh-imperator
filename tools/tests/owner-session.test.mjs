@@ -127,7 +127,7 @@ test('additive migration preserves historical rows and leaves identities NULL wi
   const store = new TaskforceStore(dir)
   t.after(() => store.close())
   store.taskOf(41, 'run-a') // lazy connection performs migration before reading physical rows
-  assert.deepEqual({ ...store.handle.prepare('SELECT * FROM task').get() }, { ...oldTask, owner_session: null })
+  assert.deepEqual({ ...store.handle.prepare('SELECT * FROM task').get() }, { ...oldTask, owner_session: null, evidence_policy: 'legacy', verification_files: null, verification_command: null, verification_cwd: null, evidence_generation: 0 })
   assert.deepEqual({ ...store.handle.prepare('SELECT * FROM fact').get() }, { ...oldFact, actor_session: null })
 })
 

@@ -152,3 +152,90 @@ test('spawn and fork both allow one nested delegation and stop at depth two', op
     assert.throws(() => resolveChildDepth(parent(2), maximum), { name: 'SubagentDepthError' })
   }
 })
+
+test('native task_verify without bash fails closed and root cannot use the verifier to execute', options, async t => {
+  const { ctx, agent } = await fixture(t)
+  const { apply: applyTools } = await import('../../lib/tools/index.js')
+  const { tempStore } = await import('./helpers.mjs')
+  const { writeFile } = await import('node:fs/promises')
+  const cwd = await mkdtemp(join(tmpdir(), 'taskforce-native-verifier-'))
+  t.after(() => rm(cwd, { recursive: true, force: true }))
+  await writeFile(join(cwd, 'source.js'), 'source\n')
+  const store = tempStore(t)
+  const main = agent('receipt-root', undefined, { cwd })
+  const worker = agent('receipt-worker', main, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'receipt-root' })
+  const byId = new Map([main, worker].map(a => [a.session.header.id, a]))
+  ctx.provide('taskforceStore', store)
+  ctx.provide('agents', { get: id => byId.get(id) })
+  applyTools(ctx)
+  const id = store.openTask({ title: 'native capability', evidence_policy: 'execution', verification_files: ['source.js'], verification_command: 'true' }, 'receipt-root', { sessionId: 'receipt-root', cwd, isRoot: true }).task_id
+  store.claimTask({ task_id: id, child_id: 'receipt-worker' }, 'receipt-root', 'receipt-worker', 'receipt-worker')
+  const call = async caller => {
+    const result = await caller.ctx.tools.execute({ agent: caller, callId: `verify-${caller.session.header.id}`, name: 'task_verify', arguments: { task_id: id, command: 'true' }, signal: new AbortController().signal })
+    assert.equal(result.isError, false, result.error?.message)
+    return JSON.parse(result.value)
+  }
+  assert.equal((await call(main)).code, 'E_VERIFICATION_ROLE')
+  const missing = await call(worker)
+  assert.equal(missing.code, 'E_VERIFICATION_CAPABILITY')
+  assert.equal(missing.verified, false)
+  assert.equal(store.board(id, 'receipt-root').receipts[0].status, 'unknown')
+})
+
+test('native task_verify awaits real bash, correlates its parent and retains native guard denials', options, async t => {
+  const { ctx, agent } = await fixture(t)
+  const [{ LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, bash, { apply: applyTools }, { tempStore }] = await Promise.all([
+    native('@deepseek-ai/dsh-subprocess-local'), native('@deepseek-ai/dsh-bash-local'),
+    native('@deepseek-ai/dsh-shell-env'), native('@deepseek-ai/dsh-tool-bash'), import('../../lib/tools/index.js'), import('./helpers.mjs'),
+  ])
+  const { writeFile, readFile } = await import('node:fs/promises')
+  const cwd = await mkdtemp(join(tmpdir(), 'taskforce-native-receipt-'))
+  t.after(() => rm(cwd, { recursive: true, force: true }))
+  await writeFile(join(cwd, 'source.js'), 'source\n')
+  const store = tempStore(t)
+  new LocalSubprocessRuntime(ctx)
+  new ShellEnvRegistry(ctx)
+  new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
+  bash.apply(ctx, { enableRunInBackground: false, promoteOnTimeout: false })
+  const main = agent('receipt-root', undefined, { cwd })
+  // Separate tool scope matches independently created live agent sessions;
+  // session metadata, rather than inheriting the root's restrict layer, supplies lineage.
+  const worker = agent('receipt-worker', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'receipt-root' })
+  const byId = new Map([main, worker].map(a => [a.session.header.id, a]))
+  ctx.provide('taskforceStore', store)
+  ctx.provide('agents', { get: id => byId.get(id) })
+  applyTools(ctx)
+  applyScope(ctx)
+  await ctx.serial('agent/created', { agent: main })
+  await ctx.serial('agent/created', { agent: worker })
+  const command = "printf 'native receipt\\n'; printf 'native stderr\\n' >&2"
+  const id = store.openTask({ title: 'real native receipt', evidence_policy: 'execution', verification_files: ['source.js'], verification_command: command }, 'receipt-root', { sessionId: 'receipt-root', cwd, isRoot: true }).task_id
+  store.claimTask({ task_id: id, child_id: 'worker-label' }, 'receipt-root', 'receipt-worker', 'receipt-worker')
+  let outerToken, bashCalls = 0
+  ctx.tools.guard(exec => {
+    if (exec.name === 'task_verify') outerToken = exec.token
+    if (exec.name === 'bash' && exec.agent === worker) {
+      bashCalls++
+      assert.equal(exec.parent, outerToken)
+      assert.equal(exec.rootCallId, 'real-verification')
+      assert.equal(store.board(id, 'receipt-root').receipts[0].status, 'pending')
+    }
+  })
+  const call = async () => {
+    const result = await worker.ctx.tools.execute({ agent: worker, callId: 'real-verification', name: 'task_verify', arguments: { task_id: id, command }, signal: new AbortController().signal })
+    assert.equal(result.isError, false, result.error?.message)
+    return JSON.parse(result.value)
+  }
+  const first = await call()
+  assert.equal(first.verified, true, JSON.stringify({ first, receipts: store.board(id, 'receipt-root').receipts }))
+  assert.equal(bashCalls, 1)
+  const receipt = store.board(id, 'receipt-root').receipts[0]
+  assert.equal(await readFile(receipt.logs.stdout.path, 'utf8'), 'native receipt\n')
+  assert.equal(await readFile(receipt.logs.stderr.path, 'utf8'), 'native stderr\n')
+  assert.equal(receipt.exit_code, 0)
+  const dispose = worker.ctx.tools.guard(exec => exec.name === 'bash' ? 'native approval/policy denial probe' : undefined)
+  t.after(dispose)
+  assert.equal((await call()).verified, false)
+  store.submitTask({ task_id: id }, 'receipt-root', 'receipt-worker', 'receipt-worker')
+  assert.throws(() => store.acceptTask({ task_id: id }, 'receipt-root', 'lead', 'receipt-root'), { code: 'E_VERIFICATION_RECEIPT' })
+})

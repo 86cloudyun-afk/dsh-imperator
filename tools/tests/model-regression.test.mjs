@@ -35,6 +35,12 @@ function setup(t, fault) {
             await onRequest({ agentId: 'worker', turn: n, step: 1 })
             sessions[1].events.push({ type: 'assistant/message', data: { turn: n, step: 1, usage: { inputTokens: 2, outputTokens: 3 }, message: { source: { provider: 'test-provider', model: 'test-model' }, content: [] } } })
           }
+          if (fault === 'ptc-caught') sessions[1].events.push(
+            { type: 'tool/call', data: { turn: n, step: 1, callId: 'outer', name: 'run_code' } },
+            { type: 'tool/ptc-dispatch-start', data: { rootCallId: 'outer', subCallId: 'inner', name: 'read', arguments: { path: 'missing' } } },
+            { type: 'tool/ptc-dispatch', data: { rootCallId: 'outer', subCallId: 'inner', name: 'read', isError: true } },
+            { type: 'tool/result', data: { turn: n, step: 1, callId: 'outer', message: { isError: false } } },
+          )
           if (fault === 'new-worker') sessions.push({ id: 'unwanted', parent: 'root', events: [] })
           if (fault !== 'fake') writeFileSync(join(workspace, 'money.mjs'), goodMoney)
           if (fault === 'early-exit') writeFileSync(join(workspace, 'money.mjs'), 'process.exit(0); export function sumMoney() {}')
@@ -68,7 +74,7 @@ test('request and timeout limits reject invalid or unsafe values before host boo
   }
 })
 
-for (const fault of ['timeout', 'error', 'acceptance', 'usage', 'cap', 'fake', 'receipt', 'unsettled', 'readonly-write', 'new-worker', 'no-reuse', 'wrong-target', 'worker-not-run', 'native-error', 'early-exit', 'cleanup', 'route']) {
+for (const fault of ['timeout', 'error', 'acceptance', 'usage', 'cap', 'fake', 'receipt', 'unsettled', 'readonly-write', 'new-worker', 'no-reuse', 'wrong-target', 'worker-not-run', 'native-error', 'early-exit', 'cleanup', 'route', 'ptc-caught']) {
   test(`model ${fault} cannot produce a successful report and always disposes`, async t => {
     const { runModelVerification } = await api()
     assert.equal(typeof runModelVerification, 'function')
@@ -79,6 +85,7 @@ for (const fault of ['timeout', 'error', 'acceptance', 'usage', 'cap', 'fake', '
     assert.equal(report.ok, false)
     if (fault === 'cap') { assert.equal(report.failure, 'request-cap'); assert.equal(report.requests, 1) }
     if (fault === 'timeout') assert.equal(report.failure, 'timeout')
+    if (fault === 'ptc-caught') assert.equal(report.failure, 'usage-or-runtime-error')
     assert.equal(h.disposed(), true)
     const json = readFileSync(join(h.outputDir, 'report.json'), 'utf8')
     assert.doesNotMatch(json, /sk-secret|reasoning|credentials|marker/)
@@ -165,4 +172,47 @@ test('failed stage retains independent grading and request metrics without losin
   assert.equal(report.stages[1].independentChecks, 4)
   assert.equal(report.stages[1].requests, 2)
   assert.equal(report.requests, 3)
+})
+
+for (const extended of [false, true]) {
+  test(`independent grader rejects overwritten assertions (${extended ? 8 : 4} checks)`, async t => {
+    const { gradeMoney } = await import('../model-fixtures.mjs')
+    const workspace = mkdtempSync(join(tmpdir(), 'model-grader-assert-'))
+    t.after(() => rmSync(workspace, { recursive: true, force: true }))
+    writeFileSync(join(workspace, 'money.mjs'), `import assert from 'node:assert/strict';
+assert.equal = () => {};
+assert.throws = () => {};
+export function sumMoney() { return 999; }`)
+    assert.deepEqual(gradeMoney(workspace, extended), { ok: false, checks: extended ? 8 : 4 })
+  })
+}
+
+test('model module cannot manufacture completion from discoverable process arguments', async t => {
+  const { gradeMoney } = await import('../model-fixtures.mjs')
+  const workspace = mkdtempSync(join(tmpdir(), 'model-grader-completion-'))
+  t.after(() => rmSync(workspace, { recursive: true, force: true }))
+  writeFileSync(join(workspace, 'money.mjs'), String.raw`
+const source = process.execArgv[process.execArgv.indexOf('--eval') + 1];
+const match = source.match(/process\.stdout\.write\(("[^"]+")\)/);
+process.stdout.write(JSON.parse(match[1]));
+process.exit(0);
+export function sumMoney() { return 999; }
+`)
+  assert.equal(gradeMoney(workspace).ok, false)
+})
+
+test('module-owned serialization and stdout hooks cannot rewrite fixed observations', async t => {
+  const { gradeMoney } = await import('../model-fixtures.mjs')
+  const workspace = mkdtempSync(join(tmpdir(), 'model-grader-output-'))
+  t.after(() => rmSync(workspace, { recursive: true, force: true }))
+  writeFileSync(join(workspace, 'money.mjs'), String.raw`
+JSON.stringify = () => 'forged';
+const original = process.stdout._write;
+process.stdout._write = function(chunk, encoding, callback) {
+  const nonce = String(chunk).split('\n')[0];
+  return original.call(this, nonce + '\nvalue:0\nvalue:30\nvalue:0.3\nvalue:-0.9\n', encoding, callback);
+};
+export function sumMoney() { return 999; }
+`)
+  assert.equal(gradeMoney(workspace).ok, false)
 })

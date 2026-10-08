@@ -21,23 +21,46 @@ export function writeModelFixture(workspace) {
   writeFileSync(join(workspace, 'money.test.mjs'), `import { test } from 'node:test'\nimport assert from 'node:assert/strict'\nimport { sumMoney } from './money.mjs'\ntest('empty', () => assert.equal(sumMoney([]), 0))\ntest('integers', () => assert.equal(sumMoney([10,20]), 30))\ntest('decimal', () => assert.equal(sumMoney([0.1,0.2]), 0.3))\ntest('negative', () => assert.equal(sumMoney([-1.1,0.2]), -0.9))\n`)
 }
 
-/** Exit alone cannot pass: an early process.exit(0) lacks the grader's completion token.
- * No model-written tests, logs or success messages enter this decision. */
+/** The parent owns the fixed predicates. The model module runs only in the child;
+ * mutable assert/JSON/output methods from that module cannot decide the verdict.
+ * Source arrives on consumed stdin, keeping the private completion nonce out of
+ * argv. Missing, extra or manufactured observations fail exact parent comparison.
+ * This ordinary module boundary is not a sandbox against same-UID processes. */
 export function gradeMoney(workspace, extended = false) {
   const token = randomUUID()
-  const source = `import assert from 'node:assert/strict';
-import { sumMoney } from ${JSON.stringify(pathToFileURL(join(workspace, 'money.mjs')).href)};
-assert.equal(sumMoney([]),0);
-assert.equal(sumMoney([10,20]),30);
-assert.equal(sumMoney([0.1,0.2]),0.3);
-assert.equal(sumMoney([-1.1,0.2]),-0.9);
-${extended ? `for (const x of [NaN,Infinity,-Infinity]) assert.throws(() => sumMoney([1,x]),TypeError);
-assert.equal(sumMoney([0,-2.25,1.25]),-1);` : ''}
-process.stdout.write(${JSON.stringify(token)});`
-  const result = spawnSync(process.execPath, ['--input-type=module', '--eval', source], {
-    cwd: workspace, encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
+  const source = `import fs from 'node:fs';
+const write = fs.writeSync;
+const getPrototypeOf = Object.getPrototypeOf;
+const typeErrorPrototype = TypeError.prototype;
+let observations = '';
+function observe(sumMoney, input) {
+  let observation;
+  try {
+    const value = sumMoney(input);
+    observation = typeof value === 'number' ? 'value:' + value : 'other-value';
+  } catch (error) {
+    let prototype = error !== null && (typeof error === 'object' || typeof error === 'function') ? getPrototypeOf(error) : null;
+    while (prototype !== null && prototype !== typeErrorPrototype) prototype = getPrototypeOf(prototype);
+    observation = prototype === typeErrorPrototype ? 'type-error' : 'other-error';
+  }
+  observations += observation + '\\n';
+}
+const { sumMoney } = await import(${JSON.stringify(pathToFileURL(join(workspace, 'money.mjs')).href)});
+observe(sumMoney, []);
+observe(sumMoney, [10,20]);
+observe(sumMoney, [0.1,0.2]);
+observe(sumMoney, [-1.1,0.2]);
+${extended ? `observe(sumMoney, [1,NaN]);
+observe(sumMoney, [1,Infinity]);
+observe(sumMoney, [1,-Infinity]);
+observe(sumMoney, [0,-2.25,1.25]);` : ''}
+write(1, ${JSON.stringify(token + '\n')} + observations);`
+  const result = spawnSync(process.execPath, ['--input-type=module'], {
+    input: source, cwd: workspace, encoding: 'utf8', timeout: 10000, maxBuffer: 65536,
     env: { PATH: process.env.PATH },
   })
-  return { ok: result.status === 0 && !result.signal && !result.error && result.stdout === token,
+  const expected = token + '\nvalue:0\nvalue:30\nvalue:0.3\nvalue:-0.9\n'
+    + (extended ? 'type-error\ntype-error\ntype-error\nvalue:-1\n' : '')
+  return { ok: result.status === 0 && !result.signal && !result.error && result.stdout === expected,
     checks: extended ? 8 : 4 }
 }

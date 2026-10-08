@@ -9,6 +9,7 @@ import { spawnSync } from 'node:child_process'
 import { controlledProfile, nativeModule, resolveInstallAnchor, installationVersion } from './host-runtime.mjs'
 import { MODEL_STAGES, STRICT_COMMAND, STRICT_FILES, writeModelFixture, gradeMoney } from './model-fixtures.mjs'
 import { strictExecutionEvidence } from '../lib/store/execution.js'
+import { toolEvent } from '../lib/plugins/tool-events.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const fail = code => { throw Object.assign(new Error(code), { verificationCode: code }) }
@@ -73,7 +74,8 @@ function accounting(snapshot, requests, route) {
   let valid = true
   const matched = new Set()
   for (const session of snapshot.sessions) for (const event of eventsOf(session)) {
-    if (event.type === 'step/error' || event.type === 'tool/result' && (event.data?.error || event.data?.message?.isError)
+    const tool = toolEvent(event)
+    if (event.type === 'step/error' || tool?.phase === 'result' && tool.isError
       || event.type === 'turn/end' && event.data?.reason?.kind !== 'completed') valid = false
     if (event.type !== 'assistant/message') continue
     const key = `${session.id}:${event.data.turn}:${event.data.step}`

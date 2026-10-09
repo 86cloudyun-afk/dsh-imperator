@@ -206,3 +206,52 @@ test('all 384 arrival permutations and success patterns match an invocation-orde
   }
   assert.equal(checked, 384)
 })
+
+const semanticFailure = JSON.stringify({ ok: false, error: 'target is not owned', code: 'E_CHILD_NOT_OWN', hint: 'check child identity' })
+function textOutcome(id, text, extra = {}) {
+  return { type: 'tool/result', data: { message: { isError: false,
+    source: { callId: id }, content: [{ type: 'text', text }], ...extra } } }
+}
+function semanticEvents(tool = 'task_child_send', text = semanticFailure) {
+  return Array.from({ length: 6 }, (_, i) => [
+    call('semantic-' + i, { target_id: 'missing', message: 'continue' }, tool),
+    textOutcome('semantic-' + i, text),
+  ]).flat()
+}
+test('native task-tool JSON failures participate in echo detection even when transport succeeds', () => {
+  for (const name of ['task_open', 'task_claim', 'task_fact', 'task_submit', 'task_verify',
+    'task_accept', 'task_reject', 'task_close', 'task_board', 'task_child_send', 'task_child_stop']) {
+    const events = semanticEvents(name)
+    assert.equal(guard.foldGuardSignal(events, { echoFailures: 6, detectStall: false }).signal, 'echo', name)
+  }
+})
+test('PTC task-tool JSON failures count inside successful run_code wrappers', () => {
+  const events = Array.from({ length: 6 }, (_, i) => [
+    { type: 'step/start', data: { turn: 1, step: i + 1 } },
+    call('root-' + i, { code: 'different transport ' + i }, 'run_code'),
+    { type: 'tool/ptc-dispatch-start', data: { rootCallId: 'root-' + i, subCallId: 'inner',
+      name: 'task_child_send', arguments: { target_id: 'missing', message: 'continue' } } },
+    { type: 'tool/ptc-dispatch', data: { rootCallId: 'root-' + i, subCallId: 'inner',
+      isError: false, content: [{ type: 'text', text: semanticFailure }] } },
+    result('root-' + i, false), { type: 'step/end', data: { turn: 1, step: i + 1 } },
+  ]).flat()
+  assert.equal(guard.foldGuardSignal(events, { echoFailures: 6, detectStall: false }).signal, 'echo')
+})
+test('semantic failure parsing excludes external tools, quoted errors and incomplete envelopes', () => {
+  for (const name of ['read', 'bash', 'run_code', 'task_custom', 'task_child_spawn']) {
+    assert.equal(guard.foldGuardSignal(semanticEvents(name), { echoFailures: 6, detectStall: false }).signal, undefined, name)
+  }
+  for (const text of [
+    JSON.stringify({ ok: true, nested: JSON.parse(semanticFailure) }),
+    JSON.stringify({ ok: true, text: semanticFailure }),
+    JSON.stringify({ ok: false }), JSON.stringify({ ok: 'false', error: 'x', code: 'E_INPUT', hint: 'x' }),
+    JSON.stringify([JSON.parse(semanticFailure)]), JSON.stringify(semanticFailure),
+    'Error: ' + semanticFailure, semanticFailure + ' trailing text',
+  ]) assert.equal(guard.foldGuardSignal(semanticEvents('task_child_send', text),
+    { echoFailures: 6, detectStall: false }).signal, undefined, text)
+  const successful = semanticEvents().slice(0, 10).concat([
+    call('success', { target_id: 'missing', message: 'continue' }, 'task_child_send'),
+    textOutcome('success', JSON.stringify({ ok: true })),
+  ])
+  assert.equal(guard.foldGuardSignal(successful, { echoFailures: 6, detectStall: false }).signal, undefined)
+})

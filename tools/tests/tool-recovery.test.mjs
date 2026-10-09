@@ -36,6 +36,7 @@ function workspace(t) {
   return cwd
 }
 function snapshot(store) {
+  store.open()
   return Object.fromEntries(TABLES.map(table => [
     table, store.handle.prepare('SELECT * FROM ' + table + ' ORDER BY id').all(),
   ]))

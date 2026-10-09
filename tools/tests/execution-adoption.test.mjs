@@ -256,3 +256,32 @@ test('adoption cannot refresh a stale generation or transfer predecessor ownersh
     assert.deepEqual(rows(f.store), stable)
   }
 })
+
+for (const [table, column, detailKey, mismatchKey] of [
+  ['execution_receipt', 'command', 'receipts', 'mismatched_receipts'],
+  ['execution_waiver', 'reason', 'execution_waivers', 'mismatched_waivers'],
+]) {
+  for (const auditRun of [RUN, FOREIGN_RUN]) {
+    test('adoption refuses ' + table + ' already assigned to ' + auditRun, t => {
+      const f = fixture(t), id = f.open()
+      f.claim(id); assert.equal(f.verify(id).verified, true); f.submit(id)
+      assert.equal(f.accept(id, null, { waiver_reason: 'manual audit history' }).execution_verified, false)
+      f.store.handle.prepare('UPDATE ' + table + ' SET run_id = ?, ' + column + ' = ? WHERE task_id = ?')
+        .run(auditRun, 'FOREIGN_AUDIT_SECRET', id)
+      const detail = f.store.board(id)
+      assert.deepEqual(detail[detailKey], [])
+      assert.equal(detail.scope_integrity[0]?.[mismatchKey], 1)
+      assert.doesNotMatch(JSON.stringify(detail), /FOREIGN_AUDIT_SECRET/)
+      const before = rows(f.store), migration = structuredClone(f.store.migration)
+      const summary = f.store.unassignedSummary()
+      assert.throws(() => f.store.adoptUnassigned(RUN), error => {
+        assert.equal(error.code, 'E_STORE_INTEGRITY')
+        assert.doesNotMatch(error.message + (error.hint ?? ''), /FOREIGN_AUDIT_SECRET/)
+        return true
+      })
+      assert.deepEqual(rows(f.store), before)
+      assert.deepEqual(f.store.migration, migration)
+      assert.deepEqual(f.store.unassignedSummary(), summary)
+    })
+  }
+}

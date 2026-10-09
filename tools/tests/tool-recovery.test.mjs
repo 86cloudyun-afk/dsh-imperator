@@ -221,12 +221,14 @@ for (const [code, kind] of [['NOT_RESUMABLE', 'recovery'], ['PERSISTENCE_UNAVAIL
     assertHint(result, kind)
   })
 }
-for (const [method, name, args] of [
-  ['send', 'task_child_send', { target_id: CHILD, message: 'continue after recovery' }],
-  ['stop', 'task_child_stop', { target_id: CHILD }],
+for (const [method, name, args, diagnostic] of [
+  ['send', 'task_child_send', { target_id: CHILD, message: 'continue after recovery' }, 'opaque host runtime diagnostic'],
+  ['stop', 'task_child_stop', { target_id: CHILD }, 'opaque host runtime diagnostic'],
+  ['send', 'task_child_send', { target_id: CHILD, message: 'continue after recovery' }, '服务不可用：child bridge failed'],
+  ['stop', 'task_child_stop', { target_id: CHILD }, '服务不可用：child bridge failed'],
 ]) {
-  test('child ' + method + ' preserves unknown runtime failure without inventing ownership or success', async t => {
-    const error = new Error('opaque host runtime diagnostic'), f = childFixture(t, method, error)
+  test('child ' + method + ' preserves unknown runtime failure: ' + diagnostic, async t => {
+    const error = new Error(diagnostic), f = childFixture(t, method, error)
     const before = snapshot(f.store)
     const result = await f.call(name, args, f.signal)
     assertNoReceipt(result)

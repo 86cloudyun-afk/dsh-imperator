@@ -685,8 +685,20 @@ test('genuine mounted spawn fork and resumed workers receive the native read dis
   }, { inspectNative: async ({ ctx, root }) => {
     const { renderPrompt } = await native('@deepseek-ai/dsh-system-prompt')
     const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+    const assertDirectory = (agent, assembly) => {
+      if (installationVersion(anchor) === '0.2.1-alpha.2') {
+        assert.equal(assembly.contexts.find(context => context.name === 'working-directory:current')?.text,
+          'Current working directory: ' + JSON.stringify(workspace) + '.')
+        assert.equal(ctx.get('workingDirectory').get(agent.session), workspace)
+      } else {
+        assert.equal(assembly.variables.cwd, workspace)
+        assert.ok(renderPrompt(assembly).includes(workspace), 'legacy native cwd must remain visible in the prompt')
+      }
+    }
     const assertWorker = async agent => {
-      const prompt = renderPrompt(await agent.ctx.systemPrompt.assemble({ scope: agent, agent }))
+      const assembly = await agent.ctx.systemPrompt.assemble({ scope: agent, agent })
+      assertDirectory(agent, assembly)
+      const prompt = renderPrompt(assembly)
       for (const contract of [/已有文件.*原生 read/, /新任务或续作.*重读/, /旧对话.*其他代理.*shell cat\/grep.*替代/,
         /原生写入\/编辑成功.*更新观察.*无需逐次重读/, /FS_NOT_OBSERVED.*FS_STALE_VERSION.*read.*核对修改/]) {
         assert.match(prompt, contract)
@@ -695,7 +707,9 @@ test('genuine mounted spawn fork and resumed workers receive the native read dis
       assert.ok(agent.ctx.tools.schemas(agent).some(tool => tool.name === 'edit'))
       rendered++
     }
-    const rootPrompt = renderPrompt(await root.ctx.systemPrompt.assemble({ scope: root, agent: root }))
+    const rootAssembly = await root.ctx.systemPrompt.assemble({ scope: root, agent: root })
+    assertDirectory(root, rootAssembly)
+    const rootPrompt = renderPrompt(rootAssembly)
     assert.match(rootPrompt, /不执行命令/)
     assert.equal(root.ctx.tools.schemas(root).some(tool => tool.name === 'edit'), false)
     for (const row of TASKFORCE_DEFINITION.plugins.find(row => row.id === 'delegation').config.filter(row => row.name === '@deepseek-ai/dsh-tool-subagent')) {

@@ -69,7 +69,7 @@ test('persistent acknowledgements suppress old PTC failures but not new scoped a
 test('PTC failed receipts and repeated notices preserve main flow counters and pending work', () => {
   const events = [call('r', 1,'run_code'), ptc('call','a','r','subagent'), ptc('result','a','r','subagent'),
     ptc('call','b','r','subagent'), ptc('result','b','r','subagent',false), ptc('call','c','r','subagent')]
-  const notice = { type:'user/message', data:{id:'one', source:{kind:'subagent-settled'}} }
+  const notice = { type:'user/message', data:{id:'one', source:{kind:'subagent-settled',senderSessionId:'settled-child'}} }
   events.push(notice, structuredClone(notice))
   assert.deepEqual(foldSubagentFlow(events), { dispatched:3, delegatedResults:2, failedDispatches:1,
     settledNotices:1, settled:1, inFlight:1 })

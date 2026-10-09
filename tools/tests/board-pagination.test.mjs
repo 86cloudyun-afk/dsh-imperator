@@ -420,3 +420,27 @@ test('late tokens continue across display containers while task and late cursors
   assert.equal(tasks.tasks[0].id, ids[2])
   assert.equal(tasks.late_blockers[0].fact_id, first.late_blockers[0].fact_id)
 })
+
+test('fresh terminal-only board avoids redundant task cohort scans and selection', t => {
+  const store = tempStore(t), ids = seed(store, 20, 0)
+  for (const id of ids) store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+  const prepare = store.handle.prepare.bind(store.handle)
+  let queries = 0
+  store.handle.prepare = sql => { queries++; return prepare(sql) }
+  const page = store.boardPage({}, 'run-a')
+  assert.deepEqual(page.tasks, [])
+  assert.equal(page.open_tasks, 0)
+  assert.equal(page.totals.tasks, 20)
+  assert.equal(page.pagination.next_cursor, null)
+  assert.equal(page.pagination.page_token, null)
+  assert.ok(queries <= 7, 'empty fresh board used ' + queries + ' SQL queries')
+})
+test('empty current membership still invalidates a previously issued task continuation', t => {
+  const store = tempStore(t), ids = seed(store, 3, 0)
+  const first = store.boardPage({ limit: 1 }, 'run-a')
+  for (const id of ids) store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+  assert.throws(() => store.boardPage({ cursor: first.pagination.next_cursor,
+    page_token: first.pagination.page_token }, 'run-a'), { code: 'E_PAGE_CHANGED' })
+  assert.throws(() => store.boardPage({ cursor: first.pagination.next_cursor }, 'run-a'), { code: 'E_INPUT' })
+  assert.equal(store.handle.isTransaction, false)
+})

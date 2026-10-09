@@ -7,7 +7,7 @@ const start = (id, name = 'subagent', args = { prompt: 'work' }) => ({ type: 'to
   data: { rootCallId: id.split(':')[0], parentCallId: id.split(':')[0], subCallId: id, name, arguments: args } })
 const result = (id, isError = false, name = 'subagent', args = { prompt: 'work' }) => ({ type: 'tool/ptc-dispatch',
   data: { ...start(id, name, args).data, isError, content: [], ...(isError ? { error: { name: 'Error', code: 'ENOENT' } } : {}) } })
-const notice = { type: 'user/message', data: { source: { kind: 'subagent-settled' } } }
+const notice = { type: 'user/message', data: { source: { kind: 'subagent-settled', senderSessionId: 'child-1' } } }
 const nativeCall = (id, name = 'subagent', args = { prompt: 'work' }) => ({ type: 'tool/call',
   data: { callId: id, name, arguments: JSON.stringify(args) } })
 const nativeResult = (id, isError = false) => ({ type: 'tool/result',

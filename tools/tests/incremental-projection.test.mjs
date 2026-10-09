@@ -18,7 +18,7 @@ const reasoning = () => event('assistant/message', { message: { content: [{ type
 const options = { stallSteps: 2, stallReasoningChars: 200, globalStallCap: 3, echoFailures: 2 }
 const ptc = (phase, id, name = 'read') => event(`tool/ptc-dispatch${phase === 'call' ? '-start' : ''}`,
   { rootCallId: 'wrapper', subCallId: id, name, arguments: { path: 'missing' }, isError: true })
-const notice = id => event('user/message', { id, source: { kind: 'subagent-settled', sender: 'same-child' } })
+const notice = id => event('user/message', { id, source: { kind: 'subagent-settled', senderSessionId: 'same-child' } })
 
 // Removing full-prefix comparison, recursive immutability checks, or reducer
 // cursor persistence must respectively break replacement, mutation or parity.

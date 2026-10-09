@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { TASKFORCE_DEFINITION } from '../../lib/preset.js'
+import { installationVersion } from '../host-runtime.mjs'
 import { apply as applyScope, DENY_CODE } from '../../lib/plugins/orchestrator-scope.mjs'
 
 // Integration supplies an explicit installation; offline checks never claim a
@@ -79,6 +80,16 @@ async function fixture(t) {
   return { ctx, owner, agent, createScope }
 }
 
+async function mountNativeWorkingDirectory(ctx, cwd) {
+  if (installationVersion(anchor) !== '0.2.1-alpha.2') return
+  const [{ default: LocalFileSystem }, { default: SessionProjectionRegistry }, { default: WorkingDirectory }] = await Promise.all([
+    native('@deepseek-ai/dsh-fs-local'), native('@deepseek-ai/dsh-session-projection'), native('@deepseek-ai/dsh-working-directory'),
+  ])
+  if (!ctx.get('fs')) await ctx.plugin(LocalFileSystem, { cwd })
+  if (!ctx.get('sessionProjections')) await ctx.plugin(SessionProjectionRegistry)
+  if (!ctx.get('workingDirectory')) await ctx.plugin(WorkingDirectory, { defaultDirectory: cwd })
+}
+
 test('native PTC transport cannot write from the root; children retain execution', options, async (t) => {
   const { ctx, agent } = await fixture(t)
   const root = await mkdtemp(join(tmpdir(), 'taskforce-boundary-'))
@@ -88,6 +99,7 @@ test('native PTC transport cannot write from the root; children retain execution
     native('@deepseek-ai/dsh-sandbox-local'), native('@deepseek-ai/dsh-ptc-runtime-node'),
   ])
   new LocalFileSystem(ctx, LocalFileSystem.Config({ cwd: root }))
+  await mountNativeWorkingDirectory(ctx, root)
   new LocalSubprocessRuntime(ctx)
   new Sandbox(ctx, Sandbox.Config({}))
   ctx.provide('sandboxPolicy', { defaultMode: 'danger-full-access',
@@ -239,7 +251,8 @@ test('native task_verify awaits real bash, correlates its parent and retains nat
   new LocalSubprocessRuntime(ctx)
   new ShellEnvRegistry(ctx)
   new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
-  bash.apply(ctx, { enableRunInBackground: false, promoteOnTimeout: false })
+  await mountNativeWorkingDirectory(ctx, cwd)
+  await ctx.plugin(bash, { enableRunInBackground: false, promoteOnTimeout: false })
   const main = agent('receipt-root', undefined, { cwd })
   // Separate tool scope matches independently created live agent sessions;
   // session metadata, rather than inheriting the root's restrict layer, supplies lineage.
@@ -475,7 +488,8 @@ test('native padded real owner completes strict verification with exact receipt 
   new LocalSubprocessRuntime(ctx)
   new ShellEnvRegistry(ctx)
   new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
-  bash.apply(ctx, { enableRunInBackground: false, promoteOnTimeout: false })
+  await mountNativeWorkingDirectory(ctx, cwd)
+  await ctx.plugin(bash, { enableRunInBackground: false, promoteOnTimeout: false })
   const store = tempStore(t), main = agent('exact-receipt-root', undefined, { cwd })
   const worker = agent(' worker ', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'exact-receipt-root' })
   const sibling = agent('worker', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'exact-receipt-root' })
@@ -671,8 +685,21 @@ test('genuine mounted spawn fork and resumed workers receive the native read dis
   }, { inspectNative: async ({ ctx, root }) => {
     const { renderPrompt } = await native('@deepseek-ai/dsh-system-prompt')
     const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+    const assertDirectory = (agent, assembly) => {
+      if (installationVersion(anchor) === '0.2.1-alpha.2') {
+        assert.equal(assembly.sections.some(section => section.name === 'taskforce:working-directory'), false)
+        assert.equal(assembly.contexts.find(context => context.name === 'working-directory:current')?.text,
+          'Current working directory: ' + JSON.stringify(workspace) + '.')
+        assert.equal(ctx.get('workingDirectory').get(agent.session), workspace)
+      } else {
+        assert.equal(assembly.variables.cwd, workspace)
+        assert.ok(renderPrompt(assembly).includes(workspace), 'legacy native cwd must remain visible in the prompt')
+      }
+    }
     const assertWorker = async agent => {
-      const prompt = renderPrompt(await agent.ctx.systemPrompt.assemble({ scope: agent, agent }))
+      const assembly = await agent.ctx.systemPrompt.assemble({ scope: agent, agent })
+      assertDirectory(agent, assembly)
+      const prompt = renderPrompt(assembly)
       for (const contract of [/已有文件.*原生 read/, /新任务或续作.*重读/, /旧对话.*其他代理.*shell cat\/grep.*替代/,
         /原生写入\/编辑成功.*更新观察.*无需逐次重读/, /FS_NOT_OBSERVED.*FS_STALE_VERSION.*read.*核对修改/]) {
         assert.match(prompt, contract)
@@ -681,7 +708,9 @@ test('genuine mounted spawn fork and resumed workers receive the native read dis
       assert.ok(agent.ctx.tools.schemas(agent).some(tool => tool.name === 'edit'))
       rendered++
     }
-    const rootPrompt = renderPrompt(await root.ctx.systemPrompt.assemble({ scope: root, agent: root }))
+    const rootAssembly = await root.ctx.systemPrompt.assemble({ scope: root, agent: root })
+    assertDirectory(root, rootAssembly)
+    const rootPrompt = renderPrompt(rootAssembly)
     assert.match(rootPrompt, /不执行命令/)
     assert.equal(root.ctx.tools.schemas(root).some(tool => tool.name === 'edit'), false)
     for (const row of TASKFORCE_DEFINITION.plugins.find(row => row.id === 'delegation').config.filter(row => row.name === '@deepseek-ai/dsh-tool-subagent')) {
@@ -880,4 +909,46 @@ test('native verifier request cap rejects the next prepared stream without losin
   assert.equal(dispatches, 1)
   assert.equal(report.usage.inputTokens, 2)
   assert.equal(report.stages[1].requests, 0)
+})
+
+test('native public message constructors retain continuation and unknown-outcome accounting', options, async () => {
+  const [{ Session }, { createUserMessage, createToolResultMessage }, { foldSubagentFlow, createFlowProjection }] = await Promise.all([
+    native('@deepseek-ai/dsh-session'), native('@deepseek-ai/dsh-llm'), import('../../lib/plugins/working-context.mjs'),
+  ])
+  const session = Session.create('continuation-accounting-native')
+  for (const callId of ['launch-a', 'launch-b']) {
+    const call = session.append('tool/call', { turn: 1, step: 1, callId, name: 'subagent', arguments: '{}' })
+    session.append('tool/result', { turn: 1, step: 1, message: createToolResultMessage({ callId,
+      content: [{ type: 'text', text: 'started' }], isError: false }) }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+  }
+  const projection = createFlowProjection()
+  // Source-equivalent settlement envelope built through the public SDK; the
+  // private subagent settlement emitter is intentionally not imported.
+  const notice = () => {
+    const summary = 'Background subagent child-a finished and will do no further work unless you send it more.'
+    session.append('user/message', createUserMessage({ content: [
+      { type: 'text', text: summary }, { type: 'text', text: 'Its closing message:' }, { type: 'text', text: 'answer' },
+    ], source: { kind: 'subagent-settled', form: 'notice', summary, senderSessionId: 'child-a' } }), { surfaceOp: 'append' })
+  }
+  notice()
+  assert.equal(projection.read(session.snapshotEvents()).inFlight, 1)
+  notice()
+  const flow = projection.read(session.snapshotEvents())
+  assert.equal(flow.settledNotices, 2)
+  assert.equal(flow.inFlight, 1)
+  assert.deepEqual(flow, foldSubagentFlow(session.snapshotEvents()))
+  assert.equal(projection.processedEvents, session.snapshotEvents().length)
+
+  const unknown = Session.create('unknown-outcome-accounting-native')
+  const call = unknown.append('tool/call', { turn: 1, step: 1, callId: 'unknown', name: 'subagent', arguments: '{}' })
+  unknown.append('tool/result', { turn: 1, step: 1,
+    message: createToolResultMessage({ callId: 'unknown', content: [{ type: 'text', text: 'uncommitted outcome' }], isError: true }),
+    error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' },
+  }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+  for (const channel of ['settled-notice', 'tool-result']) {
+    const flow = foldSubagentFlow(unknown.snapshotEvents(), undefined, channel)
+    assert.equal(flow.delegatedResults, 1)
+    assert.equal(flow.failedDispatches, 0)
+    assert.equal(flow.inFlight, 1)
+  }
 })

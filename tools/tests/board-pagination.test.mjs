@@ -444,3 +444,35 @@ test('empty current membership still invalidates a previously issued task contin
   assert.throws(() => store.boardPage({ cursor: first.pagination.next_cursor }, 'run-a'), { code: 'E_INPUT' })
   assert.equal(store.handle.isTransaction, false)
 })
+
+test('late cohort queries filter blocker history through an index without sorting IDs', t => {
+  const store = tempStore(t), ids = seed(store, 80)
+  store.handle.prepare("UPDATE task SET status='accepted' WHERE run_id=?").run('run-a')
+  for (const id of ids) store.recordFact({ task_id: id, kind: 'blocker', statement: 'late' }, 'run-a')
+  const original = store.handle.prepare, prepare = original.bind(store.handle), reads = []
+  store.handle.prepare = sql => {
+    const statement = prepare(sql)
+    if (/^SELECT (?:COALESCE\(MAX\(b\.id\)|b\.id AS id|COUNT\(\*\) AS n, COUNT\(DISTINCT t\.id\))/.test(sql)) {
+      for (const method of ['get', 'all', 'iterate']) {
+        const execute = statement[method].bind(statement)
+        statement[method] = (...params) => { reads.push({ sql, params }); return execute(...params) }
+      }
+    }
+    return statement
+  }
+  try {
+    const first = store.boardPage({ view: 'late_blockers' }, 'run-a')
+    assert.equal(first.total, 80)
+    const next = store.boardPage({ view: 'late_blockers', cursor: first.pagination.next_cursor,
+      page_token: first.pagination.page_token }, 'run-a')
+    assert.equal(next.total, 80)
+    assert.equal(next.late_blockers.length, 25)
+  } finally { store.handle.prepare = original }
+  assert.equal(reads.length, 5, 'first ceiling/members/counts and continuation members/counts must execute')
+  for (const { sql, params } of reads) {
+    const plan = prepare('EXPLAIN QUERY PLAN ' + sql).all(...params).map(row => row.detail).join('\n')
+    assert.match(plan, /SEARCH b USING (?:COVERING )?INDEX idx_fact_blocker_run_id \(run_id=\?/,
+      'cohort/count queries must skip ordinary fact history')
+    assert.doesNotMatch(plan, /TEMP B-TREE FOR ORDER BY/, 'membership IDs stream in index order')
+  }
+})

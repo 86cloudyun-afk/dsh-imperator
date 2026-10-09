@@ -1,18 +1,18 @@
-# Imperator 0.3.1 交付、验收与回滚
+# Imperator 0.3.2 交付、验收与回滚
 
 ## 交付目标
 
-本版修正续作通知和未知派发结果的未结算估计，优化新开的空待办页，并增加固定 alpha.2 宿主兼容验收。提示词不再无条件引用已废弃的 `cwd` 变量；旧宿主仍按原生变量提供目录，新宿主保留必需的目录上下文。保留可信 session 归属与作者审计、opt-in 严格执行回执、有界分页看板、冻结事件增量投影、独立 durable governor core 及固定四阶段 opt-in 模型回归。包版本为 0.3.1，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2 / 0.2.1-alpha.2（预发布版），不能把版本范围声明当作所有未来版本均已测试。
+本版修复 ID-only 代理调用 task_open 的异常、未归属任务接管时执行回执与豁免记录漏迁移，以及子代理服务错误的误分类。blocker 部分索引优化候选、完整成员校验和计数，实际同进程测量见 [0.3.2 研究记录](superpowers/research/2026-10-09-imperator-0.3.2-recovery.md)。执行审计归属异常会阻止验收，接管保持真实 owner/generation/命令/快照/结果不变。保留有界分页与完整成员变化校验、冻结事件增量投影、durable governor core 和固定四阶段 opt-in 模型回归。包版本为 0.3.2，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2 / 0.2.1-alpha.2（预发布版），不能把版本范围声明当作所有未来版本均已测试。
 
 F1修正候选 `c237ab8` 的108个归档文件与提交逐字节相同，实际解压包已通过双Node全量原生验证及显式四阶段模型验收（58条native stream请求、215946ms，运行/usage/route错误计数全0）。包SHA为 `c4556657616dcd1d016bad5ceb9e4e30a89811ff9de41697430fb7914d815c16`；完整身份与证据见 [0.3验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。历史55条普通agent样本与六次失败278条保留，旧辅助调用覆盖缺失、历史发生情况及usage未知，不能推断历史全部provider用量完整。最终文档归档将不同于模型候选包，仍须controller核对产品等价、双Node、唯一最终范围复核、更新CI与exact HEAD merge；本记录不宣称这些步骤完成。固定样例不证明生产部署或普遍性能/费用改善。
 
 ## 包含内容与核验
 
-`local-dsh-taskforce-0.3.1.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
+`local-dsh-taskforce-0.3.2.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
 
 ```sh
 mkdir taskforce-candidate
-tar -xzf local-dsh-taskforce-0.3.1.tgz -C taskforce-candidate
+tar -xzf local-dsh-taskforce-0.3.2.tgz -C taskforce-candidate
 cd taskforce-candidate/package
 npm test
 npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.json
@@ -41,7 +41,7 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 在确认目标 profile 后，以其管理员身份安装经校验的本地包，例如 web profile：
 
 ```sh
-dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.3.1.tgz
+dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.3.2.tgz
 dsh --profile web --dump-config
 ```
 

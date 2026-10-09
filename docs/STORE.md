@@ -147,7 +147,7 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 | `closeTask` | `({ task_id, result ∈ done/partial/failed, note? }, runId, caller?, actorSessionId?)` | **兼容别名**：`done`/`partial` → `submitted`（附注转交 `submitTask`，`alias_of:'submitTask'`），`failed` → `cancelled`（有附注时写取消裁决，`alias_of:null` —— 取消不是 submit 别名）；返回体另带 `mapped_status`。**永不产生 `accepted`**；**终态任务一律拒绝**（`E_TERMINAL`，先查原状态）；**取消（`failed`）还要求身份**：只有主会话或该任务**当前 owner** 能取消，同 run 的竞争子代理被 `E_TASK_CONFLICT` 拒绝且不产生任何写入（`caller` 由工具层派生，模型参数不参与；缺省且未绑定 = 宿主直连，沿用只校验 run 的历史语义） |
 | `taskOf` | `(task_id \| { task_id }, runId)` | `{ task, fact_count, last_fact_at, blockers, open }` |
 | `board` | `({} \| { task_id }, runId)` | 兼容宿主 API，见下 |
-| `boardPage` | `({view?,task_id?,limit?,cursor?,late_cursor?}, runId)` | 模型分页入口，见下 |
+| `boardPage` | `({view?,task_id?,limit?,cursor?,page_token?,late_cursor?,late_page_token?}, runId)` | 模型分页入口，见下 |
 | `stats` | `(runId)` | `{ run_id, tasks{…}, facts{…}, blockers_open, blockers_late }`；缺省 = 未归属域 |
 | `statsAllRuns` | — | **显式命名的跨 run 视图**（唯一会跨过隔离边界的读方法） |
 | `unassignedSummary` | — | `{ task, fact, handoff }` 未归属行计数（只读诊断） |
@@ -161,11 +161,13 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 它们不属于待办集合（结论没被自动改写），但**必须可见** —— 这是"晚到阻塞不会回到待办"的修复点。
 `board({task_id}, runId)`：`{ scope:'task', task（含 `late`）, counts:{by_kind,by_confidence}, facts[]（≤50，最近在前，不截断）, handoffs[]（≤10）, late_blockers[], validation_warnings[] }`。历史 `accepted` 如缺当前有效依据，返回 `{code:'W_EVIDENCE_REVIEW',message}` 提醒人工核对（可能曾人工豁免）；状态不自动回滚，且不解析验收文案猜测豁免。
 
-`boardPage` 是模型 `task_board` 的入口；旧宿主 `board` 的返回形状、最近5条摘要和全待办列表保持不变。无参数 `boardPage` 使用 `view='tasks'`，默认每页25、最大100；`limit`、`cursor`、`late_cursor`、`task_id` 必须为合法整数，非法/超界参数报 `E_INPUT`。各页按 ID 降序、`id < cursor` keyset 读取；`pagination:{limit,next_cursor,has_more}` 的 `limit` 是请求上限，受字节预算影响实际页可更短。插入比当前游标更新的记录不会混入后续页；要看它们从第一页重新读。
+`boardPage` 是模型 `task_board` 的入口；旧宿主 `board` 的返回形状、最近5条摘要和全待办列表保持不变。无参数 `boardPage` 使用 `view='tasks'`，默认每页25、最大100；`limit`、`cursor`、`late_cursor`、`task_id` 必须为合法整数，非法/超界参数报 `E_INPUT`。各页按 ID 降序、`id < cursor` keyset 读取；`pagination:{limit,next_cursor,has_more,page_token?}` 的 `limit` 是请求上限，受字节预算影响实际页可更短。待办/晚到阻塞是可变集合：续页必须将上页的 `next_cursor` 和 `page_token` 配对传入（默认晚到区为 `late_cursor/late_page_token`），仅数字游标的旧调用会报 `E_INPUT`，需升级调用方。示例：`task_board({cursor:上页.pagination.next_cursor,page_token:上页.pagination.page_token})`。
+
+token 绑定实际 run、逻辑集合、有效 task 筛选、首轮候选 ID 上界、该上界内的完整成员指纹和实际末行 ID；不绑定 limit。首轮已存在的终态任务重新进入待办、晚到 blocker 进入/离开报警集合（包括新 decision 消解旧 blocker）时，返回 `E_PAGE_CHANGED`，须丢弃该集合的游标/token 从第一页重读，并按 ID 去重；没有静默跳过。待办内部 open/claimed/submitted/rejected 状态变化不改变成员，仍可继续。首轮后插入的更大任务/blocker ID 不混入这轮分页，要看它们从第一页读取。token 是有界校验元数据，不是授权凭据；每页指纹计算流式扫描当前范围成员，内存有界但工作量为 O(成员数)，不保留跨页锁或写入数据库。全域 totals 始终描述当前单页读取事务的完整 run，不是分页 cohort 或当前页长度。
 
 `view` 支持 `tasks`、`summary`、`facts`、`handoffs`、`late_blockers`。`tasks` 返回待办页及每任务最新1条事实，`summary` 返回全域汇总及晚到报警页。`totals` 包含本 run 全量 `tasks/facts/open_tasks/submitted_tasks/late_blockers/late_blocked_tasks`，兼容字段 `open_tasks/submitted_tasks/late_blocked_tasks` 同样是完整计数，不是当前页长度。`facts` 计数排除与父任务 run 不符、父任务不存在的附属行，包含本 run 未挂任务事实。`tasks` 给 task_id 可筛选该任务，但全域 totals 和独立晚到报警区仍看整个 run。所有 task_id 入口先校验父任务归属；所有附属页先校验父任务及附属行 run，异域污染不消耗页额度。
 
-默认 `tasks/summary` 始终包含 `late_blockers[]`、`late_blocked_tasks` 和独立 `late_pagination`，待办为空也保留报警入口。晚到页每项为 `{fact_id,task_id,title,status,owner,statement,by,actor_session,at}`，按 `fact_id` 降序分页；多个 blocker 可来自同一任务。`late_cursor` 仅翻动默认/摘要/详情的晚到区；`view='late_blockers'` 使用 `cursor`，返回未截断 statement、完整 `total` 与 `pagination`。处理仍须主会话 `task_reject` 重新复核。
+默认 `tasks/summary` 始终包含 `late_blockers[]`、`late_blocked_tasks` 和独立 `late_pagination`，待办为空也保留报警入口。晚到页每项为 `{fact_id,task_id,title,status,owner,statement,by,actor_session,at}`，按 `fact_id` 降序分页；多个 blocker 可来自同一任务。`late_cursor + late_page_token` 仅翻动默认/摘要/详情的晚到区；`view='late_blockers'` 使用 `cursor + page_token`，返回未截断 statement、完整 `total` 与 `pagination`。处理仍须主会话 `task_reject` 重新复核。
 
 `facts/handoffs` 必须指定 `task_id`，按事实/交接 ID 分页，内容未截断，返回各集合完整 `total`。`task_id` 无 `view` 保持兼容详情：事实50条、交接10条、执行 receipts/waivers、统计与警告；新增 `facts_pagination/handoffs_pagination/late_pagination`。继续读取例如 `task_board({view:'facts',task_id, cursor:详情.facts_pagination.next_cursor})`，直到 `has_more=false`，即可取全历史。
 
@@ -241,7 +243,7 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 | `task_accept` | `task_id`(必), `note?`, `waiver_reason?` | **仅主会话** | **验收通过** → `accepted`；有未解 blocker 一律拒绝；**无执行依据也拒绝**（`waiver_reason` = 显式人工豁免） |
 | `task_reject` | `task_id`(必), `reason`(必) | **仅主会话** | `submitted` → **打回**（`rejected`）；**终态** → **重新复核**（`reopened:true`，任务回待办板） |
 | `task_close` | `task_id`(必), `result`(必, enum), `note?` | 主/子 | 兼容别名：`done`/`partial` 同 `task_submit`（含 `submitted` 幂等；**`rejected` 须先 claim**）；`failed` → `cancelled`；**终态任务一律拒绝（`E_TERMINAL`）** |
-| `task_board` | `task_id?/view?/limit?/cursor?/late_cursor?` | 主/子 | 读板（范围恒为本 run；返回体带 `viewer` / `can_accept` / `late_blockers`） |
+| `task_board` | `task_id?/view?/limit?/cursor?/page_token?/late_cursor?/late_page_token?` | 主/子 | 读板（范围恒为本 run；返回体带 `viewer` / `can_accept` / `late_blockers`） |
 
 参数经 `defineTool` 编译成 raw JSON Schema（`required` 与 `enum` 都进 schema）；
 返回值统一是**紧凑 JSON 字符串**：成功 `{ ok:true, ... }`，失败 `{ ok:false, error, code, hint }`。
@@ -402,3 +404,5 @@ v3 覆盖（逐条对应审计缺陷，断言 id 里带 ★）：
 详情板新增任务 policy/generation/固定命令/cwd/清单，以及最近至多 10 条 `receipts` 与 10 条 `execution_waivers` 元数据；日志内容保留在宿主文件中，不展开到板。错误码 `E_VERIFICATION_POLICY` / `E_VERIFICATION_COMMAND` / `E_VERIFICATION_RECEIPT` / `E_VERIFICATION_CAPABILITY` / `E_VERIFICATION_ROLE` 均有对应工具 hint。
 
 这些是工具接口层的宿主观测证据。相同 UID 的 unrestricted shell 可以物理改写数据库或回执目录；本功能不构成抗恶意物理篡改、进程隔离或全进程树 quiescence 的承诺。原生 timeout promotion 可能留后台工作，回执永远拒绝将它标成成功。
+
+事实计数的可见性口径：`boardPage().totals.facts`、`stats(runId).facts`（含 by_kind/by_confidence）和 `workingState(runId).factCount` 共用同一 SQL 判据。保留本 run 内未挂任务的事实；挂任务的事实必须存在同 run 父任务，错父域或孤儿事实不计入模型可见统计。NULL 未归属域使用相同规则。`statsAllRuns()` 仍是宿主显式调用的原始全局统计。

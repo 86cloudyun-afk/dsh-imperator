@@ -194,6 +194,30 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     session.append('turn/end', { turn: 2, reason: { kind: 'completed' } })
     pass('native cancelled delegation, scoped IDs and result replacement replay')
 
+    // Real task tool failures use successful text transport; guard must use the
+    // matched invocation name because public results retain only source.callId.
+    session.append('turn/start', { turn: 3 })
+    for (let step = 1; step <= 6; step++) {
+      const callId = 'semantic-probe-' + step
+      const args = { target_id: 'missing-semantic-probe', message: 'continue the task' }
+      session.append('step/start', { turn: 3, step })
+      const called = session.append('tool/call', { turn: 3, step, callId,
+        name: 'task_child_send', arguments: JSON.stringify(args) })
+      const result = await parent.agent.ctx.tools.execute({ agent: parent.agent, name: 'task_child_send',
+        arguments: args, callId, signal: new AbortController().signal })
+      assert.equal(result.isError, false)
+      assert.equal(JSON.parse(result.content[0].text).code, 'E_CHILD_NOT_OWN')
+      const message = createToolResultMessage({ callId, content: result.content, isError: result.isError })
+      assert.deepEqual(message.source, { kind: 'tool', callId })
+      session.append('tool/result', { turn: 3, step, message },
+        { surfaceOp: 'append', sourceEventSeqs: [called.seq] })
+      session.append('step/end', { turn: 3, step })
+    }
+    session.append('turn/end', { turn: 3, reason: { kind: 'completed' } })
+    assert.equal(foldGuardSignal(session.snapshotEvents(), { echoFailures: 6, detectStall: false }).signal, 'echo')
+    pass('native task-tool semantic errors remain observable over successful text transport')
+
+
     // Execute real failures without a model, then persist the exact public
     // AgentLoop result shape (source has callId, never toolName).
     for (const [index, name] of ['todo_write', 'unknown-diagnostic-probe'].entries()) {
@@ -281,7 +305,9 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.ok(page.tasks.some(row => row.truncated), 'large titles must disclose clipping')
     const seen = page.tasks.map(row => row.id)
     while (page.pagination.has_more) {
-      page = await task(parent.agent, 'task_board', { cursor: page.pagination.next_cursor })
+      page = await task(parent.agent, 'task_board', { cursor: page.pagination.next_cursor,
+        page_token: page.pagination.page_token })
+      assert.equal(page.ok, true, page.error)
       seen.push(...page.tasks.map(row => row.id))
     }
     assert.equal(new Set(seen).size, seen.length)

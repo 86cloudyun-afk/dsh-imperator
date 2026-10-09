@@ -15,12 +15,13 @@ function seed(store, count, facts = 8, run = 'run-a') {
 }
 function collect(store, args, key, run = 'run-a') {
   const result = []
-  let cursor = args.cursor
+  let cursor = args.cursor, pageToken = args.page_token
   do {
-    const page = store.boardPage({ ...args, cursor }, run)
+    const page = store.boardPage({ ...args, cursor, page_token: pageToken }, run)
     result.push(...page[key])
     assert.equal(page.pagination.has_more, page.pagination.next_cursor !== null)
     cursor = page.pagination.next_cursor ?? undefined
+    pageToken = page.pagination.page_token ?? undefined
   } while (cursor !== undefined)
   return result
 }
@@ -91,7 +92,7 @@ test('late blockers paginate by fact ID with full counts, even when the pending 
   assert.equal(first.totals.late_blockers, 62)
   assert.equal(first.late_blockers.length, 25)
   assert.equal(first.late_pagination.has_more, true)
-  const next = store.boardPage({ late_cursor: first.late_pagination.next_cursor }, 'run-a')
+  const next = store.boardPage({ late_cursor: first.late_pagination.next_cursor, late_page_token: first.late_pagination.page_token }, 'run-a')
   assert.ok(next.late_blockers[0].fact_id < first.late_blockers.at(-1).fact_id)
   assert.equal(collect(store, { view: 'late_blockers' }, 'late_blockers').length, 62)
 })
@@ -139,11 +140,12 @@ test('large display fields and many alerts stay within the complete tool wire bu
   const all = collect(store, { limit: 100 }, 'tasks')
   assert.equal(new Set(all.map(r => r.id)).size, 110)
   const lateIds = []
-  let lateCursor
+  let lateCursor, lateToken
   do {
-    const page = store.boardPage({ view: 'summary', limit: 100, late_cursor: lateCursor }, 'run-a')
+    const page = store.boardPage({ view: 'summary', limit: 100, late_cursor: lateCursor, late_page_token: lateToken }, 'run-a')
     lateIds.push(...page.late_blockers.map(row => row.fact_id))
     lateCursor = page.late_pagination.next_cursor ?? undefined
+    lateToken = page.late_pagination.page_token ?? undefined
   } while (lateCursor !== undefined)
   assert.deepEqual(lateIds, store.handle.prepare("SELECT id FROM fact WHERE task_id=? AND kind='blocker' ORDER BY id DESC").all(done).map(row => row.id))
   assert.equal(store.boardPage({ view: 'late_blockers', limit: 1 }, 'run-a').late_blockers[0].statement, huge.trim())
@@ -159,7 +161,7 @@ test('keyset continuation ignores later inserts and reads only selected task sum
   }
   const first = store.boardPage({ limit: 25 }, 'run-a')
   const added = store.openTask('later insertion', 'run-a').task_id
-  const rest = collect(store, { cursor: first.pagination.next_cursor, limit: 25 }, 'tasks')
+  const rest = collect(store, { cursor: first.pagination.next_cursor, page_token: first.pagination.page_token, limit: 25 }, 'tasks')
   assert.deepEqual([...first.tasks, ...rest].map(r => r.id), ids.reverse())
   assert.ok(!rest.some(r => r.id === added))
   assert.ok(Math.max(...lengths) <= 26, `materialized ${Math.max(...lengths)} rows`)
@@ -292,4 +294,129 @@ test('compatible accepted detail checks evidence presence without materializing 
   assert.equal(detail.facts_pagination.has_more, true)
   assert.deepEqual(detail.validation_warnings, [])
   assert.ok(Math.max(...lengths) <= 51, `materialized ${Math.max(...lengths)} fact rows for a detail page plus lookahead`)
+})
+
+test('pending continuation detects a previously skipped terminal task reopening above the cursor', t => {
+  const store = tempStore(t), ids = seed(store, 4, 0)
+  store.closeTask({ task_id: ids.at(-1), result: 'failed' }, 'run-a')
+  const first = store.boardPage({ limit: 1 }, 'run-a')
+  assert.equal(first.tasks[0].id, ids.at(-2))
+  store.rejectTask({ task_id: ids.at(-1), reason: 'new evidence requires review' }, 'run-a', 'lead')
+  assert.throws(() => store.boardPage({ limit: 1, cursor: first.pagination.next_cursor,
+    page_token: first.pagination.page_token }, 'run-a'), { code: 'E_PAGE_CHANGED' })
+  assert.equal(store.handle.isTransaction, false)
+  assert.equal(store.boardPage({ limit: 1 }, 'run-a').tasks[0].id, ids.at(-1))
+})
+
+test('late continuation detects a previously pending high-ID blocker entering the alarm collection', t => {
+  const store = tempStore(t), ids = seed(store, 3, 0)
+  for (const id of ids.slice(0, 2)) {
+    store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+    store.recordFact({ task_id: id, kind: 'blocker', statement: 'late blocker' }, 'run-a')
+  }
+  store.recordFact({ task_id: ids[2], kind: 'blocker', statement: 'still pending' }, 'run-a')
+  const first = store.boardPage({ view: 'late_blockers', limit: 1 }, 'run-a')
+  store.closeTask({ task_id: ids[2], result: 'failed' }, 'run-a')
+  assert.throws(() => store.boardPage({ view: 'late_blockers', limit: 1,
+    cursor: first.pagination.next_cursor, page_token: first.pagination.page_token }, 'run-a'),
+  { code: 'E_PAGE_CHANGED' })
+})
+
+test('board, stats and working state count the same visible facts including unattached facts and NULL scope', t => {
+  const store = tempStore(t)
+  for (const run of ['run-a', null]) {
+    const [id] = seed(store, 1, 1, run), [foreign] = seed(store, 1, 0, 'foreign')
+    store.recordFact({ statement: 'unattached', confidence: 'CONFIRMED' }, run)
+    const put = store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,?,?,?,?)')
+    put.run(foreign, run, 'blocker', 'wrong parent scope', 'REFUTED', 'now')
+    store.handle.exec('PRAGMA foreign_keys=OFF')
+    put.run(999999, run, 'blocker', 'missing parent', 'REFUTED', 'now')
+    store.handle.exec('PRAGMA foreign_keys=ON')
+    assert.equal(store.boardPage({}, run).totals.facts, 2)
+    const stats = store.stats(run)
+    assert.equal(stats.facts.total, 2)
+    assert.deepEqual(stats.facts.by_kind, { fact: 2 })
+    assert.deepEqual(stats.facts.by_confidence, { CONFIRMED: 1, PLAUSIBLE: 1 })
+    assert.equal(store.workingState(run).factCount, 2)
+    assert.equal(store.boardPage({ view: 'facts', task_id: id }, run).total, 1)
+  }
+  assert.equal(store.statsAllRuns().facts.total, 8, 'explicit raw global statistics retain their contract')
+})
+
+test('mutable cursors require a bounded token bound to the collection, run, filter and emitted cursor', t => {
+  const store = tempStore(t), ids = seed(store, 4, 0)
+  seed(store, 4, 0, 'other')
+  const first = store.boardPage({ limit: 1 }, 'run-a'), cursor = first.pagination.next_cursor
+  const token = first.pagination.page_token
+  for (const args of [
+    { cursor }, { page_token: token }, { cursor, page_token: '' }, { cursor, page_token: 'bad' },
+    { cursor, page_token: 'a'.repeat(2049) }, { cursor: cursor - 1, page_token: token },
+    { cursor, page_token: token, task_id: ids[0] }, { cursor, page_token: token, view: 'tasks', task_id: ids[0] },
+    { cursor, page_token: token, view: 'late_blockers' },
+  ]) assert.throws(() => store.boardPage(args, 'run-a'), { code: 'E_INPUT' }, JSON.stringify(args))
+  assert.throws(() => store.boardPage({ cursor, page_token: token }, 'other'), { code: 'E_INPUT' })
+  assert.ok(typeof token === 'string' && token.length <= 1024)
+  const second = store.boardPage({ limit: 2, cursor, page_token: token }, 'run-a')
+  assert.deepEqual(second.tasks.map(row => row.id), ids.slice(1, 3).reverse())
+})
+
+test('successful task_board tool continuation forwards the page token and exposes restart guidance', async t => {
+  const store = tempStore(t), ids = seed(store, 3, 0), board = tools(store)
+  const first = JSON.parse(await board({ limit: 1 }))
+  const second = JSON.parse(await board({ limit: 1, cursor: first.pagination.next_cursor,
+    page_token: first.pagination.page_token }))
+  assert.equal(second.ok, true)
+  assert.equal(second.tasks[0].id, ids[1])
+  store.closeTask({ task_id: ids[1], result: 'failed' }, 'run-a')
+  const stale = JSON.parse(await board({ limit: 1, cursor: first.pagination.next_cursor,
+    page_token: first.pagination.page_token }))
+  assert.equal(stale.ok, false)
+  assert.equal(stale.code, 'E_PAGE_CHANGED')
+  assert.match(stale.hint, /第一页/)
+})
+
+test('workingState excludes wrong-parent facts independently of board rendering', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 1), [foreign] = seed(store, 1, 0, 'foreign')
+  store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,?,?,?,?)')
+    .run(foreign, 'run-a', 'fact', 'wrong parent', 'CONFIRMED', 'now')
+  assert.equal(store.workingState('run-a').factCount, 1)
+  assert.equal(store.workingState('run-a').task.id, id)
+})
+test('new resolver above the initial blocker ceiling invalidates a late continuation', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 0)
+  store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+  for (let i = 0; i < 3; i++) store.recordFact({ task_id: id, kind: 'blocker', statement: 'late-' + i }, 'run-a')
+  const first = store.boardPage({ view: 'late_blockers', limit: 1 }, 'run-a')
+  const blocker = first.late_blockers[0].fact_id
+  store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at,resolves_fact_id) VALUES(?,?,?,?,?,?,?)')
+    .run(id, 'run-a', 'decision', 'resolved by migrated evidence', 'CONFIRMED', 'now', blocker)
+  assert.throws(() => store.boardPage({ view: 'late_blockers', limit: 1,
+    cursor: first.pagination.next_cursor, page_token: first.pagination.page_token }, 'run-a'),
+  { code: 'E_PAGE_CHANGED' })
+})
+test('pending status changes and later inserted tasks preserve an existing cohort including NULL scope', t => {
+  const store = tempStore(t)
+  for (const run of ['run-a', null]) {
+    const ids = seed(store, 4, 0, run), first = store.boardPage({ limit: 1 }, run)
+    store.claimTask({ task_id: ids[2], child_id: 'worker' }, run)
+    store.openTask('new above the ceiling', run)
+    const second = store.boardPage({ cursor: first.pagination.next_cursor,
+      page_token: first.pagination.page_token, limit: 3 }, run)
+    assert.deepEqual(second.tasks.map(row => row.id), ids.slice(0, 3).reverse())
+  }
+})
+test('late tokens continue across display containers while task and late cursors stay independent', t => {
+  const store = tempStore(t), ids = seed(store, 4, 0)
+  store.closeTask({ task_id: ids[0], result: 'failed' }, 'run-a')
+  for (let i = 0; i < 4; i++) store.recordFact({ task_id: ids[0], kind: 'blocker', statement: 'late-' + i }, 'run-a')
+  const first = store.boardPage({ limit: 1 }, 'run-a')
+  const summary = store.boardPage({ view: 'summary', limit: 1,
+    late_cursor: first.late_pagination.next_cursor, late_page_token: first.late_pagination.page_token }, 'run-a')
+  const late = store.boardPage({ view: 'late_blockers', limit: 1,
+    cursor: summary.late_pagination.next_cursor, page_token: summary.late_pagination.page_token }, 'run-a')
+  assert.equal(late.late_blockers[0].fact_id, first.late_blockers[0].fact_id - 2)
+  const tasks = store.boardPage({ limit: 1, cursor: first.pagination.next_cursor,
+    page_token: first.pagination.page_token }, 'run-a')
+  assert.equal(tasks.tasks[0].id, ids[2])
+  assert.equal(tasks.late_blockers[0].fact_id, first.late_blockers[0].fact_id)
 })

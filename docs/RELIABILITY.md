@@ -23,3 +23,11 @@
 验证器仍使用主分支的 deadline/exitCode/signal 分离逻辑；超时后即使退出 0 也失败，SIGTERM 宽限 500ms 后可强制结束直接子进程。宿主缺失不得冒称成功；退出/清理失败不得报告 HOST_VERIFIED。CI 原生阶段对打包再解压的候选执行 `test:all`，而不是仅验证源码工作目录。
 
 当前版本的验收以对应 commit/tree 的 CI 制品为证；历史报告中的旧版本 UNVERIFIED/FAILED 不表示已验证新的版本。所有原生检查都运行在临时 DSH_HOME，不修改已有 profile、事实库或服务，不调用模型。
+
+## 长任务与子代理停止的诊断边界
+
+连续任务工具失败现在参与 ECHO：例如同参数 `task_child_send` 六次返回完整 `ok:false` 错误回执，即使 DSH 的 `isError=false`（文本传输成功），也会提示停止重复调用。判定绑定真实 callId/turn/step 和已注册工具名，同时支持 native 与 PTC。ECHO 不执行子代理取消；preset 的 STALL 仍只观察，reasoning effort 保持路由选择。该回归修复的是失败检测，不能据此断言所有进程退出或子代理停止均已修复。
+
+另有宿主条件性风险：官方 DSH 0.2.0-rc.2 的 headless 入口在 root 空闲后直接退出，没有等待后代；退出清理可以中断仍运行的子代理。当前官方主线已加入 `waitForChildren` 与 root 再检查（见 [headless 源码](https://github.com/deepseek-ai/deepseek-harness/blob/d743267388641bc76f17c45ce8b4c231aed1d32c/packages/bundle/headless/src/index.ts)）。截至 2026-10-09 已发布的 0.2.1-alpha.2 是预发布版；本修复保持现有 rc.2 宿主验收基线，没有自动替换宿主。此问题只在实际采用该 headless 生命周期时适用，不能推断 Web/TUI/SDK 用户遇到的停止原因。
+
+排查实际停止时保留宿主入口/版本、最后 turn/end 的 reason.kind、agent/error 的稳定 code、父会话是否仍存活及退出时间。区分 completed、error、aborted、max-tokens 和 refusal；不要把活动表缺失或 inactive 单独当作崩溃证据。现有离线与原生宿主验收不发送模型请求，也不等价于数小时真实并发稳定性验收。

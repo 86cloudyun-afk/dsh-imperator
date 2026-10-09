@@ -12,4 +12,5 @@ Global constraints: preserve existing SQL scope authorization and unpaged host b
 Execution ledger:
 - Design independently reviewed read-only by child_stop_audit; candidate ceilings must include initially ineligible rows, and resolver IDs are not capped.
 - Local executor unavailable; remote branch/CI replace local worktree commands and ignored scratch ledger. This checked-in plan records evidence across compaction.
-- Test task: prepared; execution pending.
+- Test task: complete. Test-only commits f3bb9d6 and bc31209. Existing push CI runs 37938537765 and 37938812904 inspected on Node 22.23.2/24.19.0. Latest offline suite: 546 tests, 530 pass, 11 expected failures, 5 skips. Failures are actual paging exceptions, visible-count assertions (4 vs 2), workingState count, native/PTC semantic ECHO and durable warning assertions. Native host probe reaches successful task-tool text transport and fails only the expected missing ECHO assertion.
+- Store and guard implementation task: production code prepared following observed RED; full green CI pending. No model requests, scheduling or cancellation changes.

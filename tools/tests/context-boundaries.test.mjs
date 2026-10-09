@@ -94,3 +94,23 @@ test('malformed assistant blocks cannot manufacture signals or abort guard foldi
     assert.deepEqual(guard.foldGuardSignals(events), { stall: undefined, echo: undefined, echoKey: undefined })
   }
 })
+
+test('legacy directory assembly requires confirmed ownership after downstream assembly', async () => {
+  for (const mode of ['unknown', 'switched']) {
+    const hooks = new Map()
+    const owner = { preset: 'taskforce' }, agent = { ctx: { preset: 'taskforce' } }
+    const registry = { composedPreset(target) {
+      if (mode === 'unknown') throw new Error('scope unavailable')
+      return target.preset
+    } }
+    context.apply({ ...owner, on: (name, fn) => hooks.set(name, fn),
+      get: name => name === 'agentPresets' ? registry : undefined })
+    const assembly = { sections: [], contexts: [], tools: [], variables: { cwd: '/outside-native-directory' } }
+    const result = await hooks.get('system-prompt/assemble')(assembly, { agent }, async () => {
+      if (mode === 'switched') agent.ctx.preset = 'standard'
+      return assembly
+    })
+    assert.equal(result, assembly, mode + ' scope must preserve the downstream assembly')
+    assert.deepEqual(result.sections, [])
+  }
+})

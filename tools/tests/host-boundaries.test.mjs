@@ -687,6 +687,7 @@ test('genuine mounted spawn fork and resumed workers receive the native read dis
     const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
     const assertDirectory = (agent, assembly) => {
       if (installationVersion(anchor) === '0.2.1-alpha.2') {
+        assert.equal(assembly.sections.some(section => section.name === 'taskforce:working-directory'), false)
         assert.equal(assembly.contexts.find(context => context.name === 'working-directory:current')?.text,
           'Current working directory: ' + JSON.stringify(workspace) + '.')
         assert.equal(ctx.get('workingDirectory').get(agent.session), workspace)

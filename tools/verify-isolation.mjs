@@ -42,7 +42,9 @@ export async function verifyIsolation({ installAnchor, installDir } = {}) {
         agent.ctx.systemPrompt.variable('cwd', () => fixture.root)
         prepared.add(agent)
       }
-      const prompt = renderPrompt(await agent.ctx.systemPrompt.assemble({ agent, scope: agent }))
+      const assembly = await agent.ctx.systemPrompt.assemble({ agent, scope: agent })
+      const prompt = renderPrompt(assembly)
+      assert.equal(assembly.sections.some(section => section.name === 'taskforce:working-directory'), expected === 'taskforce')
       const names = agent.ctx.tools.schemas(agent).map(row => row.name)
       assert.equal(registry.composedPreset(agent.ctx), expected)
       assert.equal(prompt.includes('你是「任务部队」'), expected === 'taskforce')

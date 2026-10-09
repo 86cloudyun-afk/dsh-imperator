@@ -16,3 +16,5 @@ Execution ledger:
 - Store and guard implementation task: production code prepared following observed RED; full green CI pending. No model requests, scheduling or cancellation changes.
 
 - First fix run 37939486475: 540 passing offline tests, 1 failing input-boundary regression, 5 skips. Root cause: task_id without view selected compatibility detail and silently ignored a task cursor/token. Detail now rejects that unsupported pair; explicit task-filter token mismatch also remains covered. Original paging/count/semantic failure assertions pass. Complete rerun pending.
+
+- At 55ff151, full offline suites are green: 546 tests, 541 passing, 5 unavailable-host skips on both Node versions. Native semantic-error probe also passes. Native full acceptance exposed an existing test caller still forwarding a numeric-only task cursor; it is upgraded to forward page_token and explicitly assert ok before reading tasks. No production change required. Final packed-native rerun and independent PR review pending.

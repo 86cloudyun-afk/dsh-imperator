@@ -305,7 +305,9 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.ok(page.tasks.some(row => row.truncated), 'large titles must disclose clipping')
     const seen = page.tasks.map(row => row.id)
     while (page.pagination.has_more) {
-      page = await task(parent.agent, 'task_board', { cursor: page.pagination.next_cursor })
+      page = await task(parent.agent, 'task_board', { cursor: page.pagination.next_cursor,
+        page_token: page.pagination.page_token })
+      assert.equal(page.ok, true, page.error)
       seen.push(...page.tasks.map(row => row.id))
     }
     assert.equal(new Set(seen).size, seen.length)

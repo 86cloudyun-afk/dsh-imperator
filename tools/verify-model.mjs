@@ -13,6 +13,8 @@ import { toolEvent } from '../lib/plugins/tool-events.mjs'
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const MODEL_MAX_OUTPUT_TOKENS = 8192
+// Compatibility is proved against these pinned releases, never a future range.
+const modelHostVersions = new Set(['0.2.0-rc.2', '0.2.1-alpha.2'])
 const fail = code => { throw Object.assign(new Error(code), { verificationCode: code }) }
 const count = value => Number.isSafeInteger(value) && value >= 0
 const tick = () => new Promise(resolveTick => setTimeout(resolveTick, 10))
@@ -73,7 +75,7 @@ const usageKeys = ['inputTokens', 'outputTokens', 'cacheReadTokens', 'cacheWrite
 // Literal names only: never trust event tool names, session IDs or error text
 // as report strings. Unknown native/plugin tools still fail the same gate.
 const diagnosticTools = new Set([
-  'bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'str_replace_editor',
+  'bash', 'read', 'write', 'edit', 'read_image', 'glob', 'grep', 'str_replace_editor', 'working_directory',
   'run_code', 'job_output', 'job_list', 'job_kill', 'skill', 'subagent', 'fork',
   'send_message', 'interrupt_agent', 'list_agents', 'list_subagent_models',
   'todo_write', 'get_goal', 'create_goal', 'update_goal', 'task_child_stop',
@@ -274,7 +276,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
     writeModelFixture(workspace)
     harness = await createHarness({ ...config, workspace, packageRoot: ROOT, onRequest, onFailure: () => { runtimeStopped = true; stopped = true; harness?.cancel() } })
     report.provenance.hostVersion = /^\d+\.\d+\.\d+(?:-[\w.-]+)?$/.test(harness.hostVersion) ? harness.hostVersion : null
-    if (report.provenance.hostVersion !== '0.2.0-rc.2') fail('host-version')
+    if (!modelHostVersions.has(report.provenance.hostVersion)) fail('host-version')
     for (const stage of MODEL_STAGES) {
       const before = safeSnapshot(harness)
       const beforeRequests = requests.size
@@ -515,7 +517,7 @@ export function createModelStreamBoundary({ tracked, provider, model, isAgentLoo
 /** Official profile/registry path only; no custom provider client and no approval bypass. */
 export async function createNativeHarness({ installAnchor, packageRoot, workspace, provider, model, onRequest, onFailure }, { inspectNative } = {}) {
   const anchor = resolveInstallAnchor({ installAnchor })
-  if (installationVersion(anchor) !== '0.2.0-rc.2') fail('host-version')
+  if (!modelHostVersions.has(installationVersion(anchor))) fail('host-version')
   const fixture = await controlledProfile(anchor, packageRoot)
   let app, handle
   const tracked = new Map()

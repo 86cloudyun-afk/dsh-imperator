@@ -514,7 +514,7 @@ test('native diagnostic names cover mounted root and worker tools through scoped
   const { runModelVerification } = await api()
   const names = ['todo_write', 'get_goal', 'create_goal', 'update_goal', 'task_child_stop',
     'subagent_fork', 'ask_user_question', 'exit_plan_mode', 'web_search', 'web_fetch',
-    'str_replace_editor', 'write', 'edit', 'bash']
+    'str_replace_editor', 'write', 'edit', 'bash', 'working_directory']
   const h = setup(t, undefined, ({ stage, sessions }) => {
     if (stage.name !== 'repair') return
     names.forEach((name, index) => sessions[1].events.push(
@@ -808,4 +808,75 @@ test('cleanup retains usage arriving from an already admitted stream after the l
   assert.equal(report.requests, 1)
   assert.equal(report.usage.inputTokens, 11)
   assert.equal(report.stages[0].usage.outputTokens, 13)
+})
+
+test('alpha.2 retains independent checks, accounting, strict evidence and cleanup', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t)
+  const report = await runModelVerification(h.options, {
+    createHarness: async config => ({ ...await h.factory(config), hostVersion: '0.2.1-alpha.2' }),
+  })
+  assert.equal(report.ok, true)
+  assert.equal(report.provenance.hostVersion, '0.2.1-alpha.2')
+  assert.deepEqual(report.stages.map(s => s.independentChecks), [1, 4, 8, 8])
+  assert.deepEqual(report.stages.map(s => s.newWorkers), [0, 1, 0, 0])
+  assert.equal(report.stages[2].reuse, 1)
+  assert.equal(report.stages[3].strictVerified, true)
+  assert.deepEqual(report.stages[3].closure.tasks.map(task => task.evidencePolicy), ['legacy', 'legacy', 'execution'])
+  assert.equal(report.requests, 7)
+  assert.equal(report.usage.inputTokens, 14)
+  assert.equal(h.disposed(), true)
+  assert.doesNotMatch(JSON.stringify(report), /sk-secret|reasoning|credentials|marker/)
+})
+for (const [label, version] of [
+  ['earlier release candidate', '0.2.0-rc.1'], ['earlier alpha', '0.2.1-alpha.1'],
+  ['later alpha', '0.2.1-alpha.3'], ['stable release', '0.2.1'], ['future release', '0.3.0'],
+  ['build suffix', '0.2.0-rc.2+local'], ['malformed value', 'sk-secret'],
+]) {
+  test('unsupported host ' + label + ' fails before stages or requests and disposes', async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t)
+    let stageRuns = 0
+    const report = await runModelVerification(h.options, {
+      createHarness: async config => {
+        const harness = await h.factory(config)
+        harness.hostVersion = version
+        harness.runStage = async () => { stageRuns++; throw new Error('unsupported host entered a stage') }
+        return harness
+      },
+    })
+    assert.equal(report.ok, false)
+    assert.equal(report.failure, 'host-version')
+    assert.deepEqual(report.stages, [])
+    assert.equal(stageRuns, 0)
+    assert.equal(report.requests, 0)
+    assert.equal(h.disposed(), true)
+    const saved = readFileSync(join(h.outputDir, 'report.json'), 'utf8')
+    assert.equal(JSON.parse(saved).failure, 'host-version')
+    assert.doesNotMatch(saved, /sk-secret|reasoning|credentials|marker/)
+  })
+}
+
+test('working-directory diagnostics accept only the literal native and PTC name', async () => {
+  const { diagnoseModelRuntime } = await api()
+  const names = ['working_directory', 'working_directory_sk-secret',
+    'working_directory\nsk-secret', ' working_directory', 'working_directory ', '__proto__']
+  const sessions = names.map(name => ({ id: 'sk-secret-session', events: [
+    { type: 'tool/call', data: { turn: 1, step: 1, callId: 'same', name, arguments: 'sk-secret' } },
+    { type: 'tool/result', data: { turn: 1, step: 1,
+      message: { source: { kind: 'tool', callId: 'same' }, isError: true, content: [{ type: 'text', text: 'sk-secret' }] },
+      error: { code: 'INVALID_ARGS', message: 'sk-secret' } } },
+    { type: 'tool/ptc-dispatch', data: { turn: 1, step: 1, subCallId: 'same', name, isError: true,
+      error: { code: 'INVALID_ARGS', message: 'sk-secret' } } },
+  ] }))
+  const diagnostics = diagnoseModelRuntime({ sessions })
+  assert.deepEqual(diagnostics.details.map(detail => detail.toolName),
+    names.flatMap(name => name === 'working_directory' ? [name, name] : [null, null]))
+  assert.deepEqual(diagnostics.details.map(detail => detail.unknownTool),
+    names.flatMap(name => [name !== 'working_directory', name !== 'working_directory']))
+  assert.deepEqual(diagnostics.failureCodes, ['native-tool-error', 'ptc-tool-error'])
+  assert.equal(diagnostics.counts['native-tool-error'], names.length)
+  assert.equal(diagnostics.counts['ptc-tool-error'], names.length)
+  assert.equal(diagnostics.errorCounts.INVALID_ARGS, names.length * 2)
+  assert.doesNotMatch(JSON.stringify(diagnostics), /sk-secret|__proto__/)
 })

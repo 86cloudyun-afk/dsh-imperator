@@ -294,7 +294,7 @@ const wcEvents = [
   { type: 'tool/call', data: { name: 'subagent', callId: 'p1' } },
   { type: 'tool/call', data: { name: 'subagent', callId: 'p2' } },
   { type: 'tool/call', data: { name: 'subagent_fork', callId: 'p3' } },
-  { type: 'user/message', data: { source: { kind: 'subagent-settled', form: 'notice' } } },
+  { type: 'user/message', data: { source: { kind: 'subagent-settled', form: 'notice', senderSessionId: 'child-p1' } } },
   { type: 'todo/write', data: { todos: [{ id: 7, content: '重构解析器', status: 'in_progress' }] } },
 ]
 

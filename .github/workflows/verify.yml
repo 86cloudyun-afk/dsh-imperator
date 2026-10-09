@@ -36,7 +36,7 @@ jobs:
         run: |
           set -euo pipefail
           node tools/bench-board.mjs 1000 5000 > "$RUNNER_TEMP/taskforce-verification/board-bench.jsonl"
-          node -e 'const fs=require("node:fs");for(const line of fs.readFileSync(process.argv[1],"utf8").trim().split("\\n")){const r=JSON.parse(line);console.log(JSON.stringify({scenario:r.scenario,tasks:r.tasks,queries:r.queries,materialized_rows:r.materialized_rows,streamed_rows:r.streamed_rows,json_bytes:r.json_bytes,p50_ms:r.p50_ms,p95_ms:r.p95_ms}))}' "$RUNNER_TEMP/taskforce-verification/board-bench.jsonl"
+          node -e 'const fs=require("node:fs");for(const line of fs.readFileSync(process.argv[1],"utf8").trim().split("\n")){const r=JSON.parse(line);console.log(JSON.stringify({scenario:r.scenario,tasks:r.tasks,queries:r.queries,materialized_rows:r.materialized_rows,streamed_rows:r.streamed_rows,json_bytes:r.json_bytes,p50_ms:r.p50_ms,p95_ms:r.p95_ms}))}' "$RUNNER_TEMP/taskforce-verification/board-bench.jsonl"
       - name: Run npm test
         shell: bash
         run: |

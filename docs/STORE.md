@@ -150,8 +150,8 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 | `boardPage` | `({view?,task_id?,limit?,cursor?,page_token?,late_cursor?,late_page_token?}, runId)` | 模型分页入口，见下 |
 | `stats` | `(runId)` | `{ run_id, tasks{…}, facts{…}, blockers_open, blockers_late }`；缺省 = 未归属域 |
 | `statsAllRuns` | — | **显式命名的跨 run 视图**（唯一会跨过隔离边界的读方法） |
-| `unassignedSummary` | — | `{ task, fact, handoff }` 未归属行计数（只读诊断） |
-| `adoptUnassigned` | `(runId)` | 把全部未归属行显式接管到该 run；`runId` 为 `null` 时拒绝 |
+| `unassignedSummary` | — | `{ task, fact, handoff, execution_receipts, execution_waivers }` 未归属行计数（只读诊断） |
+| `adoptUnassigned` | `(runId)` | 显式接管未归属任务及匹配记录，返回 tasks/facts/handoffs/execution_receipts/execution_waivers 数量；`runId` 为 `null` 时拒绝 |
 
 `board({}, runId)` 无 `task_id`：`{ scope:'open', run_id, open_tasks, submitted_tasks, tasks[], late_blockers[], late_blocked_tasks, note }`，
 范围 = 本 run 的**待办**任务（`open / claimed / submitted / rejected`），每任务带**最近 5 条**事实摘要
@@ -173,9 +173,13 @@ token 绑定实际 run、逻辑集合、有效 task 筛选、首轮候选 ID 上
 
 `tasks/summary` 的完整模型工具 JSON（包含 `ok/viewer/can_accept`）上限65536 UTF-8 bytes。数据层预算60000 bytes，展示字段截短会标明 `truncated/truncated_fields`，任务带 `detail:{task_id}` 原文入口。超预算可明确减少页尾，返回 `budget_reduced:true` 并将各区游标置于最后实际输出条目，所有略去记录仍可继续读取。可操作 `owner_session/actor_session/viewer` 过长时省略原值并标明省略，不产生截短的伪身份；任务身份原值可通过详情/历史读取；viewer 省略时另给 `viewer_metadata:{role,omitted:true}`。页数有界的详情和显式原文历史页不受摘要字节上限约束。
 
-分页默认/摘要用 `scope_integrity_totals:{mismatched_facts,mismatched_handoffs}` 报告全域异常，不随当前页消失；`scope_integrity_note` 指向 task_id 详情的逐任务异常列表，避免全域异常列表撑破字节预算。旧宿主 `board` 的 `scope_integrity` 保持不变。
+分页默认/摘要用 `scope_integrity_totals` 报告全域异常，不随当前页消失；保留 mismatched_facts/mismatched_handoffs，执行审计异常时新增正数 mismatched_receipts/mismatched_waivers（缺省按0）。`scope_integrity_note` 指向 task_id 详情的逐任务异常列表，旧宿主 `board.scope_integrity` 同样报告这些审计异常数量。异域回执/豁免原文隐藏，验收在人工豁免和证据路径之前以 `E_STORE_INTEGRITY` 拒绝。
 
-`node tools/bench-board.mjs` 默认在临时 SQLite 中分别 seed1000/5000任务、每任务8事实，输出完整工具包 UTF-8 bytes 和30次查询 p50/p95，最后清理临时数据库。可传入其他任务量，例如 `node tools/bench-board.mjs 1000 5000`；性能数字只记录，不作为墙钟测试阈值。
+`adoptUnassigned` 在同一写事务中先按原本 `task.run_id IS NULL` 的父任务迁移 NULL-run 执行回执与豁免，再迁移任务及既有事实/交接。它只改变审计归属，不改变 owner、generation、命令、快照、结果或日志；已归属任务上的 NULL/异域审计保留异常，不自动纳入。原本未归属任务如附有已归属的执行审计，接管在任何迁移前以 `E_STORE_INTEGRITY` 拒绝，避免父任务移动让异常审计重新可见；须管理员核对修复。任一步写入失败回滚全部五张表与迁移诊断。人工豁免仍是非验证通过，旧失败、pending 或旧代回执不会因接管而变成有效依据。
+
+`node tools/bench-board.mjs` 默认在临时 SQLite 中分别 seed1000/5000任务、每任务8事实，输出完整工具包 UTF-8 bytes、查询数、返回 JavaScript 的行数和5次预热后30次完整读板的 p50/p95，最后清理临时数据库。可传入其他任务量，例如 `node tools/bench-board.mjs 1000 5000`；p50/p95 采用 nearest-rank（30样本排序下标14/28），计数与 EXPLAIN 在独立非计时读取中采集，行数不是 SQLite 实际访问行数。性能数字只记录，不作为墙钟测试阈值。
+
+`node tools/probe-late-index.mjs 1000 5000` 在同一进程、同一临时数据集比较 baseline/index-only/query-only/both；检查9类原场景、每任务额外1万条普通事实的筛选场景及 NULL/异域/错误消解关系。结果、两个分页 token、查询和返回行数逐字比较；后续高 ID resolver 仍必须让旧游标返回 `E_PAGE_CHANGED`。该工具只操作自己新建的合成库，正常看板不会创建实验索引或改变持久数据。
 
 `blockers` 字段是**未解** blocker 计数：只有一条**同任务、同 run（包括双方 NULL）、`kind='decision'` 且 `confidence ∈ {CONFIRMED,PLAUSIBLE}`** 的事实以 `resolves_fact_id` 指向 blocker，才算消解。旧库畸形、REFUTED、跨任务或跨 run 的伪关联不消解；`v_task_board.blockers` 仍是历史总数，不能据此推断未解数量。
 
@@ -406,3 +410,5 @@ v3 覆盖（逐条对应审计缺陷，断言 id 里带 ★）：
 这些是工具接口层的宿主观测证据。相同 UID 的 unrestricted shell 可以物理改写数据库或回执目录；本功能不构成抗恶意物理篡改、进程隔离或全进程树 quiescence 的承诺。原生 timeout promotion 可能留后台工作，回执永远拒绝将它标成成功。
 
 事实计数的可见性口径：`boardPage().totals.facts`、`stats(runId).facts`（含 by_kind/by_confidence）和 `workingState(runId).factCount` 共用同一 SQL 判据。保留本 run 内未挂任务的事实；挂任务的事实必须存在同 run 父任务，错父域或孤儿事实不计入模型可见统计。NULL 未归属域使用相同规则。`statsAllRuns()` 仍是宿主显式调用的原始全局统计。
+
+0.3.2 增加 blocker 专用部分索引，优化候选上界、完整成员指纹和全量计数查询；原 SQL、消解判据和分页协议保持不变。选行查询仍可能使用普通 fact run 索引，耗尽的任务范围续页仍可能读普通事实历史。1k/5k 合成热读对照与范围限制见 [0.3.2 研究记录](superpowers/research/2026-10-09-imperator-0.3.2-recovery.md)。

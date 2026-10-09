@@ -351,8 +351,9 @@ test('mutable cursors require a bounded token bound to the collection, run, filt
   for (const args of [
     { cursor }, { page_token: token }, { cursor, page_token: '' }, { cursor, page_token: 'bad' },
     { cursor, page_token: 'a'.repeat(2049) }, { cursor: cursor - 1, page_token: token },
-    { cursor, page_token: token, task_id: ids[0] }, { cursor, page_token: token, view: 'late_blockers' },
-  ]) assert.throws(() => store.boardPage(args, 'run-a'), { code: 'E_INPUT' })
+    { cursor, page_token: token, task_id: ids[0] }, { cursor, page_token: token, view: 'tasks', task_id: ids[0] },
+    { cursor, page_token: token, view: 'late_blockers' },
+  ]) assert.throws(() => store.boardPage(args, 'run-a'), { code: 'E_INPUT' }, JSON.stringify(args))
   assert.throws(() => store.boardPage({ cursor, page_token: token }, 'other'), { code: 'E_INPUT' })
   assert.ok(typeof token === 'string' && token.length <= 1024)
   const second = store.boardPage({ limit: 2, cursor, page_token: token }, 'run-a')

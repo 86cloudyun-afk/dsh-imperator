@@ -36,7 +36,8 @@ test('native nested result identity is accepted; unrelated receipts do not settl
 test('distinct notice IDs are not collapsed merely because they share a sender', () => {
   const state = foldSubagentFlow([call('a'), call('b'), notice('one'), notice('two')])
   assert.equal(state.settledNotices, 2)
-  assert.equal(state.inFlight, 0)
+  assert.equal(state.settled, 2)
+  assert.equal(state.inFlight, 1)
 })
 test('a missing current state supersedes rather than silently retaining a stale projection', async () => {
   const listeners = new Map()

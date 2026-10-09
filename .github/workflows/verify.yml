@@ -51,6 +51,7 @@ jobs:
       fail-fast: false
       matrix:
         node: ['22.23.2', '24.19.0']
+        dsh: ['0.2.0-rc.2', '0.2.1-alpha.2']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -59,7 +60,7 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - name: Install pinned official DSH
-        run: npm install --global --prefix "$RUNNER_TEMP/dsh-host" --no-audit --no-fund @deepseek-ai/dsh@0.2.0-rc.2
+        run: npm install --global --prefix "$RUNNER_TEMP/dsh-host" --no-audit --no-fund "@deepseek-ai/dsh@${{ matrix.dsh }}"
       - name: Pack exact deliverable and record inputs
         shell: bash
         run: |
@@ -76,7 +77,7 @@ jobs:
           tar -xzf "$evidence/$PACK_FILE" -C "$RUNNER_TEMP/taskforce-unpacked"
           (cd "$evidence" && sha256sum "$PACK_FILE" source.tar.gz > SHA256SUMS)
           { node --version; npm --version; } > "$evidence/runtime.txt"
-          npm view @deepseek-ai/dsh@0.2.0-rc.2 version dist.integrity --json > "$evidence/dsh-package.json"
+          npm view "@deepseek-ai/dsh@${{ matrix.dsh }}" version dist.integrity --json > "$evidence/dsh-package.json"
       - name: Full acceptance of unpacked deliverable (no model requests)
         shell: bash
         run: |
@@ -88,7 +89,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: taskforce-delivery-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.node }}
+          name: taskforce-delivery-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.node }}-${{ matrix.dsh }}
           path: ${{ runner.temp }}/taskforce-native/
           retention-days: 14
           if-no-files-found: error

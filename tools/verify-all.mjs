@@ -32,6 +32,7 @@ const TESTS = [
   'read-snapshot.test.mjs',
   'lifecycle-recovery.test.mjs',
   'ptc-events.test.mjs',
+  'continuation-flow.test.mjs',
   'store-reassignment.test.mjs',
   'host-runtime.test.mjs',
   'integration-contract.test.mjs',

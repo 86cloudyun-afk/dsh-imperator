@@ -373,3 +373,49 @@ test('successful task_board tool continuation forwards the page token and expose
   assert.equal(stale.code, 'E_PAGE_CHANGED')
   assert.match(stale.hint, /第一页/)
 })
+
+test('workingState excludes wrong-parent facts independently of board rendering', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 1), [foreign] = seed(store, 1, 0, 'foreign')
+  store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,?,?,?,?)')
+    .run(foreign, 'run-a', 'fact', 'wrong parent', 'CONFIRMED', 'now')
+  assert.equal(store.workingState('run-a').factCount, 1)
+  assert.equal(store.workingState('run-a').task.id, id)
+})
+test('new resolver above the initial blocker ceiling invalidates a late continuation', t => {
+  const store = tempStore(t), [id] = seed(store, 1, 0)
+  store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+  for (let i = 0; i < 3; i++) store.recordFact({ task_id: id, kind: 'blocker', statement: 'late-' + i }, 'run-a')
+  const first = store.boardPage({ view: 'late_blockers', limit: 1 }, 'run-a')
+  const blocker = first.late_blockers[0].fact_id
+  store.handle.prepare('INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at,resolves_fact_id) VALUES(?,?,?,?,?,?,?)')
+    .run(id, 'run-a', 'decision', 'resolved by migrated evidence', 'CONFIRMED', 'now', blocker)
+  assert.throws(() => store.boardPage({ view: 'late_blockers', limit: 1,
+    cursor: first.pagination.next_cursor, page_token: first.pagination.page_token }, 'run-a'),
+  { code: 'E_PAGE_CHANGED' })
+})
+test('pending status changes and later inserted tasks preserve an existing cohort including NULL scope', t => {
+  const store = tempStore(t)
+  for (const run of ['run-a', null]) {
+    const ids = seed(store, 4, 0, run), first = store.boardPage({ limit: 1 }, run)
+    store.claimTask({ task_id: ids[2], child_id: 'worker' }, run)
+    store.openTask('new above the ceiling', run)
+    const second = store.boardPage({ cursor: first.pagination.next_cursor,
+      page_token: first.pagination.page_token, limit: 3 }, run)
+    assert.deepEqual(second.tasks.map(row => row.id), ids.slice(0, 3).reverse())
+  }
+})
+test('late tokens continue across display containers while task and late cursors stay independent', t => {
+  const store = tempStore(t), ids = seed(store, 4, 0)
+  store.closeTask({ task_id: ids[0], result: 'failed' }, 'run-a')
+  for (let i = 0; i < 4; i++) store.recordFact({ task_id: ids[0], kind: 'blocker', statement: 'late-' + i }, 'run-a')
+  const first = store.boardPage({ limit: 1 }, 'run-a')
+  const summary = store.boardPage({ view: 'summary', limit: 1,
+    late_cursor: first.late_pagination.next_cursor, late_page_token: first.late_pagination.page_token }, 'run-a')
+  const late = store.boardPage({ view: 'late_blockers', limit: 1,
+    cursor: summary.late_pagination.next_cursor, page_token: summary.late_pagination.page_token }, 'run-a')
+  assert.equal(late.late_blockers[0].fact_id, first.late_blockers[0].fact_id - 2)
+  const tasks = store.boardPage({ limit: 1, cursor: first.pagination.next_cursor,
+    page_token: first.pagination.page_token }, 'run-a')
+  assert.equal(tasks.tasks[0].id, ids[2])
+  assert.equal(tasks.late_blockers[0].fact_id, first.late_blockers[0].fact_id)
+})

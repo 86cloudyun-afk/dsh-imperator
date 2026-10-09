@@ -255,3 +255,29 @@ test('semantic failure parsing excludes external tools, quoted errors and incomp
   ])
   assert.equal(guard.foldGuardSignal(successful, { echoFailures: 6, detectStall: false }).signal, undefined)
 })
+
+test('semantic failures need matched names and a single complete text envelope', () => {
+  const wrongName = semanticEvents().map(event => event.type !== 'tool/result' ? event
+    : { ...event, data: { message: { ...event.data.message,
+      source: { ...event.data.message.source, toolName: 'read' } } } })
+  assert.equal(guard.foldGuardSignal(wrongName, { echoFailures: 6, detectStall: false }).signal, undefined)
+  const blocks = semanticEvents().map(event => event.type !== 'tool/result' ? event
+    : { ...event, data: { message: { ...event.data.message,
+      content: [...event.data.message.content, { type: 'text', text: 'extra' }] } } })
+  assert.equal(guard.foldGuardSignal(blocks, { echoFailures: 6, detectStall: false }).signal, undefined)
+  const noCode = JSON.stringify({ ok: false, error: 'unknown service error', code: null, hint: 'inspect service' })
+  assert.equal(guard.foldGuardSignal(semanticEvents('task_child_send', noCode),
+    { echoFailures: 6, detectStall: false }).signal, 'echo')
+})
+test('semantic ECHO warnings acknowledge durable evidence without changing request effort', async () => {
+  const h = harness({ echoFailures: 6 })
+  h.agent.session.events = semanticEvents()
+  const request = { reasoningEffort: 'max' }
+  assert.equal(await h.request(request), request)
+  const warning = (await h.pre()).messages[0]
+  assert.equal(warning?.source.signal, 'echo')
+  assert.equal(await h.request(request), request)
+  const resumed = harness({ echoFailures: 6 })
+  resumed.agent.session.events = [...h.agent.session.events, { type: 'user/message', data: warning }]
+  assert.equal((await resumed.pre()).messages.length, 0)
+})

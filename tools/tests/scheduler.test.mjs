@@ -366,3 +366,20 @@ test('reader close rejection remains the outcome even when cleanup replaces nati
     version: '0.2.0-rc.2', session, persistence: backend,
   }), error => error === closeFailure)
 })
+
+test('checkpoint compares underlying Cordis service identities across fresh contextual proxies', async () => {
+  const original = Symbol.for('cordis.original')
+  const session = { header: { id: 's' }, snapshotEvents: () => [] }
+  const sessions = { get: () => session, async flush() { return true } }
+  let target = sessions, replace = false
+  const backend = { async flush() {}, async open() {
+    return { id: 's', access: 'read', header: session.header, async read() { return [] },
+      async close() { if (replace) target = { ...sessions } } }
+  } }
+  const ctx = { get: name => name === 'sessions'
+    ? new Proxy(target, { get: (object, key) => key === original ? object : object[key] }) : backend }
+  const args = { version: '0.2.0-rc.2', session, persistence: backend }
+  assert.equal((await host.flushNativeCheckpoint(ctx, args)).native_enabled, false)
+  replace = true
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), code('E_SCHEDULER_CAPABILITY'))
+})

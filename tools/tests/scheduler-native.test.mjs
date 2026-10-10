@@ -51,6 +51,14 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
     assert.equal(after.length, before.length + 1)
     assert.ok(Object.isFrozen(after.at(-1)))
     console.log('SCHEDULER_SNAPSHOT_VERIFIED ' + JSON.stringify({ version, frozen: true, reused_until_append: true, stable_previous_length: before.length, frozen_event: true }))
+    const sessionsBefore = ctx.get('sessions'), sessionsAgain = ctx.get('sessions')
+    const original = Symbol.for('cordis.original')
+    assert.notEqual(sessionsBefore, sessionsAgain)
+    assert.equal(typeof sessionsBefore[original], 'object')
+    assert.ok(sessionsBefore[original])
+    assert.equal(sessionsBefore[original], sessionsAgain[original])
+    assert.equal(sessionsAgain.get(child.agent.id), child.agent.session)
+    console.log('SCHEDULER_SERVICE_IDENTITY_VERIFIED ' + JSON.stringify({ version, fresh_contextual_proxy: true, exact_original_target: true }))
     const backend = ctx.get('sessionPersistence')
     const checkpoint = await helpers.flushNativeCheckpoint(ctx, { version, session: child.agent.session, persistence: backend })
     assert.equal(checkpoint.session_id, child.agent.id)
@@ -60,7 +68,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
     assert.equal(checkpoint.quiescence_proven, false)
     assert.equal(requests, 0)
     const requireHost = createRequire(anchor)
-    for (const name of ['dsh-agent', 'dsh-session', 'dsh-session-persistence', 'dsh-session-persistence-jsonl', 'dsh-subprocess']) {
+    for (const name of ['cordis', 'dsh-agent', 'dsh-session', 'dsh-session-persistence', 'dsh-session-persistence-jsonl', 'dsh-subprocess']) {
       const entry = requireHost.resolve('@deepseek-ai/' + name)
       const bytes = readFileSync(entry)
       let directory = dirname(entry), manifest

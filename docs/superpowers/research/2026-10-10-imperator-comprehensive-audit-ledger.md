@@ -19,3 +19,7 @@ Known issues43/44/46/48/52/57/59 have current-source defects. Issue53 is an inte
 Tasks1–7 pending genuine RED/GREEN and independent review. No production correction, PR or merge performed for this audit yet. Dynamic isolated V8 real-dispatcher boundary reproduction of service-loss replay reported by recovery audit; real node/SQLite regression required before correction. A workflow audit agent was platform-interrupted; its completed source findings are retained and implementation will be reassigned.
 
 PR/merge/main completion is recorded by parent only after actual gates. The source plan does not assert its own future merge.
+
+## Ownership and current execution
+
+Task2 granted submit-status-code.test.mjs for the obsolete updated_at fixture; Task5 granted host-api-contract.test.mjs for real anchor-enabled native guard parity. Tasks1/2/3/5/6 have tests-only isolated commits in real Actions; Task4 is dispatched. No production fix or audit PR merged yet. Managed executor is now definitively failed again; Actions remain the actual execution path.

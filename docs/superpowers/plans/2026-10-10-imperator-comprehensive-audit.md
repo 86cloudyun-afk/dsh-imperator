@@ -35,7 +35,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 
 ### Task 2: Repair store reporting and submission chronology
 
-**Files:** `lib/store/index.js`, `lib/store/board-page.js`, `tools/tests/submit-audit-attribution.test.mjs`, `tools/tests/store-evidence.test.mjs`, `tools/tests/store-scope-integrity.test.mjs`, `tools/tests/board-pagination.test.mjs`, `docs/STORE.md`
+**Files:** `lib/store/index.js`, `lib/store/board-page.js`, `tools/tests/submit-audit-attribution.test.mjs`, `tools/tests/store-evidence.test.mjs`, `tools/tests/store-scope-integrity.test.mjs`, `tools/tests/board-pagination.test.mjs`, `tools/tests/submit-status-code.test.mjs`, `docs/STORE.md`
 **Interfaces:** migrate/unassignedSummary/apply boot diagnostics; acceptTask.resolved_blockers; submitTask/closeTask submitted_at; statsAllRuns.blockers_late; scope_integrity_totals.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-2-brief.md
 
@@ -71,7 +71,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 
 ### Task 5: Repair scope activation and ambiguous guard outcomes
 
-**Files:** `lib/plugins/scope-membership.mjs`, `lib/plugins/guard.mjs`, `tools/tests/preset-isolation.test.mjs`, `tools/tests/guard-causality.test.mjs`, `docs/PRESET_ISOLATION.md`, `docs/RELIABILITY.md`
+**Files:** `lib/plugins/scope-membership.mjs`, `lib/plugins/guard.mjs`, `tools/tests/preset-isolation.test.mjs`, `tools/tests/guard-causality.test.mjs`, `tools/tests/host-api-contract.test.mjs`, `docs/PRESET_ISOLATION.md`, `docs/RELIABILITY.md`
 **Interfaces:** createScopeMembership resolution invariant; guard event projection and echo/demotion behavior.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-5-brief.md
 
@@ -105,3 +105,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 - [ ] Verify full six-job available matrix and write task report with exact-head evidence.
 - [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
 
+
+## Ownership amendments
+
+Task2 also owns the existing submit-status-code fixture: preserve its no-write assertions, but pin submitted_at after the genuine chronology RED. Task5 also owns one native guard parity hunk in host-api-contract, the existing anchor-enabled stage, avoiding an ineffective skipped node:test check. All implementers retain the frozen234a789 production base; these grants do not authorize other files.

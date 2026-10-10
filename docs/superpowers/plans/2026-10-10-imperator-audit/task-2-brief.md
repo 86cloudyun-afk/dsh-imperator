@@ -14,6 +14,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 - tools/tests/store-evidence.test.mjs
 - tools/tests/store-scope-integrity.test.mjs
 - tools/tests/board-pagination.test.mjs
+- tools/tests/submit-status-code.test.mjs
 - docs/STORE.md
 
 ## Interfaces
@@ -26,7 +27,7 @@ Only NULL receipt/waiver diagnostics and boot warning;0/1/2 distinct resolved bl
 
 ## Implementation approach
 
-Add nullable TEXT task.submitted_at migration and project field; stamp actual submission transition only. Reuse existing evidence predicates and five-table diagnostics. Count recovery integrity using scope-safe joins; healthy output retains prior shape. Wrap all-runs multiquery reads in existing deferred snapshot helper.
+Preserve submit-status zero-write idempotence assertions; after genuine RED, update the obsolete fixture to pin actual submitted_at rather than updated_at. Add nullable TEXT task.submitted_at migration and project field; stamp actual submission transition only. Reuse existing evidence predicates and five-table diagnostics. Count recovery integrity using scope-safe joins; healthy output retains prior shape. Wrap all-runs multiquery reads in existing deferred snapshot helper.
 
 ## Sequence and report
 

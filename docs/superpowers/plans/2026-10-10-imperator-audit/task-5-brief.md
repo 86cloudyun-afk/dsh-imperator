@@ -12,6 +12,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 - lib/plugins/guard.mjs
 - tools/tests/preset-isolation.test.mjs
 - tools/tests/guard-causality.test.mjs
+- tools/tests/host-api-contract.test.mjs
 - docs/PRESET_ISOLATION.md
 - docs/RELIABILITY.md
 
@@ -25,7 +26,7 @@ Direct resolution lacks either/both native functions→activation error; direct 
 
 ## Implementation approach
 
-Apply native export contract symmetrically after successful resolution. Classify unknown outcomes independently of definite failure using actual shared tool event envelopes; no memory/projection optimization unrelated to the bug.
+Place actual native guard parity in the existing host-api-contract anchor-enabled stage; do not claim a skipped node:test fixture proves native parity. Apply native export contract symmetrically after successful resolution. Classify unknown outcomes independently of definite failure using actual shared tool event envelopes; no memory/projection optimization unrelated to the bug.
 
 ## Sequence and report
 

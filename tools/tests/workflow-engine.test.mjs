@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { randomUUID } from 'node:crypto'
 import { writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -7,7 +8,7 @@ import { Worker } from 'node:worker_threads'
 import { TaskforceStore } from '../../lib/store/index.js'
 import { TaskforceGovernor } from '../../lib/governor/index.js'
 import { TaskforceRecovery } from '../../lib/store/recovery.js'
-import { workflowAdmission } from '../../lib/store/workflow.js'
+import { workflowAdmission, workflowAudit, workflowDeliveryGate } from '../../lib/store/workflow.js'
 import { runTaskVerification } from '../../lib/tools/verification.js'
 import { tempStore } from './helpers.mjs'
 
@@ -630,4 +631,158 @@ test('historical completed fail-then-pass outcome keeps original acceptance repl
   assert.throws(() => f.store.acceptTask({ ...args, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }, run, lead), { code: 'E_TERMINAL' })
   assert.deepEqual(deliveryRows(f, id), before)
   assert.equal(f.store.taskOf(id, run).task.status, 'accepted')
+})
+
+/** Reproduce the exact durable writes of 0.4.0 (81b7ce6) after a nonpassing
+ * review: recordExecution(pending) resets stage/revision without advancing
+ * evidence_generation. Optional old artifact/review writes reproduce later
+ * crash boundaries. Completion still uses the real store and real Node output.
+ * SQL is intentional: the upgraded API must refuse these historical writes. */
+async function legacyReplacement(f, id, stage, dimension = 'requirements_result', result = 'fail') {
+  await f.verify(id)
+  const artifactArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const artifact = f.flow.recordArtifact(artifactArgs, run, worker)
+  const reviewArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key(),
+    revision_id: artifact.revision_id, requirements_result: 'pass', quality_result: 'pass', [dimension]: result,
+    findings: ['legacy failure requiring root return'] }
+  const failed = f.flow.recordReview(reviewArgs, run, reviewer)
+  const original = f.flow.state({ task_id: id }, run), db = f.store.open(), stamp = new Date().toISOString()
+  const receiptId = randomUUID()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.prepare("UPDATE workflow SET stage='test',revision_id=NULL,row_version=row_version+1,updated_at=? WHERE task_id=?").run(stamp, id)
+    db.prepare("INSERT INTO execution_receipt(receipt_id,task_id,run_id,evidence_generation,owner_session,actor_session,command,cwd,verification_files,status,started_at,call_id,root_call_id,parent_call_id,timeout_ms,snapshot) SELECT ?,task_id,run_id,evidence_generation,owner_session,actor_session,command,cwd,verification_files,'pending',?,?,'legacy-root',NULL,timeout_ms,snapshot FROM execution_receipt WHERE receipt_id=?")
+      .run(receiptId, stamp, 'legacy-call', artifact.receipt_id)
+    db.exec('COMMIT')
+  } catch (error) { db.exec('ROLLBACK'); throw error }
+  if (stage !== 'test') {
+    const processResult = spawnSync(process.execPath, ['--check', 'source.js'], { cwd: f.store.root, encoding: 'utf8' })
+    const completed = f.store.recordExecution({ task_id: id, receipt_id: receiptId, native_result: { isError: false,
+      value: { kind: 'foreground', exitCode: processResult.status, signal: processResult.signal, timedOut: false,
+        aborted: false, timeoutMs: 60000, stdout: { text: processResult.stdout, truncated: false },
+        stderr: { text: processResult.stderr, truncated: false } } } }, run, worker)
+    assert.equal(completed.verified, true)
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const task = db.prepare('SELECT * FROM task WHERE id=?').get(id)
+      let flow = db.prepare('SELECT * FROM workflow WHERE task_id=?').get(id)
+      const receipt = db.prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(receiptId)
+      const revision = Number(db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
+        .run(id, run, flow.plan_version, task.evidence_generation, worker.sessionId, receiptId, receipt.snapshot, receipt.logs, stamp).lastInsertRowid)
+      const args = { task_id: id, expected_version: flow.row_version, request_key: f.key() }
+      db.prepare("UPDATE workflow SET stage='review',revision_id=?,row_version=row_version+1,updated_at=? WHERE task_id=?").run(revision, stamp, id)
+      workflowAudit(db, task, 'recordArtifact', args, worker, flow.row_version, { task_id: id, receipt_id: receiptId,
+        snapshot: JSON.parse(receipt.snapshot), logs: JSON.parse(receipt.logs), evidence_generation: task.evidence_generation,
+        row_version: flow.row_version + 1, revision_id: revision })
+      if (stage === 'lead_acceptance') {
+        flow = db.prepare('SELECT * FROM workflow WHERE task_id=?').get(id)
+        const reviewId = Number(db.prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) VALUES(?,?,?,?,?,?,'pass','pass','[]',?)")
+          .run(id, run, revision, flow.plan_version, task.evidence_generation, reviewer.sessionId, stamp).lastInsertRowid)
+        const args = { task_id: id, expected_version: flow.row_version, request_key: f.key(), revision_id: revision,
+          requirements_result: 'pass', quality_result: 'pass', findings: [] }
+        db.prepare("UPDATE workflow SET stage='lead_acceptance',row_version=row_version+1,updated_at=? WHERE task_id=?").run(stamp, id)
+        workflowAudit(db, task, 'recordReview', args, reviewer, flow.row_version, { task_id: id, review_id: reviewId,
+          revision_id: revision, stage: 'lead_acceptance', row_version: flow.row_version + 1 })
+      }
+      db.exec('COMMIT')
+    } catch (error) { db.exec('ROLLBACK'); throw error }
+  }
+  const durable = deliveryRows(f, id)
+  f.store.close(); f.store.open()
+  assert.deepEqual(deliveryRows(f, id), durable, 'upgrade fixture must survive closing and reopening SQLite')
+  const state = f.flow.state({ task_id: id }, run)
+  assert.equal(state.stage, stage)
+  assert.equal(state.evidence_generation, original.evidence_generation)
+  assert.equal(state.plan_version, original.plan_version)
+  assert.equal(state.rework_count, 0)
+  if (stage === 'test') assert.equal(state.revision_id, null)
+  else assert.notEqual(state.revision_id, artifact.revision_id)
+  return { artifactArgs, artifact, reviewArgs, failed }
+}
+
+for (const stage of ['test', 'review', 'lead_acceptance']) {
+  for (const [dimension, result] of [['requirements_result','fail'], ['requirements_result','unverified'], ['quality_result','fail'], ['quality_result','unverified']]) {
+    test('legacy ' + stage + ' replacement preserves ' + dimension + '=' + result + ' failure until root return', async t => {
+      const f = fixture(t), id = f.open({ max_reworks: 0 })
+      await legacyReplacement(f, id, stage, dimension, result)
+      if (stage === 'lead_acceptance') f.store.submitTask({ task_id: id }, run, worker)
+      const before = deliveryRows(f, id), calls = f.executions()
+      if (stage === 'test') {
+        await assert.rejects(async () => {
+          await f.artifact(id); f.review(id)
+          assert.equal(f.accept(id).status, 'accepted', 'unfixed old-generation replacement reaches acceptance')
+        }, { code: 'E_WORKFLOW_STAGE' })
+      } else if (stage === 'review') {
+        assert.throws(() => f.review(id), { code: 'E_WORKFLOW_REVIEW' })
+      } else {
+        assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version,
+          request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_EVIDENCE' })
+      }
+      assert.equal(f.executions(), calls)
+      assert.deepEqual(deliveryRows(f, id), before)
+      assert.throws(() => f.change('returnForRework', id, { reason: 'no budget remains' }), { code: 'E_WORKFLOW_BUDGET' })
+      assert.deepEqual(deliveryRows(f, id), before)
+    })
+  }
+}
+
+for (const entry of ['pending', 'artifact', 'accept']) {
+  test('legacy cleared revision rejects direct ' + entry + ' through the shared failure gate', async t => {
+    const f = fixture(t), id = f.open({ max_reworks: 0 }); await legacyReplacement(f, id, 'test')
+    if (entry === 'accept') f.store.submitTask({ task_id: id }, run, worker)
+    const before = deliveryRows(f, id), calls = f.executions()
+    const action = entry === 'pending' ? () => f.store.recordExecution({ task_id: id, status: 'pending',
+      command: 'node --check source.js', timeout_ms: 60000, call_id: 'blocked', root_call_id: 'root' }, run, worker)
+      : entry === 'artifact' ? () => f.change('recordArtifact', id, {}, worker)
+      : () => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }, run, lead)
+    assert.throws(action, { code: entry === 'accept' ? 'E_WORKFLOW_EVIDENCE' : 'E_WORKFLOW_STAGE' })
+    assert.equal(f.executions(), calls)
+    assert.deepEqual(deliveryRows(f, id), before)
+  })
+}
+
+test('legacy replacement history preserves read-only replay and budgeted root-return recovery at every crash boundary', async t => {
+  for (const stage of ['test', 'review', 'lead_acceptance']) {
+    const f = fixture(t), id = f.open({ max_reworks: 1 })
+    const original = await legacyReplacement(f, id, stage)
+    let before = deliveryRows(f, id)
+    assert.deepEqual(f.flow.recordArtifact(original.artifactArgs, run, worker), original.artifact)
+    assert.deepEqual(f.flow.recordReview(original.reviewArgs, run, reviewer), original.failed)
+    assert.deepEqual(deliveryRows(f, id), before)
+    f.change('returnForRework', id, { reason: 'explicitly recover interrupted legacy replacement' }); f.claim(id)
+    await f.artifact(id); f.review(id)
+    assert.equal(f.accept(id).status, 'accepted')
+    const state = f.flow.state({ task_id: id }, run)
+    assert.equal(state.evidence_generation, 1)
+    assert.equal(state.rework_count, 1)
+    assert.notEqual(state.revision_id, original.artifact.revision_id)
+    before = deliveryRows(f, id)
+    assert.deepEqual(f.flow.recordArtifact(original.artifactArgs, run, worker), original.artifact)
+    assert.deepEqual(f.flow.recordReview(original.reviewArgs, run, reviewer), original.failed)
+    assert.deepEqual(deliveryRows(f, id), before)
+  }
+})
+
+test('historical failure association requires matching artifact task, run, plan and generation', async t => {
+  for (const dimension of ['task_id', 'run_id', 'plan_version', 'evidence_generation']) {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const db = f.store.open(), task = db.prepare('SELECT * FROM task WHERE id=?').get(id)
+    const flow = db.prepare('SELECT * FROM workflow WHERE task_id=?').get(id)
+    const prior = { ...db.prepare('SELECT * FROM workflow_artifact WHERE id=?').get(flow.revision_id) }
+    prior[dimension] = dimension === 'run_id' ? 'foreign artifact run' : prior[dimension] + 100
+    const revision = Number(db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
+      .run(prior.task_id, prior.run_id, prior.plan_version, prior.evidence_generation, prior.producer_session,
+        prior.receipt_id, prior.snapshot, prior.logs, prior.created_at).lastInsertRowid)
+    db.prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) VALUES(?,?,?,?,?,?,'fail','pass','[]','historical')")
+      .run(id, run, revision, flow.plan_version, task.evidence_generation, reviewer.sessionId)
+    // Isolate attribution from the separate public scope-integrity check: a
+    // foreign-run artifact attached to this task must still fail that check.
+    for (const action of ['review', 'accept']) assert.doesNotThrow(() => workflowDeliveryGate(db, task, flow, action))
+    if (dimension === 'run_id') {
+      assert.throws(() => f.review(id), error => error.code === 'E_STORE_INTEGRITY' && !error.message.includes(prior.run_id))
+    } else {
+      f.review(id)
+      assert.equal(f.accept(id).status, 'accepted')
+    }
+  }
 })

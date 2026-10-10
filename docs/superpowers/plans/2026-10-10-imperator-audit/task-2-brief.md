@@ -15,6 +15,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 - tools/tests/store-scope-integrity.test.mjs
 - tools/tests/board-pagination.test.mjs
 - tools/tests/submit-status-code.test.mjs
+- tools/tests/owner-session.test.mjs (only additive-migration expected-row fixture)
 - docs/STORE.md
 
 ## Interfaces

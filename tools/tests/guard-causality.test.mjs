@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import * as guard from '../../lib/plugins/guard.mjs'
+import { apply as applyTools } from '../../lib/tools/index.js'
+import { tempStore } from './helpers.mjs'
 
 const call = (id, args = { path: 'a' }, tool = 'read') =>
   ({ type: 'tool/call', data: { name: tool, arguments: args, callId: id } })
@@ -280,4 +282,246 @@ test('semantic ECHO warnings acknowledge durable evidence without changing reque
   const resumed = harness({ echoFailures: 6 })
   resumed.agent.session.events = [...h.agent.session.events, { type: 'user/message', data: warning }]
   assert.equal((await resumed.pre()).messages.length, 0)
+})
+
+const unknownNativeResult = id => ({ type: 'tool/result', data: {
+  message: { source: { callId: id }, isError: true, content: [{ type: 'text', text: 'uncommitted outcome' }] },
+  error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' },
+} })
+const unknownControlText = (status = 'unknown', code = 'E_CONTROL_OUTCOME_UNKNOWN') => JSON.stringify({
+  ok: false, error: 'external effect is unresolved', code,
+  hint: 'keep the original retry key; do not repeat the effect under another key',
+  operation: { status, retry_key: 'original-retry-key' },
+})
+const ambiguousNativeEvents = () => Array.from({ length: 3 }, (_, i) => [
+  call('unknown-' + i, { command: 'one fixed effect' }, 'bash'), unknownNativeResult('unknown-' + i),
+]).flat()
+
+test('matched native unknown effects do not produce definite-failure ECHO', () => {
+  assert.equal(signal(ambiguousNativeEvents()), undefined)
+})
+
+test('an ambiguous matched outcome breaks a definite failure tail and its replay cannot overwrite it', () => {
+  const events = [...failures('before', 2), call('ambiguous'), unknownNativeResult('ambiguous')]
+  assert.equal(signal(events), undefined)
+  assert.equal(signal([...events, result('ambiguous')]), undefined, 'first observed outcome remains ambiguous')
+  assert.equal(signal([...events, ...failures('after', 2)]), undefined)
+  assert.equal(signal([...events, ...failures('after', 3)]), 'echo', 'later definite failures still protect the agent')
+})
+
+test('definite TOOL_NOT_STARTED outcomes still produce ECHO', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [
+    call('not-started-' + i),
+    { type: 'tool/result', data: { message: { source: { callId: 'not-started-' + i }, isError: true },
+      error: { name: 'ToolNotStartedError', code: 'TOOL_NOT_STARTED' } } },
+  ]).flat()
+  assert.equal(signal(events), 'echo')
+})
+
+for (const [status, code] of [
+  ['pending', 'E_CONTROL_OUTCOME_UNKNOWN'], ['unknown', 'E_CONTROL_OUTCOME_UNKNOWN'],
+  ['unknown', 'PERSISTENCE_UNAVAILABLE'], ['unknown', null],
+]) {
+  test('durable ' + status + '/' + code + ' control effects do not produce definite-failure ECHO', () => {
+    assert.equal(guard.foldGuardSignal(semanticEvents('task_child_send', unknownControlText(status, code)),
+      { echoFailures: 6, detectStall: false }).signal, undefined)
+  })
+}
+
+test('PTC durable unknown control effects do not produce definite-failure ECHO', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [
+    { type: 'step/start', data: { turn: 1, step: i + 1 } },
+    call('unknown-root-' + i, { code: 'transport' }, 'run_code'),
+    { type: 'tool/ptc-dispatch-start', data: { rootCallId: 'unknown-root-' + i, subCallId: 'inner',
+      name: 'task_child_send', arguments: { target_id: 'child', message: 'continue' } } },
+    { type: 'tool/ptc-dispatch', data: { rootCallId: 'unknown-root-' + i, subCallId: 'inner',
+      isError: false, content: [{ type: 'text', text: unknownControlText() }] } },
+    result('unknown-root-' + i, false), { type: 'step/end', data: { turn: 1, step: i + 1 } },
+  ]).flat()
+  assert.equal(signal(events), undefined)
+})
+
+test('unknown controls cannot inject change-arguments guidance or arm effort demotion', async () => {
+  const h = harness({ stepDownRequests: 3 })
+  h.agent.session.events = semanticEvents('task_child_send', unknownControlText())
+  assert.deepEqual((await h.pre()).messages, [])
+  const request = { reasoningEffort: 'max' }
+  assert.equal(await h.request(request), request)
+})
+
+
+test('missing durable journal leaves prior effects ambiguous and cannot advise a replacement retry', async () => {
+  const unavailable = JSON.stringify({
+    ok: false, error: 'durable control journal is unavailable', code: 'E_CONTROL_JOURNAL_UNAVAILABLE',
+    hint: 'retain the original retry key and inspect receipts when the journal returns; do not replay',
+  })
+  assert.equal(guardModuleSignal(unavailable), undefined)
+  const h = harness({ stepDownRequests: 3 })
+  h.agent.session.events = semanticEvents('task_child_send', unavailable)
+  assert.deepEqual((await h.pre()).messages, [])
+  const request = { reasoningEffort: 'max' }
+  assert.equal(await h.request(request), request)
+})
+
+function guardModuleSignal(text) {
+  return guard.foldGuardSignal(semanticEvents('task_child_send', text),
+    { echoFailures: 6, detectStall: false }).signal
+}
+
+/** Real SQLite and registered tool handlers. Only the external interrupt boundary
+ * returns a fixture receipt; every replay passes through the production journal. */
+async function rejectedStopHistory(t, transport = 'native') {
+  const store = tempStore(t)
+  const run = 'guard-rejected-run', child = 'guard-rejected-child'
+  const args = { target_id: ' ' + child + ' ', request_key: ' original-rejected-key ' }
+  const events = [], agent = { id: run, session: { header: { id: run }, events } }
+  const definitions = new Map()
+  let effects = 0
+  applyTools({
+    logger: { warn() {} },
+    get(name) {
+      if (name === 'taskforceStore') return store
+      if (name === 'agents') return { get: id => id === run ? agent : undefined }
+      if (name === 'subagents') return {
+        async listChildren() { return [{ id: child, mode: 'continuable', createdAt: 0 }] },
+        interrupt(target, authority) {
+          assert.equal(target, child)
+          assert.equal(authority.agent, agent)
+          effects++
+          return { accepted: false }
+        },
+      }
+    },
+    tools: { register(definition) { definitions.set(definition.name, definition); return () => {} } },
+  })
+  const invoke = id => definitions.get('task_child_stop').execute(args, {
+    agent, callId: id, signal: new AbortController().signal,
+  })
+  const first = JSON.parse(await invoke('initial-rejection'))
+  assert.equal(first.ok, true, 'transport success is distinct from the initial explicit rejection')
+  assert.equal(first.stopped.accepted, false)
+  assert.equal(first.operation.status, 'rejected')
+  assert.equal(effects, 1)
+  const rows = () => store.open().prepare('SELECT * FROM control_operation ORDER BY id').all()
+  const before = rows()
+  assert.equal(before.length, 1)
+  assert.equal(before[0].request_key, args.request_key)
+  let receipt
+  for (let step = 1; step <= 6; step++) {
+    const id = 'rejected-replay-' + step
+    const text = await invoke(id)
+    receipt = JSON.parse(text)
+    assert.equal(receipt.ok, false)
+    assert.equal(receipt.code, 'E_CONTROL_OUTCOME_UNKNOWN', 'existing public replay code is retained')
+    assert.equal(receipt.operation.status, 'rejected')
+    assert.equal(receipt.operation.operation_id, first.operation.operation_id)
+    assert.equal(receipt.operation.retry_key, args.request_key)
+    assert.equal(receipt.operation.durable, true)
+    assert.equal(receipt.operation.replayed, true)
+    assert.equal(receipt.operation.invoke, false)
+    const encodedArgs = step % 2 ? args : JSON.stringify(args)
+    events.push({ type: 'step/start', data: { turn: 1, step } })
+    if (transport === 'native') {
+      events.push({ type: 'tool/call', data: { turn: 1, step, callId: id,
+        name: 'task_child_stop', arguments: encodedArgs } })
+      events.push({ type: 'tool/result', data: { turn: 1, step,
+        message: { isError: false, source: { callId: id, toolName: 'task_child_stop' },
+          content: [{ type: 'text', text }] } } })
+    } else {
+      events.push(call('wrapper-' + step, { code: 'transport ' + step }, 'run_code'))
+      events.push({ type: 'tool/ptc-dispatch-start', data: {
+        turn: 1, step, rootCallId: 'wrapper-' + step, subCallId: id,
+        name: 'task_child_stop', arguments: encodedArgs,
+      } })
+      events.push({ type: 'tool/ptc-dispatch', data: { turn: 1, step,
+        rootCallId: 'wrapper-' + step, subCallId: id, isError: false,
+        content: [{ type: 'text', text }] } })
+      events.push(result('wrapper-' + step, false))
+    }
+    events.push({ type: 'step/end', data: { turn: 1, step } })
+  }
+  assert.equal(effects, 1, 'six distinct same-key replays must dispatch zero additional interrupts')
+  assert.deepEqual(rows(), before, 'durable rejection and exact original key remain unchanged')
+  return { events, receipt, args }
+}
+
+for (const transport of ['native', 'PTC']) {
+  for (const surface of ['fold', 'projection', 'plugin']) {
+    test('durable rejected stop replay triggers ' + surface + ' ECHO through ' + transport, async t => {
+      const { events } = await rejectedStopHistory(t, transport)
+      if (surface === 'fold') {
+        assert.equal(guard.foldGuardSignal(events, { echoFailures: 6, detectStall: false }).signal, 'echo')
+      } else if (surface === 'projection') {
+        const projection = guard.createGuardProjection({ echoFailures: 6 })
+        let observed
+        for (let end = 1; end <= events.length; end++) observed = projection.read(events.slice(0, end))
+        assert.equal(observed.echo?.signal, 'echo')
+        assert.equal(projection.read(events).echo?.signal, 'echo', 'unchanged durable read remains stable')
+      } else {
+        const h = harness({ echoFailures: 6 })
+        h.agent.session.events = events
+        const request = { reasoningEffort: 'max' }
+        assert.equal(await h.request(request), request)
+        const messages = (await h.pre()).messages
+        assert.equal(messages.length, 1)
+        assert.equal(messages[0].source.signal, 'echo')
+        assert.match(messages[0].content[0].text, /停止重复同参失败调用/)
+        assert.doesNotMatch(messages[0].content[0].text, /original-rejected-key|guard-rejected-child/)
+        assert.equal(await h.request(request), request, 'TaskForce effort remains unchanged')
+        assert.equal((await h.pre()).messages.length, 0, 'one failure episode is not repeatedly injected')
+      }
+    })
+  }
+}
+
+function rewriteStopReceipts(events, rewrite) {
+  return events.map(event => event.type !== 'tool/result' ? event : {
+    ...event, data: { ...event.data, message: { ...event.data.message,
+      content: [{ type: 'text', text: JSON.stringify(rewrite(JSON.parse(event.data.message.content[0].text))) }] } },
+  })
+}
+test('incomplete or conflicting stop replay metadata retains the unknown barrier', async t => {
+  const { events } = await rejectedStopHistory(t)
+  for (const [variant, change] of [
+  ['missing operation', value => { delete value.operation }],
+  ['bare rejected status', value => { value.operation = { status: 'rejected' } }],
+  ['missing settlement time', value => { delete value.operation.ended_at }],
+  ['not durable', value => { value.operation.durable = false }],
+  ['still invokes', value => { value.operation.invoke = true }],
+  ['not replayed', value => { value.operation.replayed = false }],
+  ['different action', value => { value.operation.action = 'send' }],
+  ['different target', value => { value.operation.target_id = 'another-child' }],
+  ['different original key', value => { value.operation.retry_key = 'another-key' }],
+  ['missing row identity', value => { delete value.operation.id }],
+  ['conflicting message acceptance', value => { value.operation.message_id = 'accepted-message' }],
+  ['conflicting outcome code', value => { value.operation.error_code = 'UNAUTHORIZED' }],
+  ['task-bound metadata', value => { value.operation.task_id = 1 }],
+  ['generation-bound metadata', value => { value.operation.evidence_generation = 1 }],
+  ['journal unavailable', value => { value.code = 'E_CONTROL_JOURNAL_UNAVAILABLE' }],
+  ['pending status', value => { value.operation.status = 'pending'; value.operation.ended_at = null }],
+  ['unknown status', value => { value.operation.status = 'unknown' }],
+]) {
+    const uncertain = rewriteStopReceipts(events, value => { change(value); return value })
+    assert.equal(guard.foldGuardSignal(uncertain, { echoFailures: 6, detectStall: false }).signal, undefined, variant)
+    assert.equal(guard.createGuardProjection({ echoFailures: 6 }).read(uncertain).echo, undefined, variant)
+    const h = harness({ echoFailures: 6, stepDownRequests: 3 })
+    h.agent.session.events = uncertain
+    assert.deepEqual((await h.pre()).messages, [], variant)
+    const request = { reasoningEffort: 'max' }
+    assert.equal(await h.request(request), request, variant)
+  }
+})
+test('native TOOL_OUTCOME_UNKNOWN cannot be overridden by a rejected replay text envelope', async t => {
+  const { events } = await rejectedStopHistory(t)
+  const uncertain = events.map(event => event.type !== 'tool/result' ? event : {
+    ...event, data: { ...event.data, error: { code: 'TOOL_OUTCOME_UNKNOWN' } },
+  })
+  assert.equal(guard.foldGuardSignal(uncertain, { echoFailures: 6, detectStall: false }).signal, undefined)
+})
+test('one durable rejected replay result cannot manufacture six independent attempts', async t => {
+  const { events } = await rejectedStopHistory(t)
+  const first = events.slice(0, 4)
+  const oneResult = first.find(event => event.type === 'tool/result')
+  assert.equal(guard.foldGuardSignal([...first, ...Array(6).fill(oneResult)],
+    { echoFailures: 6, detectStall: false }).signal, undefined)
 })

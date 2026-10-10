@@ -26,7 +26,13 @@
 
 ## 长任务与子代理停止的诊断边界
 
-连续任务工具失败现在参与 ECHO：例如同参数 `task_child_send` 六次返回完整 `ok:false` 错误回执，即使 DSH 的 `isError=false`（文本传输成功），也会提示停止重复调用。判定绑定真实 callId/turn/step 和已注册工具名，同时支持 native 与 PTC。ECHO 不执行子代理取消；preset 的 STALL 仍只观察，reasoning effort 保持路由选择。该回归修复的是失败检测，不能据此断言所有进程退出或子代理停止均已修复。
+连续且结果确定的任务工具失败参与 ECHO：例如同参数 `task_child_send` 六次返回完整 `ok:false` 的 `E_CHILD_NOT_OWN` 回执，即使 DSH 的 `isError=false`（文本传输成功），也会提示停止重复调用。判定绑定真实 callId/turn/step 和已注册工具名，同时支持 native 与 PTC。`TOOL_NOT_STARTED` 等确定失败仍参与熔断。
+
+已结算的明确停止拒绝可参与 ECHO：首次 `task_child_stop` 的 `stopped.accepted:false` 持久记录为 `rejected`；同原键重放仍沿用兼容错误码 `E_CONTROL_OUTCOME_UNKNOWN`，但完整且一致的 durable/replayed、invoke:false 回执绑定同一目标与原键，并带结算时间、空 message_id/error_code 时，证明该次停止请求被明确拒绝。六个独立调用重读这一回执可触发 ECHO，宿主 interrupt 总计只执行首次一次；初次 `ok:true` 只表示工具传输成功。仅有 `status:rejected`、缺字段、目标/键不匹配或矛盾回执不构成这个例外。绑定仅保留摘要，警告不输出原参数或原键。
+
+外部效果不明不算确定失败：原生 `TOOL_OUTCOME_UNKNOWN`，以及子代理控制工具的 `E_CONTROL_OUTCOME_UNKNOWN`（上文完整明确拒绝重放除外）、`E_CONTROL_JOURNAL_UNAVAILABLE` 或 operation.status 为 `pending`/`unknown` 的完整错误回执都会截断连续失败尾部。首次匹配到的不明结果不会被重复结果改写；这些结果不会触发 ECHO 的换工具/换参数提示，也不会武装推理档位下调。保留原 retry_key，待日志可用后读取回执；缺少日志不能证明旧效果未发生，不应换键重发。
+
+ECHO 不执行子代理取消；preset 的 STALL 仍只观察，reasoning effort 保持路由选择。该回归修复的是失败检测，不能据此断言所有进程退出或子代理停止均已修复。
 
 另有宿主条件性风险：官方 DSH 0.2.0-rc.2 的 headless 入口在 root 空闲后直接退出，没有等待后代；退出清理可以中断仍运行的子代理。当前官方主线已加入 `waitForChildren` 与 root 再检查（见 [headless 源码](https://github.com/deepseek-ai/deepseek-harness/blob/d743267388641bc76f17c45ce8b4c231aed1d32c/packages/bundle/headless/src/index.ts)）。截至 2026-10-09 已发布的 0.2.1-alpha.2 是预发布版；本修复保持现有 rc.2 宿主验收基线，没有自动替换宿主。此问题只在实际采用该 headless 生命周期时适用，不能推断 Web/TUI/SDK 用户遇到的停止原因。
 

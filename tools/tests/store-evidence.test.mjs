@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { STORE_CODES } from '../../lib/store/index.js'
+import { STORE_CODES, PENDING_STATUSES } from '../../lib/store/index.js'
 import { tempStore } from './helpers.mjs'
 
 const run = 'run-a'
@@ -117,4 +117,67 @@ test('migration rebuilds an old run board view without changing its columns', (t
   assert.deepEqual(store.handle.prepare('PRAGMA table_info(v_run_board)').all().map((row) => row.name),
     ['run_id', 'id', 'title', 'status', 'owner', 'fact_count', 'blockers_open'])
   assert.equal(store.handle.prepare('SELECT blockers_open FROM v_run_board WHERE id = ?').get(id).blockers_open, 1)
+})
+
+
+for (const count of [0, 1, 2]) test('acceptance reports ' + count + ' distinct resolved blockers', t => {
+  const store = tempStore(t), id = open(store)
+  fact(store, id, 'artifact')
+  for (let i = 0; i < count; i++) {
+    const blocker = fact(store, id, 'blocker')
+    fact(store, id, 'decision', 'CONFIRMED', { resolves_fact_id: blocker })
+    fact(store, id, 'decision', 'PLAUSIBLE', { resolves_fact_id: blocker })
+  }
+  submit(store, id)
+  assert.equal(store.acceptTask({ task_id: id }, run, 'lead').resolved_blockers, count)
+})
+
+test('REFUTED historical decisions do not count as resolved blockers or permit acceptance', t => {
+  const store = tempStore(t), id = open(store)
+  fact(store, id, 'artifact')
+  const blocker = fact(store, id, 'blocker')
+  rawResolution(store, id, blocker, 'decision', 'REFUTED')
+  submit(store, id)
+  assert.throws(() => store.acceptTask({ task_id: id }, run, 'lead'), { code: STORE_CODES.blockers })
+  fact(store, id, 'decision', 'CONFIRMED', { resolves_fact_id: blocker })
+  assert.equal(store.acceptTask({ task_id: id }, run, 'lead').resolved_blockers, 1)
+})
+
+test('terminal unresolved blockers remain visible even when recorded before cancellation', t => {
+  const store = tempStore(t), id = open(store)
+  const recorded = store.recordFact({ task_id: id, kind: 'blocker', statement: 'preclosure blocker' }, run)
+  assert.equal(recorded.late, false)
+  store.closeTask({ task_id: id, result: 'failed' }, run, 'lead')
+  assert.equal(store.board({}, run).late_blockers[0].blockers[0].fact_id, recorded.fact_id)
+  assert.equal(store.boardPage({}, run).late_blockers[0].fact_id, recorded.fact_id)
+  assert.equal(store.stats(run).blockers_late, 1)
+  const detail = store.board({ task_id: id }, run)
+  assert.equal(detail.task.blockers, 1)
+  assert.doesNotMatch(detail.note, /收口之后落下/, 'current terminal collection is not an insertion-time claim')
+})
+
+test('all-runs blocker statistics include every pending state, terminal and NULL scope', t => {
+  const store = tempStore(t)
+  for (const scope of ['run-a', 'run-b', null]) {
+    for (const status of PENDING_STATUSES) {
+      const id = store.openTask({ title: status }, scope).task_id
+      store.handle.prepare('UPDATE task SET status=? WHERE id=?').run(status, id)
+      store.recordFact({ task_id: id, kind: 'blocker', statement: 'pending' }, scope)
+    }
+    const closed = store.openTask({ title: 'terminal' }, scope).task_id
+    store.closeTask({ task_id: closed, result: 'failed' }, scope, 'lead')
+    const blocker = store.recordFact({ task_id: closed, kind: 'blocker', statement: 'terminal unresolved' }, scope).fact_id
+    store.handle.prepare("INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at,resolves_fact_id) VALUES(?,?,'decision','invalid','REFUTED','now',?)")
+      .run(closed, scope, blocker)
+    store.handle.prepare("INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,'blocker','FOREIGN_SECRET','PLAUSIBLE','now')")
+      .run(closed, scope === null ? 'foreign' : null)
+  }
+  const domains = ['run-a', 'run-b', null].map(scope => store.stats(scope))
+  const global = store.statsAllRuns()
+  assert.equal(global.blockers_open, domains.reduce((sum, value) => sum + value.blockers_open, 0))
+  assert.equal(global.blockers_late, domains.reduce((sum, value) => sum + value.blockers_late, 0))
+  assert.equal(global.blockers_open, 12)
+  assert.equal(global.blockers_late, 3)
+  assert.equal(global.facts.total, 21, 'explicit global facts retain raw-row statistics')
+  assert.doesNotMatch(JSON.stringify(global), /FOREIGN_SECRET/)
 })

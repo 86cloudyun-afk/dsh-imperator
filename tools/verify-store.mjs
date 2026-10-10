@@ -232,7 +232,7 @@ check(
 
 const colsOf = (table) => inspect.prepare(`PRAGMA table_info(${table})`).all().map((r) => r.name)
 /* v2 起三表各多出 run 归属列；fact 另有 resolves_fact_id（未解 blocker 的机械判据）。 */
-const COLS_TASK = ['id', 'title', 'note', 'status', 'owner', 'owner_session', 'run_id', 'created_at', 'updated_at', 'evidence_policy', 'verification_files', 'verification_command', 'verification_cwd', 'evidence_generation']
+const COLS_TASK = ['id', 'title', 'note', 'status', 'owner', 'owner_session', 'run_id', 'created_at', 'updated_at', 'evidence_policy', 'verification_files', 'verification_command', 'verification_cwd', 'evidence_generation', 'submitted_at']
 const COLS_FACT = ['id', 'task_id', 'kind', 'statement', 'evidence_path', 'evidence_line', 'confidence', 'created_by', 'actor_session', 'run_id', 'resolves_fact_id', 'created_at']
 const COLS_HANDOFF = ['id', 'task_id', 'from_child', 'to_child', 'note', 'run_id', 'created_at']
 

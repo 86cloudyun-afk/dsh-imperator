@@ -27,6 +27,9 @@ test('unchanged cursor reread compares its full prefix without reading it again 
   const events = new Proxy(source, { get(target, key, receiver) {
     if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) indexedReads++
     return Reflect.get(target, key, receiver)
+  }, getOwnPropertyDescriptor(target, key) {
+    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) indexedReads++
+    return Reflect.getOwnPropertyDescriptor(target, key)
   } })
   const cursor = createEventCursor()
   cursor.read(events)

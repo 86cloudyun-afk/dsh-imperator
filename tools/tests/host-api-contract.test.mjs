@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { resolveInstallAnchor } from '../host-runtime.mjs'
+import { foldGuardSignal, createGuardProjection } from '../../lib/plugins/guard.mjs'
 
 /**
  * 宿主 API 符号锚点契约（**不依赖行号**）。
@@ -98,4 +99,47 @@ test('dsh-tools 必须导出可用的 defineTool（工具注册行的硬依赖�
   // 说明：本守卫只断言**符号锚点**（跨版本改名/移除检测）。defineTool 的**调用形状**
   // （必填 output 等字段、schema 编译）由既有 native 测试覆盖：lib/tools/index.js
   // 用它注册全部 10 个工具，verify-host / preset-isolation / host-boundaries 走真实注册路径。
+})
+
+/** Public SDK constructors and durable Session records provide the actual wire
+ * shape; only the unavailable external effect is represented by its receipt. */
+async function nativeGuardOutcomeHistory(kind) {
+  const [{ Session }, { createToolResultMessage }] = await Promise.all([
+    importHost('dsh-session', 'lib/index.js'), importHost('dsh-llm', 'lib/index.js'),
+  ])
+  const session = Session.create('guard-outcome-' + kind)
+  for (let step = 1; step <= 3; step++) {
+    const callId = 'same-provider-id'
+    const durable = kind === 'durable-unknown'
+    session.append('step/start', { turn: 1, step })
+    const invoked = session.append('tool/call', { turn: 1, step, callId,
+      name: durable ? 'task_child_send' : 'bash',
+      arguments: durable ? '{"target_id":"child","message":"continue"}' : '{"command":"one fixed effect"}' })
+    const receipt = durable ? JSON.stringify({
+      ok: false, error: 'external effect is unresolved', code: 'E_CONTROL_OUTCOME_UNKNOWN',
+      hint: 'retain the original retry key; do not repeat effects',
+      operation: { status: 'unknown', retry_key: 'original-retry-key' },
+    }) : 'uncommitted outcome'
+    session.append('tool/result', { turn: 1, step,
+      message: createToolResultMessage({ callId, content: [{ type: 'text', text: receipt }], isError: !durable }),
+      ...(durable ? {} : { error: {
+        name: kind === 'native-unknown' ? 'ToolOutcomeUnknownError' : 'ToolNotStartedError',
+        code: kind === 'native-unknown' ? 'TOOL_OUTCOME_UNKNOWN' : 'TOOL_NOT_STARTED',
+      } }),
+    }, { surfaceOp: 'append', sourceEventSeqs: [invoked.seq] })
+    session.append('step/end', { turn: 1, step })
+  }
+  return session.snapshotEvents()
+}
+
+for (const kind of ['native-unknown', 'durable-unknown']) {
+  test('native SDK result shape does not classify ' + kind + ' as definite-failure ECHO', { skip }, async () => {
+    const events = await nativeGuardOutcomeHistory(kind)
+    assert.equal(foldGuardSignal(events, { echoFailures: 3, detectStall: false }).signal, undefined)
+    assert.equal(createGuardProjection({ echoFailures: 3 }).read(events).echo, undefined)
+  })
+}
+test('native SDK definite TOOL_NOT_STARTED result shape still triggers ECHO', { skip }, async () => {
+  const events = await nativeGuardOutcomeHistory('not-started')
+  assert.equal(foldGuardSignal(events, { echoFailures: 3, detectStall: false }).signal, 'echo')
 })

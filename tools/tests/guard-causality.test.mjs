@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import * as guard from '../../lib/plugins/guard.mjs'
-import { nativeModule, resolveInstallAnchor } from '../host-runtime.mjs'
 
 const call = (id, args = { path: 'a' }, tool = 'read') =>
   ({ type: 'tool/call', data: { name: tool, arguments: args, callId: id } })
@@ -348,27 +347,3 @@ test('unknown controls cannot inject change-arguments guidance or arm effort dem
   assert.equal(await h.request(request), request)
 })
 
-let unknownOutcomeAnchor, unknownOutcomeSkip = false
-try { unknownOutcomeAnchor = resolveInstallAnchor({}) }
-catch (error) { unknownOutcomeSkip = 'native SDK result parity requires a DSH installation: ' + error.message }
-test('native SDK result constructors preserve the unknown-effect ECHO boundary', { skip: unknownOutcomeSkip }, async () => {
-  const [{ Session }, { createToolResultMessage }] = await Promise.all([
-    nativeModule(unknownOutcomeAnchor, '@deepseek-ai/dsh-session'),
-    nativeModule(unknownOutcomeAnchor, '@deepseek-ai/dsh-llm'),
-  ])
-  const session = Session.create('guard-unknown-outcome-native')
-  for (let step = 1; step <= 3; step++) {
-    const callId = 'same-provider-id'
-    session.append('step/start', { turn: 1, step })
-    const invoked = session.append('tool/call', { turn: 1, step, callId, name: 'bash',
-      arguments: '{"command":"one fixed effect"}' })
-    session.append('tool/result', { turn: 1, step,
-      message: createToolResultMessage({ callId, content: [{ type: 'text', text: 'uncommitted outcome' }], isError: true }),
-      error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' },
-    }, { surfaceOp: 'append', sourceEventSeqs: [invoked.seq] })
-    session.append('step/end', { turn: 1, step })
-  }
-  const events = session.snapshotEvents()
-  assert.equal(signal(events), undefined)
-  assert.equal(guard.createGuardProjection({ echoFailures: 3 }).read(events).echo, undefined)
-})

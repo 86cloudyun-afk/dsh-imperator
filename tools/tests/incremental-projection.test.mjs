@@ -183,10 +183,10 @@ test('runtime guard thresholds replay on effort changes, without downgrading req
   assert.equal((await h.pre(a)).messages[0]?.source.signal, 'stall')
 })
 
-// Observing data reads through a frozen proxy distinguishes runtime reducer
-// reuse from a full fold without exposing test-only caches in production.
+// A Proxy over a frozen target can invent changing absent properties. Such
+// histories must replay; ordinary JSON reducer reuse is covered above.
 for (const plugin of [guard, context]) {
-  test(`${plugin.name} runtime reduces immutable events once and resets at session/scope changes`, async () => {
+  test(`${plugin.name} runtime conservatively replays Proxy graphs across session/scope changes`, async () => {
     const h = runtime(plugin, { stallAction: 'observe', stepDownRequests: 0 })
     let dataReads = 0
     const counted = new Proxy(freeze(call('child', 'subagent')), {
@@ -200,14 +200,16 @@ for (const plugin of [guard, context]) {
     assert.ok(dataReads > 0)
     dataReads = 0
     await h.pre(a)
-    assert.equal(dataReads, 0, 'unchanged immutable runtime history must not be reduced again')
+    assert.ok(dataReads > 0, 'Proxy graphs must replay even when their targets are frozen')
     const b = { ctx: a.ctx, session: a.session }
+    dataReads = 0
     await h.pre(b)
     assert.ok(dataReads > 0, 'another agent must have an independent reducer')
     dataReads = 0
     await h.pre(a)
-    assert.equal(dataReads, 0)
+    assert.ok(dataReads > 0, 'a reused agent must still replay a Proxy graph')
     a.session = { header: { id: 'same' }, events: [counted] }
+    dataReads = 0
     await h.pre(a)
     assert.ok(dataReads > 0, 'same-ID replacement session must replay')
     dataReads = 0

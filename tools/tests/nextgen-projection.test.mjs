@@ -21,22 +21,21 @@ function runtime() {
 }
 const text = result => result.messages[0]?.content[0]?.text
 
-// A second full copy adds N indexed reads beyond the mandatory N comparisons.
-test('unchanged cursor reread compares its full prefix without reading it again for a copy', () => {
-  const source = freeze(Array.from({ length: 1024 }, (_, i) => call(String(i))))
-  let indexedReads = 0
-  const events = new Proxy(source, { get(target, key, receiver) {
-    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) indexedReads++
-    return Reflect.get(target, key, receiver)
-  }, getOwnPropertyDescriptor(target, key) {
-    if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) indexedReads++
-    return Reflect.getOwnPropertyDescriptor(target, key)
-  } })
+// Observe the former full-prefix slice without introducing a Proxy graph.
+test('unchanged cursor reread retains its prefix without slicing the history', () => {
+  const events = freeze(Array.from({ length: 1024 }, (_, i) => call(String(i))))
   const cursor = createEventCursor()
   cursor.read(events)
-  indexedReads = 0
-  assert.deepEqual(cursor.read(events), { reset: false, events: [] })
-  assert.ok(indexedReads <= source.length + 2, 'unchanged reread performed ' + indexedReads + ' indexed reads')
+  const original = Array.prototype.slice
+  let historySlices = 0
+  try {
+    Array.prototype.slice = function (...args) {
+      if (this === events) historySlices++
+      return Reflect.apply(original, this, args)
+    }
+    assert.deepEqual(cursor.read(events), { reset: false, events: [] })
+    assert.equal(historySlices, 0, 'unchanged history must not be sliced for a replacement prefix')
+  } finally { Array.prototype.slice = original }
 })
 
 test('outer accessor histories never establish a reusable immutable prefix', () => {
@@ -65,22 +64,26 @@ test('mutable outer arrays retain private prefixes through append, replacement, 
   assert.equal(cursor.read(events).reset, true)
 })
 
-test('runtime context does not reread historical TODO payloads after the first immutable projection', async () => {
+test('runtime context does not reproject historical TODO payloads after the first immutable projection', async () => {
+  const event = freeze(todo('current task')), todos = event.data.todos
+  const original = Array.prototype.filter
   let todoReads = 0
-  const counted = new Proxy(freeze(todo('current task')), { get(target, key, receiver) {
-    if (key === 'data') todoReads++
-    return Reflect.get(target, key, receiver)
-  } })
-  const h = runtime()
-  const agent = { session: { header: { id: 'root' }, events: [counted, freeze(call('a'))] } }
-  assert.match(text(await h.pre(agent)), /current task/)
-  assert.ok(todoReads > 0)
-  todoReads = 0
-  assert.match(text(await h.pre(agent)), /current task/)
-  assert.equal(todoReads, 0, 'immutable TODO payloads must be folded only once')
-  agent.session.events.push(freeze(call('b')))
-  assert.match(text(await h.pre(agent)), /current task/)
-  assert.equal(todoReads, 0, 'appending a tool event must not rescan historical TODO payloads')
+  try {
+    Array.prototype.filter = function (...args) {
+      if (this === todos) todoReads++
+      return Reflect.apply(original, this, args)
+    }
+    const h = runtime()
+    const agent = { session: { header: { id: 'root' }, events: [event, freeze(call('a'))] } }
+    assert.match(text(await h.pre(agent)), /current task/)
+    assert.ok(todoReads > 0)
+    todoReads = 0
+    assert.match(text(await h.pre(agent)), /current task/)
+    assert.equal(todoReads, 0, 'ordinary immutable TODO payloads must be projected only once')
+    agent.session.events.push(freeze(call('b')))
+    assert.match(text(await h.pre(agent)), /current task/)
+    assert.equal(todoReads, 0, 'appending a tool event must not reproject historical TODO payloads')
+  } finally { Array.prototype.filter = original }
 })
 
 test('runtime TODO output matches replay through every prefix and unsafe restored edit', async () => {
@@ -117,25 +120,27 @@ test('overwritten restored TODO payloads are not interpreted before the final re
   assert.equal(text(await h.pre(agent)), context.renderWorkingContext(agent.session.events))
 })
 
-test('certified frozen data containers reuse their descriptors while still comparing every prefix slot', () => {
-  let descriptors = 0, slots = 0
-  const source = freeze(Array.from({ length: 256 }, (_, i) => call(String(i))))
-  const events = new Proxy(source, {
-    getOwnPropertyDescriptor(target, key) {
-      if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) descriptors++
-      return Reflect.getOwnPropertyDescriptor(target, key)
-    },
-    get(target, key, receiver) {
-      if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) slots++
-      return Reflect.get(target, key, receiver)
-    },
-  })
-  const cursor = createEventCursor()
-  cursor.read(events)
-  descriptors = 0; slots = 0
-  assert.deepEqual(cursor.read(events), { reset: false, events: [] })
-  assert.equal(descriptors, 0, 'certified frozen slots cannot acquire accessors')
-  assert.equal(slots, source.length, 'the entire prefix must still be compared')
+test('certified frozen data containers reuse their slot metadata', () => {
+  const events = freeze(Array.from({ length: 256 }, (_, i) => call(String(i))))
+  const descriptor = Object.getOwnPropertyDescriptor, hasOwn = Object.hasOwn
+  let metadataReads = 0
+  const indexed = (target, key) => target === events && /^(0|[1-9][0-9]*)$/.test(String(key))
+  try {
+    Object.getOwnPropertyDescriptor = (target, key) => {
+      if (indexed(target, key)) metadataReads++
+      return descriptor(target, key)
+    }
+    Object.hasOwn = (target, key) => {
+      if (indexed(target, key)) metadataReads++
+      return hasOwn(target, key)
+    }
+    const cursor = createEventCursor()
+    cursor.read(events)
+    assert.ok(metadataReads > 0)
+    metadataReads = 0
+    assert.deepEqual(cursor.read(events), { reset: false, events: [] })
+    assert.equal(metadataReads, 0, 'frozen data slots cannot acquire accessors')
+  } finally { Object.getOwnPropertyDescriptor = descriptor; Object.hasOwn = hasOwn }
 })
 
 test('outer slot validation never invokes getters and rejects inherited or setter-only slots', () => {
@@ -155,7 +160,7 @@ test('outer slot validation never invokes getters and rejects inherited or sette
   assert.equal(reads, 0)
 })
 
-test('mutable proxies are validated from own data descriptors without invoking their indexed get trap', () => {
+test('mutable Proxy containers force replay without invoking indexed get traps during certification', () => {
   let reads = 0
   const event = freeze(call('a'))
   const events = new Proxy([event], { get(target, key, receiver) {
@@ -164,7 +169,7 @@ test('mutable proxies are validated from own data descriptors without invoking t
   } })
   const cursor = createEventCursor()
   assert.equal(cursor.read(events).reset, true)
-  assert.deepEqual(cursor.read(events), { reset: false, events: [] })
+  assert.deepEqual(cursor.read(events), { reset: true, events })
   assert.equal(reads, 0)
 })
 

@@ -462,7 +462,7 @@ test('escaped checkpoint context preserves row identity and older-page reachabil
   const { store, recovery } = fixture(t)
   const { task_id } = store.openTask({ title: 'work' }, 'root')
   const older = recovery.checkpoint({ task_id, summary: 'older' }, 'root', root)
-  const large = recovery.checkpoint({ task_id, summary: String.fromCharCode(0).repeat(4095) + 'x' }, 'root', root)
+  const large = recovery.checkpoint({ task_id, summary: String.fromCharCode(1).repeat(4095) + 'x' }, 'root', root)
   for (let i = 0; i < 2; i++) {
     recovery.beginControl({ ...intent, request_key: 'mixed-' + i }, authority)
     recovery.recordLifecycle({ event_type: 'turn/end', source: 'session_event', event_seq: i,
@@ -495,4 +495,12 @@ test('oversized existing owner observations retain timeline identity and continu
   assert.equal(first.next_cursor, first.events[0].id)
   assert.equal(recovery.timeline({ limit: 1, cursor: first.next_cursor }, 'root').events[0].id, prior)
   assert.ok(Buffer.byteLength(JSON.stringify({ ok: true, ...first })) <= 16384)
+})
+
+test('recovery refuses embedded NUL text before SQLite can truncate observations', t => {
+  const { store, recovery } = fixture(t)
+  const { task_id } = store.openTask({ title: 'work' }, 'root')
+  assert.throws(() => recovery.checkpoint({ task_id, summary: String.fromCharCode(0) + 'private' }, 'root', root),
+    { code: 'E_RECOVERY_INPUT' })
+  assert.equal(recovery.inspect({}, 'root').checkpoints.length, 0)
 })

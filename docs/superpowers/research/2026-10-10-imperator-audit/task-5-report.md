@@ -93,7 +93,7 @@ The earlier tests-only commits contain both topics; use these file manifests to 
 | `tools/tests/guard-causality.test.mjs` | `6868f8faa17d75b2c1e960bf996d8303d2dd78b1` |
 | `tools/tests/host-api-contract.test.mjs` | `8553aa979d732043e548ca6274473d229932ef13` |
 
-Report path: `docs/superpowers/research/2026-10-10-imperator-audit/task-5-report.md`. The report is a separate documentation commit after the code-head verification; its final branch SHA and actual exact-head run are returned to the parent with the delivery handoff.
+Report path: `docs/superpowers/research/2026-10-10-imperator-audit/task-5-report.md`. Relative to the verified code/test candidate `1e6fe649f856697d526319f54a06179f2934c06f`, the report head differs only in this report file; all seven component blobs above are unchanged. Per the parent's explicit handoff instruction, a report-only repeated matrix is not awaited or claimed as GREEN. The task's exact-head GREEN evidence applies to the code/test candidate. The parent performs independent full-base-to-report-head review, final integration/PR review and merge/main verification.
 
 ## Read-only attribution checks and boundaries
 

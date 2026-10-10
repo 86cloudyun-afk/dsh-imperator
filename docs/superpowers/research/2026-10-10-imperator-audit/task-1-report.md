@@ -2,24 +2,24 @@
 
 ## Status and immutable inputs
 
-Implementation and candidate verification, including the PR #61 persisted-upgrade follow-up, are complete. Independent task/release/PR review and integration remain the parent's responsibility; this implementer created no PR and changed no other branch.
+Implementation and candidate verification, including both PR #61 persisted-upgrade follow-ups, are complete. Independent task/release/PR review and integration remain the parent's responsibility; this implementer created no PR and changed no other branch.
 
 - Requirement: [Task 1 brief](../../plans/2026-10-10-imperator-audit/task-1-brief.md) and [approved audit design](../../specs/2026-10-10-imperator-comprehensive-audit-design.md).
 - Production baseline: `81b7ce67114f96ebcd05b257571ce8a6bc9e68c7`.
 - Isolated branch: `codex/audit-workflow-freeze`, created exactly at planning head `234a7896e44b8d4e19608e3c80ef44a982ddc6ff`.
-- Verified final production/test/documentation candidate: `4a5d03755f9674d11682efca88c6a191f7376b2e` (initial freeze candidate `8a0b84de21c3de107551ab70e37cce4f9f1a9153`).
-- Verified final candidate tree: `009cff0e0d3332a214d57cf6c04d97c242e7102c`.
+- Verified final production/test/documentation candidate: `4524b9e04fb54bbde47b8998548c32bae946808a` (initial freeze `8a0b84de21c3de107551ab70e37cce4f9f1a9153`; first persisted-upgrade follow-up `4a5d03755f9674d11682efca88c6a191f7376b2e`).
+- Verified final candidate tree: `700a7a9b582db4ae06a82177da1f9dc6d074c4d5`.
 - This report is a subsequent documentation-only commit. The final six-job follow-up results belong to the candidate above; the original freeze results retain their original immutable SHA below. Neither is presented as an unexecuted report-head run. Per parent coordination, the report-only head is handed back without waiting for a duplicate matrix; final integration/PR exact-head verification belongs to the parent.
 
 ## Confirmed causes and correction
 
 The previous artifact path allowed a new revision while already in review or lead_acceptance. The pending execution hook reset either stage to test before a replacement artifact. A fail/unverified review could be followed by pass for the same revision, and acceptance considered only the latest review. Those combinations bypassed root return and its bounded rework budget.
 
-The shared workflowDeliveryGate now rejects artifact replacement and verification from frozen review/lead_acceptance. It also rejects review supersession and acceptance when any nonpassing result belongs to the exact current task/run/revision/plan/evidence generation. Both requirements_result and quality_result participate. The hook executes in the existing synchronous transaction before receipt insertion and before the native executor call.
+The shared workflowDeliveryGate rejects artifact replacement and verification after any actual delivery in the same task/run/plan/evidence generation, including older-writer persisted states with cleared or replacement revision IDs. Review and acceptance admit a sole exact-current artifact but refuse another actual delivered ancestor in that tuple. It also rejects review supersession and acceptance when any nonpassing result belongs to the exact current task/run/revision/plan/evidence generation. Both requirements_result and quality_result participate. The hook executes in the existing synchronous transaction before receipt insertion and before the native executor call.
 
-Exact request replay remains before mutable-work gates. Historical completed decisions remain read-only; root return clears the current revision and advances evidence generation through the existing budgeted path. Unrelated historical revision references/plans/generations do not poison new deliveries; the approved PR #61 supplement below preserves actual same-generation failed deliveries across older-writer replacement revisions. Restored lead_acceptance requires root return, claim, new current-root execution, a new artifact and independent review; zero/exhausted budget refuses this reopening.
+Exact request replay remains before mutable-work gates. Historical completed decisions remain read-only; root return clears the current revision and advances evidence generation through the existing budgeted path. Unrelated historical revision references/plans/generations do not poison new deliveries; the approved PR #61 supplements below preserve every actual same-generation delivery across older-writer replacement revisions, regardless of review verdict. Restored lead_acceptance requires root return, claim, new current-root execution, a new artifact and independent review; zero/exhausted budget refuses this reopening.
 
-No schema, store/index, tools/index, model-tool, package identity, Node/DSH pin, deadline or external dependency changes. The official full-tree adapter remains closed.
+No schema, tools/index, model-tool definition, package identity, Node/DSH pin, deadline or external dependency changes. The second PR #61 follow-up adds the explicitly authorized two-line store/index import and strict-evidence call substitution documented below; the earlier freeze and first follow-up did not modify store/index. The official full-tree adapter remains closed.
 
 ## Test contract and discriminating coverage
 
@@ -86,7 +86,7 @@ The actual [PR #61 review thread](https://github.com/86cloudyun-afk/dsh-imperato
 
 The parent explicitly approved the corresponding migration-contract supplement: failure of a real delivered artifact remains sticky across replacement revisions within the same task/run/current plan/current evidence generation. The gate retains its exact-current-revision check and additionally associates earlier reviews with actual artifact rows matching task, run, plan and generation. Thus both NULL-pointer and already-persisted R2 states require budgeted root return. An unrelated/orphan noncurrent revision reference is not inferred to be a delivered ancestor; the original other-revision/plan/generation positive test remains unchanged. Historical completed outcomes and original-key read-only replay remain unchanged. The root-return path advances generation and permits a fresh reviewed delivery.
 
-Only lib/store/workflow.js, tools/tests/workflow-engine.test.mjs and docs/WORKFLOW.md changed for this follow-up; this report is updated separately. No schema migration, store/index or tools/index change is required. The original audit branch continued from e97e3a04918a2cb606f2bdb355fc3bb65b1a2dab; main and the clean PR branch were untouched.
+Only lib/store/workflow.js, tools/tests/workflow-engine.test.mjs and docs/WORKFLOW.md changed for this first persisted-upgrade follow-up; this report is updated separately. For that first follow-up, no schema migration, store/index or tools/index change was required. The original audit branch continued from e97e3a04918a2cb606f2bdb355fc3bb65b1a2dab; main and the clean PR branch were untouched.
 
 The new fixture uses precise SQL equivalent to the old pending/artifact/review transaction writes, retaining real initial artifacts, failed reviews and decision audits. Later crash states finish their replacement receipt through production recordExecution with actual Node subprocess output, then persist the old artifact/review shapes. Every fixture closes its store, reconstructs store/workflow objects at the same path, and checks unchanged durable rows before exercising upgraded APIs. It does not delete or disable production guards.
 
@@ -153,9 +153,9 @@ Production candidate: 4a5d03755f9674d11682efca88c6a191f7376b2e; tree 009cff0e0d3
 
 All seventeen new tests passed, including the old-request replay and fresh-generation controls. Existing exact-current tuple, historical completed acceptance replay and restore/budget assertions remain passing and were not weakened. Every native combination additionally passed 40/40 boundary tests, 17 HOST_VERIFIED and 13 ISOLATION_VERIFIED checks, with no model requests. The six offline skips are existing unavailable-host checks; unpacked suites add six repository-only skips, and the separate pinned native pass supplies the host boundary evidence. Both offline benchmark/fault steps succeeded. No new skip, timeout relaxation or claimed production/paid-model result was introduced.
 
-Every follow-up tree used its verified 40-character base tree, retained all 191 paths, and was inspected for no deletions/unowned changes before the expected-SHA ref lease. The report-only handoff commit changes only this report relative to the tested candidate; its exact tree and complete six-file blob manifest are returned to the parent for independent review and final integration verification.
+Every first-follow-up tree used its verified 40-character base tree, retained all 191 entries, and was inspected for no deletions/unowned changes before the expected-SHA ref lease. The first report-only handoff commit changed only this report relative to that tested candidate; its exact tree and complete six-file blob manifest were returned to the parent for independent review and final integration verification.
 
-## Owned final candidate manifest
+## First persisted-upgrade candidate manifest (superseded)
 
 | File | Blob SHA |
 | --- | --- |
@@ -165,8 +165,119 @@ Every follow-up tree used its verified 40-character base tree, retained all 191 
 | tools/tests/nextgen-restore-integration.test.mjs | `e5ef0f51b73839a1a7fae095574007c7b3dcbbd5` |
 | tools/tests/workflow-engine.test.mjs | `f7b24d4e394134341c6f8d01048c84f91d327706` |
 
-The handoff additionally contains this report at `docs/superpowers/research/2026-10-10-imperator-audit/task-1-report.md`; its own blob is supplied in the handoff manifest.
+That handoff additionally contained this report at `docs/superpowers/research/2026-10-10-imperator-audit/task-1-report.md`; its own blob is supplied in the handoff manifest.
+
+
+## Second PR #61 follow-up: all delivery ancestry and executable recovery
+
+### Independently confirmed findings and approved scope
+
+The clean PR remained unmerged while independent release triage confirmed [P1 discussion 4237110123](https://github.com/86cloudyun-afk/dsh-imperator/pull/61#discussion_r4237110123) (thread PRRT_kwDOU4Tz5s6rCtFW) and [P2 discussion 4237110130](https://github.com/86cloudyun-afk/dsh-imperator/pull/61#discussion_r4237110130) (thread PRRT_kwDOU4Tz5s6rCtFb). This follow-up continued only the original author branch from report head 30232c06f264eae9416960511bff681cb806d701 / tree ff3c62fec4344bc4f17b072e40ceae58161561de. No clean PR, main or other branch was modified.
+
+P1: the earlier historical gate remembered failed reviews but not an unreviewed or passing delivery. The baseline writer could persist R1, start a new verification clearing revision_id to NULL, and persist a replacement R2/review without advancing evidence generation. It could also create R2 directly from the same valid receipt. On upgrade these reachable persisted states could complete a same-generation replacement without root return even when max_reworks=0. Tests use the exact equivalent old SQL writes with real artifacts, receipts and audits, then close the old store and reopen a fresh store object against the durable database. They do not revive a closed instance or fabricate a replacement owner.
+
+The minimal shared gate now queries real workflow_artifact rows matching task, run, current plan and current evidence generation. Replacement refuses any such artifact, independent of workflow stage/current revision. Review and acceptance refuse another artifact in that tuple, using NULL-aware IS NOT; a sole exact-current artifact remains eligible for its first review and passing acceptance. The previous exact-current nonpass check and actual-artifact-associated failed review check are retained. An orphan or unrelated noncurrent review reference is not a delivery; foreign task/plan/generation history does not poison this delivery, while the separate public foreign-run integrity rejection still applies. Explicit root return creates a fresh generation within the unchanged budget. Original request-key replay stays before these gates, including completed historical outcomes.
+
+P2: frozen source/log/restore evidence failure previously instructed task_verify or waiver, although frozen delivery and coding policy forbid those actions. workflowStrictEvidence preserves the real strict receipt check and converts only E_VERIFICATION_RECEIPT in review/lead_acceptance into a budget-aware workflow code/message/hint. Existing error.hint precedence in the real tool wrapper exposes the actionable hint without changing tools/index. With budget, the actual root reads workflow state and returns for rework before owner claim, fresh verification, artifact and independent review. With zero/exhausted budget, the hint requires separate explicit root authorization and a new task; no task or authorization is generated automatically. Ordinary strict tasks and mutable implement/test workflows keep their original retry/waiver behavior.
+
+Acceptance retains both real strict evidence reads. Four regression cases mutate actual source or actual receipt log bytes precisely at the second SQLite receipt query, then let every real SQL statement and evidence check execute. They assert receiptReads=2, an actionable tool-facing workflow error, submitted status and no committed mutation. The first strict read is not reused as a cached result.
+
+### Tests-only RED, before the production push
+
+Tests-only SHA: 6134452e1e378ea50fe56fddd8e4cab54b898f9c; tree 4987d7ed3367e84a3720de3f3513286e00dbf10c. [Run 38040626126](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126). Every full log was fetched and read, and all six failure-name sets were matched exactly, before the production commit was created and pushed. A draft unreferenced Git tree had been prepared after the four native RED logs; it was not committed or attached to any branch until both offline RED logs were also complete and read. All six groups had exactly the same 23 intended failures and no fixture or unrelated failure.
+
+| Job | Job ID | Tests | Passed | Failed | Skipped |
+| --- | --- | ---: | ---: | ---: | ---: |
+| offline (22.23.2) | [114179979061](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126/job/114179979061) | 913 | 884 | 23 | 6 |
+| native-host (22.23.2, 0.2.0-rc.2) | [114179979299](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126/job/114179979299) | 913 | 878 | 23 | 12 |
+| offline (24.19.0) | [114179979303](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126/job/114179979303) | 913 | 884 | 23 | 6 |
+| native-host (22.23.2, 0.2.1-alpha.2) | [114179979319](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126/job/114179979319) | 913 | 878 | 23 | 12 |
+| native-host (24.19.0, 0.2.1-alpha.2) | [114179979341](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126/job/114179979341) | 913 | 878 | 23 | 12 |
+| native-host (24.19.0, 0.2.0-rc.2) | [114179979342](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38040626126/job/114179979342) | 913 | 878 | 23 | 12 |
+
+The eight ancestry failures are missing rejection/exception assertions; the test/NULL cases reach acceptance on the unfixed writer. Twelve source/log drift cases and three strengthened existing receipt/restore checks fail because the old E_VERIFICATION_RECEIPT response lacks the required workflow recovery contract. The four second-read cases reach both real reads before failing on that old response. The prior fail/unverified, tuple isolation, replay, root-return and immutable-history tests remain intact.
+
+Exact RED failure names:
+
+- restored lead acceptance requires current-root execution and a new independently reviewed artifact
+- restored frozen delivery with zero rework budget refuses revalidation without receipt or execution
+- modified source and tampered logs invalidate accepted review
+- legacy unreviewed delivery stays frozen after persisted test replacement
+- legacy unreviewed delivery stays frozen after persisted review replacement
+- legacy unreviewed delivery stays frozen after persisted lead_acceptance replacement
+- legacy direct artifact replacement of unreviewed delivery freezes even when the receipt is unchanged
+- legacy pass delivery stays frozen after persisted test replacement
+- legacy pass delivery stays frozen after persisted review replacement
+- legacy pass delivery stays frozen after persisted lead_acceptance replacement
+- legacy direct artifact replacement of pass delivery freezes even when the receipt is unchanged
+- frozen review source drift exposes actionable tool recovery with budget 0
+- frozen review source drift exposes actionable tool recovery with budget 1
+- frozen review log drift exposes actionable tool recovery with budget 0
+- frozen review log drift exposes actionable tool recovery with budget 1
+- frozen lead_acceptance source drift exposes actionable tool recovery with budget 0
+- frozen lead_acceptance source drift exposes actionable tool recovery with budget 1
+- frozen lead_acceptance log drift exposes actionable tool recovery with budget 0
+- frozen lead_acceptance log drift exposes actionable tool recovery with budget 1
+- frozen acceptance second receipt read maps source drift to budget 0 workflow recovery
+- frozen acceptance second receipt read maps source drift to budget 1 workflow recovery
+- frozen acceptance second receipt read maps log drift to budget 0 workflow recovery
+- frozen acceptance second receipt read maps log drift to budget 1 workflow recovery
+
+### Final candidate GREEN
+
+Candidate SHA: 4524b9e04fb54bbde47b8998548c32bae946808a; tree 700a7a9b582db4ae06a82177da1f9dc6d074c4d5. [Run 38041034332](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332). All six complete job logs were fetched and inspected for this exact SHA, actual suite totals, all failures/skips and native proofs.
+
+| Job | Job ID | Tests | Passed | Failed | Skipped |
+| --- | --- | ---: | ---: | ---: | ---: |
+| offline (24.19.0) | [114181150316](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332/job/114181150316) | 913 | 907 | 0 | 6 |
+| native-host (24.19.0, 0.2.1-alpha.2) | [114181150418](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332/job/114181150418) | 913 | 901 | 0 | 12 |
+| native-host (22.23.2, 0.2.0-rc.2) | [114181150454](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332/job/114181150454) | 913 | 901 | 0 | 12 |
+| native-host (24.19.0, 0.2.0-rc.2) | [114181150487](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332/job/114181150487) | 913 | 901 | 0 | 12 |
+| offline (22.23.2) | [114181150499](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332/job/114181150499) | 913 | 907 | 0 | 6 |
+| native-host (22.23.2, 0.2.1-alpha.2) | [114181150509](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38041034332/job/114181150509) | 913 | 901 | 0 | 12 |
+
+All 23 added tests pass. Three pre-existing frozen evidence expectations were strengthened to require actionable workflow recovery, with their actual drift/refusal assertions preserved. Positive controls exercise root-return recovery for both unreviewed and passing legacy R1 at test/NULL, review/R2 and lead_acceptance/R2 boundaries; zero-budget sole-current review and acceptance; repeated verification in mutable implement/test; ordinary strict retry and explicit root waiver; artifact/review/accept original-key replay after completed source/log drift; and actual root-authorized fresh task creation when the old budget is zero. Existing failed/unverified, exact-current orphan, unrelated tuple, restored delivery, terminal-history and bounded rework controls remain passing.
+
+Each pinned native combination additionally passes 40/40 boundary tests, 17 HOST_VERIFIED and 13 ISOLATION_VERIFIED checks, with no model requests. Offline suites retain six unavailable-host skips; unpacked suites retain those plus six repository-only skips, and the separate pinned native pass supplies host evidence. Both offline benchmark/fault steps succeed. Existing 60000 ms verification deadlines and 12000 ms host validation bounds remain unchanged. No production host capability or paid-model execution is inferred from this evidence.
+
+### Authorized shared store/index integration hunk
+
+Parent explicitly approved only the import and second strict acceptance call below. Author-branch baseline store/index blob: dc492e855c6a732deda1f800d65327e34b86d98e; candidate blob: bc859c4de031c74f0805e17327435c40e540f61f. This full author blob must not replace the newer integrated Task 2 file. Apply only these two exact substitutions to that shared file and verify all other bytes are unchanged.
+
+Old import:
+```js
+import { WORKFLOW_DDL, workflowClaim, workflowSubmit, workflowStartDecision, workflowAccept, workflowFinishDecision, workflowVerificationStarted } from './workflow.js'
+```
+New import:
+```js
+import { WORKFLOW_DDL, workflowClaim, workflowSubmit, workflowStartDecision, workflowAccept, workflowFinishDecision, workflowVerificationStarted, workflowStrictEvidence } from './workflow.js'
+```
+Old acceptance call:
+```js
+      const executionReceipt = strict && waiverReason === null ? strictExecutionEvidence(this.#db(), this.root, row) : null
+```
+New acceptance call:
+```js
+      const executionReceipt = strict && waiverReason === null ? workflowStrictEvidence(this.#db(), this.root, row, workflowDecision?.flow, 'accept') : null
+```
+
+workflowDecision?.flow is the existing decision snapshot, obtained after workflow role/version/replay handling. Ordinary tasks have no workflow flow. The wrapper rethrows non-receipt errors and mutable-stage receipt errors unchanged. Both workflowAccept and the later store.acceptTask evidence check still execute; matching completed acceptance replay returns before either new check.
+
+### Final candidate manifest and tree preservation
+
+Full candidate tree: [700a7a9b582db4ae06a82177da1f9dc6d074c4d5](https://api.github.com/repos/86cloudyun-afk/dsh-imperator/git/trees/700a7a9b582db4ae06a82177da1f9dc6d074c4d5?recursive=1). The recursive tree contains all 191 entries (168 blobs and 23 directories), is not truncated, and has no deleted paths. Every tree operation used an existing exact 40-character base tree, inspected its complete result, and used an expected-SHA lease for the author-branch update. Only the six assigned paths plus the two authorized store/index substitutions differ across the complete Task 1 work. No other branch was edited.
+
+| File | Candidate blob SHA | Scope |
+| --- | --- | --- |
+| docs/WORKFLOW.md | `dd47d404212dab5ce4d63dc4c99bf4348bfcab3c` | Owned |
+| lib/store/index.js | `bc859c4de031c74f0805e17327435c40e540f61f` | Only the two authorized substitutions |
+| lib/store/workflow.js | `d9c21d76f5658256b9bd010fde1c9398b4ed49ea` | Owned |
+| lib/workflow/index.js | `7247b401cd32067d5f2ee53ad8849bbbbb686fcd` | Owned |
+| tools/tests/nextgen-restore-integration.test.mjs | `b94c02e44bf25eba74d9973311db29f22d7e66dc` | Owned |
+| tools/tests/workflow-engine.test.mjs | `573194e4dc7cfc53086412b1451eac7794ef98f5` | Owned |
+
+This report is the sixth owned file. Its final blob, documentation-only commit SHA and tree are supplied in the handoff. The report-only commit does not claim its own matrix run; the parent requested no duplicate documentation-only matrix and retains final integrated exact-head/PR/main verification.
 
 ## Limits and remaining concerns
 
-No known Task 1 defect remains after the candidate checks. Full production deployment, paid-model behavior and whole-tree containment/quiescence are not established by these tests. The cloud environment was unavailable; all execution evidence came from real GitHub Actions, not a claimed local run. No helper/reviewer agents were spawned by this implementer. Independent review may identify further issues and has not been represented as complete here.
+The targeted regressions and existing suite pass on the candidate above. Independent review and integration remain pending; earlier successful candidates did not prove the absence of the later independently discovered issues. Full production deployment, paid-model behavior and whole-tree containment/quiescence are not established by these tests. The cloud environment was unavailable; all execution evidence came from real GitHub Actions, not a claimed local run. No helper/reviewer agents were spawned by this implementer, and no PR, merge or external publication was performed.

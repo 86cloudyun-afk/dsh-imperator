@@ -92,7 +92,7 @@ test('claim and governor admission both block unsatisfied dependencies', t => {
   const governor = new TaskforceGovernor(f.store)
   assert.throws(() => governor.reserve({ operation_key: 'admit', task_id: id, generation: 0,
     kind: 'new', mode: 'write', resources: ['repository'] }, run, { role: 'lead', sessionId: run }), { code: 'E_WORKFLOW_DEPENDENCY' })
-  assert.equal(governor.snapshot(run).counts.active_total, 0)
+  assert.equal(governor.snapshot(run).active_total, 0)
 })
 
 test('upstream reject and reaccept cannot revive downstream evidence', async t => {
@@ -192,7 +192,7 @@ test('reopening store preserves workflow history without executing effects', asy
 
 test('two connections racing opposite dependency edges cannot commit a cycle', async t => {
   const f = fixture(t), a = f.create().task_id, b = f.create().task_id
-  const code = "const { parentPort, workerData: d } = require('node:worker_threads'); (async () => { const { TaskforceStore } = await import(d.storeUrl); const { TaskforceWorkflow } = await import(d.flowUrl); const s = new TaskforceStore(d.root); try { new TaskforceWorkflow(s).setDependencies({task_id:d.id,prerequisite_task_ids:[d.dep],expected_version:1,request_key:'edge'},d.run,{sessionId:d.run,isRoot:true}); parentPort.postMessage('ok') } catch(e) { parentPort.postMessage(e.code) } finally { s.close() } })().catch(e=>{throw e})"
+  const code = "const { parentPort, workerData: d } = require('node:worker_threads'); (async () => { const { TaskforceStore } = await import(d.storeUrl); const { TaskforceWorkflow } = await import(d.flowUrl); const s = new TaskforceStore(d.root); try { new TaskforceWorkflow(s).setDependencies({task_id:d.id,prerequisite_task_ids:[d.dep],expected_version:1,request_key:'edge'+d.id},d.run,{sessionId:d.run,isRoot:true}); parentPort.postMessage('ok') } catch(e) { parentPort.postMessage(e.code) } finally { s.close() } })().catch(e=>{throw e})"
   const attempt = (id, dep) => new Promise((resolve, reject) => {
     const w = new Worker(code, { eval: true, workerData: { root: f.store.root, run, id, dep,
       storeUrl: new URL('../../lib/store/index.js', import.meta.url).href,

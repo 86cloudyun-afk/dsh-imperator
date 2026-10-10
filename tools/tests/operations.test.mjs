@@ -7,7 +7,7 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { validResolutionSql } from '../../lib/store/evidence.js'
+import { TaskforceGovernor } from '../../lib/governor/index.js'
 import { TaskforceScheduler } from '../../lib/scheduler/index.js'
 import { TaskforceStore } from '../../lib/store/index.js'
 
@@ -33,22 +33,22 @@ function fixture(t, options = {}) {
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
   return { directory, root, workspace, store }
 }
-function seed(f, withReceipt = false) {
+function seed(f, withReceipt = false, run = 'run') {
   const task = f.store.openTask(withReceipt ? {
     title: SENTINEL, evidence_policy: 'execution',
     verification_files: ['source.js'], verification_command: 'node source.js',
-  } : { title: SENTINEL }, 'run', { isRoot: true, sessionId: 'run', cwd: f.workspace })
+  } : { title: SENTINEL }, run, { isRoot: true, sessionId: run, cwd: f.workspace })
   if (withReceipt) {
-    f.store.claimTask({ task_id: task.task_id, child_id: 'worker' }, 'run',
+    f.store.claimTask({ task_id: task.task_id, child_id: 'worker' }, run,
       { isRoot: false, sessionId: 'worker' }, 'worker')
     const receipt = f.store.recordExecution({ task_id: task.task_id, status: 'pending',
       command: 'node source.js', call_id: 'call', root_call_id: 'call', timeout_ms: 1000 },
-    'run', { isRoot: false, sessionId: 'worker' })
+    run, { isRoot: false, sessionId: 'worker' })
     f.store.recordExecution({ task_id: task.task_id, receipt_id: receipt.receipt_id,
       native_result: { isError: false, value: { kind: 'foreground', exitCode: 0, signal: null,
         timedOut: false, aborted: false, timeoutMs: 1000,
         stdout: { text: SENTINEL, truncated: false }, stderr: { text: '', truncated: false } } } },
-    'run', { isRoot: false, sessionId: 'worker' })
+    run, { isRoot: false, sessionId: 'worker' })
     return { ...task, receipt_id: receipt.receipt_id }
   }
   return task
@@ -480,7 +480,7 @@ CREATE VIEW v_run_board AS
          t.owner AS owner,
          (SELECT COUNT(*) FROM fact f WHERE f.task_id = t.id AND f.run_id IS t.run_id) AS fact_count,
          (SELECT COUNT(*) FROM fact f WHERE f.task_id = t.id AND f.run_id IS t.run_id AND f.kind = 'blocker'
-            AND NOT EXISTS (SELECT 1 FROM fact r WHERE ${validResolutionSql('r', 'f')})) AS blockers_open
+            AND NOT EXISTS (SELECT 1 FROM fact r WHERE (r.resolves_fact_id = f.id AND r.task_id = f.task_id AND r.run_id IS f.run_id AND r.kind = 'decision' AND r.confidence IN ('CONFIRMED', 'PLAUSIBLE')))) AS blockers_open
     FROM task t;
 
 
@@ -591,16 +591,18 @@ function insertAudit(db, table, values) {
     .map(c => [c.name, c.type === 'INTEGER' ? 1 : SENTINEL]))
   Object.assign(row, values)
   const names = Object.keys(row)
-  db.prepare('INSERT INTO ' + table + '(' + names.join(',') + ') VALUES(' + names.map(() => '?').join(',') + ')').run(...Object.values(row))
+  return db.prepare('INSERT INTO ' + table + '(' + names.join(',') + ') VALUES(' + names.map(() => '?').join(',') + ')').run(...Object.values(row))
 }
 for (const table of ['task_event', 'task_checkpoint', 'control_operation', 'workflow', 'task_dependency',
   'task_dependency_fence', 'workflow_writer', 'workflow_artifact', 'workflow_review', 'workflow_decision']) {
   for (const fault of ['foreign-run', 'missing-task']) {
     test('doctor reports ' + table + ' ' + fault + ' scope corruption without leaking records', async t => {
-      const f = fixture(t), task = seed(f)
+      const f = fixture(t), task = seed(f, true)
       if (table === 'task_event') f.store.handle.exec('DELETE FROM task_event')
       const values = { task_id: task.task_id, run_id: 'run' }
       if (table === 'control_operation') Object.assign(values, { action: 'stop', status: 'pending' })
+      if (table === 'workflow_artifact') values.receipt_id = task.receipt_id
+      if (table === 'workflow_review') values.revision_id = artifact(f, task)
       if (['task_dependency', 'task_dependency_fence'].includes(table)) values.prerequisite_task_id = task.task_id
       insertAudit(f.store.handle, table, values)
       assert.equal((await api().doctor({ root: f.root })).ok, true, 'identity-consistent audit is readable')
@@ -655,4 +657,51 @@ test('doctor requires the eager task-first blocker index without repairing it', 
     ['task_id', 'run_id', 'id'])
   f.store.handle.exec('DROP INDEX idx_fact_blocker_task_run_id')
   await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+})
+
+for (const [type, name] of [["TABLE","governor_run"],["TABLE","governor_reservation"],["TABLE","governor_retry_charge"],["INDEX","idx_governor_run"],["INDEX","idx_governor_active_task"],["TABLE","governor_hold"],["INDEX","idx_governor_resource"],["TABLE","governor_audit"]]) {
+  test('doctor detects incomplete initialized governor ' + name + ' without creating schema', async t => {
+    const f = fixture(t), task = seed(f)
+    new TaskforceGovernor(f.store).reserve({ operation_key: 'admission', task_id: task.task_id,
+      generation: 0, mode: 'read', kind: 'new', resources: ['workspace'] },
+    'run', { role: 'lead', sessionId: 'run' })
+    assert.equal((await api().doctor({ root: f.root })).ok, true)
+    f.store.handle.exec('DROP ' + type + ' ' + name)
+    await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+  })
+}
+function artifact(f, task) {
+  const receipt = f.store.handle.prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(task.receipt_id)
+  return Number(insertAudit(f.store.handle, 'workflow_artifact', {
+    task_id: task.task_id, run_id: receipt.run_id, plan_version: 1,
+    evidence_generation: receipt.evidence_generation, producer_session: receipt.owner_session,
+    receipt_id: receipt.receipt_id, snapshot: receipt.snapshot, logs: receipt.logs,
+  }).lastInsertRowid)
+}
+for (const reference of ['workflow', 'workflow_review', 'workflow_artifact']) {
+  for (const fault of ['different-task', 'different-run', 'missing-target']) {
+    test('doctor reports ' + reference + ' ' + fault + ' evidence reference without rewriting history', async t => {
+      const f = fixture(t), first = seed(f, true), second = seed(f, true, fault === 'different-run' ? 'other-run' : 'run')
+      const firstArtifact = artifact(f, first), secondArtifact = artifact(f, second)
+      if (reference !== 'workflow_artifact') insertAudit(f.store.handle, reference,
+        { task_id: first.task_id, run_id: 'run', revision_id: firstArtifact })
+      assert.equal((await api().doctor({ root: f.root })).ok, true, 'valid reference identities')
+      if (reference === 'workflow_artifact') f.store.handle.prepare('UPDATE workflow_artifact SET receipt_id=? WHERE id=?')
+        .run(fault === 'missing-target' ? 'missing' : second.receipt_id, firstArtifact)
+      else f.store.handle.prepare('UPDATE ' + reference + ' SET revision_id=? WHERE task_id=?')
+        .run(fault === 'missing-target' ? 99999 : secondArtifact, first.task_id)
+      const result = await unchangedDoctor(f, 'SCOPE_INTEGRITY')
+      assert.equal(result.counts.scope_anomalies, 1)
+    })
+  }
+}
+test('doctor preserves historical workflow receipt/review identity across new owners and generations', async t => {
+  const f = fixture(t), task = seed(f, true), oldRevision = artifact(f, task), currentRevision = artifact(f, task)
+  insertAudit(f.store.handle, 'workflow', { task_id: task.task_id, run_id: 'run', revision_id: currentRevision })
+  insertAudit(f.store.handle, 'workflow_review', { task_id: task.task_id, run_id: 'run', revision_id: oldRevision,
+    evidence_generation: 10, plan_version: 2, reviewer_session: 'historical-reviewer' })
+  f.store.handle.exec("UPDATE workflow_artifact SET producer_session='historical-producer',evidence_generation=9,plan_version=3")
+  const result = safe(await api().doctor({ root: f.root }))
+  assert.equal(result.ok, true)
+  assert.equal(result.counts.scope_anomalies, 0)
 })

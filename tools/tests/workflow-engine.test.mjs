@@ -277,3 +277,101 @@ test('failed manifest and oversized payloads leave no workflow mutation', t => {
   assert.equal(output.includes('verification_command'), false)
   assert.equal(output.includes(f.store.root), false)
 })
+
+
+test('returning an unapproved plan preserves approval requirement and rework generation', t => {
+  const f = fixture(t), id = f.create().task_id
+  f.change('returnForRework', id, { reason: 'revise before approval' })
+  const after = f.flow.state({ task_id: id }, run)
+  assert.equal(after.stage, 'plan')
+  assert.equal(after.evidence_generation, 1)
+  assert.equal(after.rework_count, 1)
+  assert.throws(() => f.claim(id), { code: 'E_WORKFLOW_STAGE' })
+  assert.equal(f.flow.ready({}, run).tasks.some(row => row.task_id === id), false)
+  f.change('approvePlan', id)
+  assert.equal(f.claim(id).status, 'claimed')
+})
+
+test('foreign prerequisite workflow header blocks readiness, claim and acceptance without exposing its run', async t => {
+  const f = fixture(t), upstream = f.open()
+  await f.artifact(upstream); f.review(upstream); f.accept(upstream)
+  const active = f.open({ dependencies: [upstream] })
+  await f.artifact(active); f.review(active); f.store.submitTask({ task_id: active }, run, worker)
+  const pending = f.create({ dependencies: [upstream] }).task_id
+  f.change('approvePlan', pending)
+  f.store.open().prepare('UPDATE workflow SET run_id=? WHERE task_id=?').run('foreign header secret', upstream)
+  for (const id of [active, pending]) {
+    const state = f.flow.state({ task_id: id }, run)
+    assert.equal(state.blocked, true)
+    assert.equal(state.blocked_code, 'E_STORE_INTEGRITY')
+    assert.equal(JSON.stringify(state).includes('foreign header secret'), false)
+  }
+  assert.equal(f.flow.ready({}, run).tasks.length, 0)
+  assert.throws(() => f.claim(pending), { code: 'E_STORE_INTEGRITY' })
+  assert.throws(() => f.store.submitTask({ task_id: active }, run, worker), { code: 'E_STORE_INTEGRITY' })
+  assert.throws(() => f.store.acceptTask({ task_id: active, expected_version: f.flow.state({ task_id: active }, run).row_version,
+    request_key: f.key() }, run, lead), { code: 'E_STORE_INTEGRITY' })
+})
+
+test('an accepted legacy prerequisite retains compatibility through workflow dependency checks', t => {
+  const f = fixture(t), upstream = f.store.openTask({ title: 'legacy prerequisite' }, run).task_id
+  f.store.recordFact({ task_id: upstream, kind: 'fact', statement: 'manual evidence' }, run)
+  f.store.submitTask({ task_id: upstream }, run)
+  f.store.acceptTask({ task_id: upstream }, run, lead)
+  const id = f.open({ dependencies: [upstream] })
+  assert.equal(f.flow.state({ task_id: id }, run).blocked, false)
+  assert.equal(f.store.taskOf(id, run).task.status, 'claimed')
+})
+
+test('accepted intermediates cannot hide transitive rework from state, claim, submit or acceptance', async t => {
+  const f = fixture(t)
+  const completed = async dependencies => {
+    const id = f.open({ dependencies }); await f.artifact(id); f.review(id); f.accept(id); return id
+  }
+  const a = await completed([]), b = await completed([a]), c = await completed([b])
+  const pending = f.create({ dependencies: [c] }).task_id; f.change('approvePlan', pending)
+  const active = f.open({ dependencies: [b] })
+  await f.artifact(active); f.review(active); f.store.submitTask({ task_id: active }, run, worker)
+  const fences = () => f.store.open().prepare('SELECT * FROM task_dependency_fence ORDER BY task_id,evidence_generation,prerequisite_task_id').all()
+  const captured = fences()
+  f.change('returnForRework', a, { reason: 'ancestor needs correction' })
+  for (const id of [b,c,pending,active]) {
+    const state = f.flow.state({ task_id: id }, run)
+    assert.equal(state.blocked, true)
+    assert.equal(state.blocked_code, 'E_WORKFLOW_DEPENDENCY')
+  }
+  assert.equal(f.store.taskOf(b, run).task.status, 'accepted')
+  assert.equal(f.store.taskOf(c, run).task.evidence_generation, 0)
+  assert.equal(f.flow.ready({}, run).tasks.some(row => [pending, active].includes(row.task_id)), false)
+  assert.throws(() => f.claim(pending), { code: 'E_WORKFLOW_DEPENDENCY' })
+  assert.throws(() => f.store.submitTask({ task_id: active }, run, worker), { code: 'E_WORKFLOW_DEPENDENCY' })
+  assert.throws(() => f.store.acceptTask({ task_id: active, expected_version: f.flow.state({ task_id: active }, run).row_version,
+    request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_DEPENDENCY' })
+  assert.deepEqual(fences(), captured, 'readiness and failed admission must not mend historical fences')
+  f.claim(a); await f.artifact(a); f.review(a); f.accept(a)
+  assert.equal(f.flow.state({ task_id: c }, run).blocked, true, 'reaccepted ancestor must not revive intermediate evidence')
+})
+
+test('shared accepted ancestors in a diamond remain ready without being mistaken for a cycle', async t => {
+  const f = fixture(t)
+  const completed = async dependencies => {
+    const id = f.open({ dependencies }); await f.artifact(id); f.review(id); f.accept(id); return id
+  }
+  const a = await completed([]), b = await completed([a]), c = await completed([a])
+  const id = f.create({ dependencies: [b,c] }).task_id; f.change('approvePlan', id)
+  assert.equal(f.flow.state({ task_id: id }, run).blocked, false)
+  assert.equal(f.claim(id).status, 'claimed')
+  await f.artifact(id); f.review(id); assert.equal(f.accept(id).status, 'accepted')
+})
+
+test('corrupt accepted dependency cycles fail closed instead of recursing or reporting ready', async t => {
+  const f = fixture(t), a = f.open()
+  await f.artifact(a); f.review(a); f.accept(a)
+  const b = f.open({ dependencies: [a] })
+  await f.artifact(b); f.review(b); f.accept(b)
+  const id = f.create({ dependencies: [b] }).task_id; f.change('approvePlan', id)
+  f.store.open().prepare('INSERT INTO task_dependency(task_id,prerequisite_task_id,run_id,created_by_session,created_at) VALUES(?,?,?,?,?)').run(a,b,run,run,'now')
+  f.store.open().prepare('INSERT INTO task_dependency_fence(task_id,run_id,evidence_generation,prerequisite_task_id,prerequisite_generation) VALUES(?,?,0,?,0)').run(a,run,b)
+  assert.equal(f.flow.state({ task_id: id }, run).blocked_code, 'E_STORE_INTEGRITY')
+  assert.throws(() => f.claim(id), { code: 'E_STORE_INTEGRITY' })
+})

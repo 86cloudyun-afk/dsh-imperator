@@ -19,7 +19,8 @@
     "./governor": "./lib/governor/index.js",
     "./tools": "./lib/tools/index.js",
     "./package.json": "./package.json",
-    "./workflow": "./lib/workflow/index.js"
+    "./workflow": "./lib/workflow/index.js",
+    "./operations": "./lib/operations/index.js"
   },
   "files": [
     "lib",
@@ -34,5 +35,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "bin": {
+    "imperator": "./tools/imperator.mjs"
   }
 }

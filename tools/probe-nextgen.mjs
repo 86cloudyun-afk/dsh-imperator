@@ -233,8 +233,9 @@ async function boardWorker(root, variant, rounds, migrationMode) {
     const additional_index_create_ms = elapsed(indexAt)
     const firstAt = performance.now()
     const candidateFirst = readOnly(store, () => withVariant(store.handle, variant, () => store.boardPage({ view: 'late_blockers', task_id: fixture.own }, RUN)))
+    const first_read_ms = elapsed(firstAt)
     assert.equal(JSON.stringify(candidateFirst), JSON.stringify(productionFirst), 'production/candidate page or token mismatch')
-    const first_read_ms = elapsed(firstAt), open_plus_first_read_ms = elapsed(openAt)
+    const candidate_setup_total_ms = elapsed(openAt)
     phase = 'board-page-cases'
     const cases = await pageCases(store, fixture, variant), outputs = [], measurements = []
     for (const scenario of cases) {
@@ -275,7 +276,7 @@ async function boardWorker(root, variant, rounds, migrationMode) {
       startup_migration_mode: migrationMode,
       import_ms, open_migration_ms, production_first_read_ms, open_plus_production_first_read_ms,
       production_task_index_at_open, candidate_index_reset_ms, additional_index_create_ms,
-      first_read_ms, open_plus_first_read_ms, candidate_indexes_isolated: true, wal_checkpoint_before_write: true,
+      first_read_ms, candidate_setup_total_ms, candidate_indexes_isolated: true, wal_checkpoint_before_write: true,
       reopened_open_ms, reopened_read_ms, reopened_candidate_index_reset_ms,
       reopen_scope: 'experiment clone after candidate index normalization; production task index may be recreated by open',
       before_write, after_write, writes, measurements, ...memory(),

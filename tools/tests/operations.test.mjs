@@ -333,7 +333,7 @@ test('fresh verification at restored root permits backup of mixed historical and
   assert.equal(JSON.parse(rows[0].logs).stdout.path, join(f.root, 'receipts', task.receipt_id + '.stdout.log'))
   assert.equal(JSON.parse(rows[1].logs).stdout.path, join(restored, 'receipts', pending.receipt_id + '.stdout.log'))
 })
-for (const fault of ['foreign-path', 'parent-escape']) {
+for (const fault of ['foreign-path', 'parent-escape', 'local-rewrite']) {
   test('restored audit refuses forged ' + fault + ' without normalizing stored provenance', async t => {
     const ops = api(), f = fixture(t); seed(f, true)
     const backup = join(f.directory, 'first-backup'), restored = join(f.directory, 'restored')
@@ -341,7 +341,8 @@ for (const fault of ['foreign-path', 'parent-escape']) {
     const db = new DatabaseSync(join(restored, 'taskforce.db'))
     const row = db.prepare('SELECT receipt_id,logs FROM execution_receipt').get()
     const logs = JSON.parse(row.logs)
-    logs.stdout.path = fault === 'foreign-path' ? join(f.directory, 'foreign', 'receipts', row.receipt_id + '.stdout.log')
+    logs.stdout.path = fault === 'local-rewrite' ? join(restored, 'receipts', row.receipt_id + '.stdout.log')
+      : fault === 'foreign-path' ? join(f.directory, 'foreign', 'receipts', row.receipt_id + '.stdout.log')
       : f.root + '/receipts/../receipts/' + row.receipt_id + '.stdout.log'
     db.prepare('UPDATE execution_receipt SET logs=?').run(JSON.stringify(logs)); db.close()
     assert.equal((await ops.doctor({ root: restored })).ok, false)

@@ -376,3 +376,27 @@ test('restored provenance metadata is required and rejects tampering and symlink
   assert.equal((await ops.doctor({ root: restored })).ok, false)
   await assert.rejects(ops.backup({ root: restored, out: join(f.directory, 'rejected') }), error => /^E_OPERATIONS_(PATH|LOG)$/.test(error.code))
 })
+
+for (const operation of ['backup', 'restore']) {
+  test(operation + ' cannot revive historical strict receipts by returning an archive to an older root', async t => {
+    const ops = api(), f = fixture(t), task = seed(f, true)
+    const { strictExecutionEvidence } = await import('../../lib/store/execution.js')
+    const first = join(f.directory, 'first-backup'), relocated = join(f.directory, 'relocated')
+    await ops.backup({ root: f.root, out: first }); await ops.restore({ backup: first, out: relocated })
+    const second = join(f.directory, 'second-backup')
+    await ops.backup({ root: relocated, out: second })
+    f.store.close(); rmSync(f.root, { recursive: true })
+    await assert.rejects(async () => {
+      if (operation === 'backup') await ops.backup({ root: relocated, out: f.root })
+      else await ops.restore({ backup: second, out: f.root })
+      // This branch proves why allowing the old root is unsafe: the original
+      // owner/generation/source and now matching log paths revive acceptance.
+      database(join(f.root, 'taskforce.db'), db => {
+        const row = db.prepare('SELECT * FROM task WHERE id=?').get(task.task_id)
+        assert.equal(strictExecutionEvidence(db, f.root, row).receipt_id, task.receipt_id)
+      })
+    }, { code: 'E_OPERATIONS_PATH' })
+    assert.equal(existsSync(f.root), false)
+    assert.equal((await ops.doctor({ root: relocated })).ok, true)
+  })
+}

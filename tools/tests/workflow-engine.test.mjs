@@ -210,3 +210,70 @@ test('bounded state refuses cross-run child record corruption without disclosing
     .run(id, id, 'secret foreign run', 'private author', 'now')
   assert.throws(() => f.flow.state({ task_id: id }, run), error => error.code === 'E_STORE_INTEGRITY' && !error.message.includes('secret'))
 })
+
+test('public store decisions reject a root identity from a different run', async t => {
+  for (const action of ['acceptTask', 'rejectTask']) {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    f.store.submitTask({ task_id: id }, run, worker)
+    const before = f.flow.state({ task_id: id }, run)
+    assert.throws(() => f.store[action]({ task_id: id, expected_version: before.row_version,
+      request_key: 'wrong-root', reason: 'return' }, run, { sessionId: 'different-root', isRoot: true }), { code: 'E_WORKFLOW_ROLE' })
+    assert.deepEqual(f.flow.state({ task_id: id }, run), before)
+    assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+  }
+})
+
+test('late blockers and damaged prerequisite ownership prevent readiness and claims', async t => {
+  for (const failure of ['late-blocker', 'ownership']) {
+    const f = fixture(t), upstream = f.open(); await f.artifact(upstream); f.review(upstream); f.accept(upstream)
+    const id = f.create({ dependencies: [upstream] }).task_id
+    f.change('approvePlan', id)
+    if (failure === 'late-blocker') f.store.recordFact({ task_id: upstream, kind: 'blocker', statement: 'late issue' }, run, worker)
+    else f.store.open().prepare("INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,?,'fact',?,'CONFIRMED','now')").run(upstream, 'foreign-scope', 'never expose this')
+    const code = failure === 'late-blocker' ? 'E_WORKFLOW_DEPENDENCY' : 'E_STORE_INTEGRITY'
+    assert.equal(f.flow.state({ task_id: id }, run).blocked_code, code)
+    assert.throws(() => f.claim(id), { code })
+    assert.equal(f.flow.ready({}, run).tasks.some(row => row.task_id === id), false)
+  }
+})
+
+test('an untouched legacy task can adopt strict workflow but existing history cannot', t => {
+  const f = fixture(t), id = f.store.openTask({ title: 'attach' }, run).task_id
+  assert.equal(f.create({ task_id: id }).task_id, id)
+  assert.equal(f.store.taskOf(id, run).task.evidence_policy, 'execution')
+  const used = f.store.openTask({ title: 'used' }, run).task_id
+  f.store.recordFact({ task_id: used, kind: 'fact', statement: 'existing history' }, run)
+  assert.throws(() => f.create({ task_id: used }), { code: 'E_WORKFLOW_STAGE' })
+  assert.equal(f.store.taskOf(used, run).task.evidence_policy, 'legacy')
+})
+
+test('failed create audit rolls back both workflow and newly created task', t => {
+  const f = fixture(t)
+  f.store.open().exec("CREATE TEMP TRIGGER fail_create BEFORE INSERT ON workflow_decision WHEN NEW.action='create' BEGIN SELECT RAISE(ABORT,'create rollback'); END")
+  assert.throws(() => f.create(), /create rollback/)
+  assert.equal(f.store.stats(run).tasks.total, 0)
+  assert.equal(f.store.open().prepare('SELECT COUNT(*) AS n FROM workflow').get().n, 0)
+})
+
+test('a new observation of the same bytes never revives a historical revision or review', async t => {
+  const f = fixture(t), id = f.open(), first = await f.artifact(id); f.review(id)
+  f.change('returnForRework', id, { reason: 'repeat verification' }); f.claim(id)
+  const second = await f.artifact(id)
+  assert.notEqual(second.revision_id, first.revision_id)
+  assert.deepEqual(second.snapshot, first.snapshot)
+  assert.throws(() => f.change('recordReview', id, { revision_id: first.revision_id,
+    requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer), { code: 'E_WORKFLOW_REVIEW' })
+  f.store.submitTask({ task_id: id }, run, worker)
+  assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_EVIDENCE' })
+})
+
+test('failed manifest and oversized payloads leave no workflow mutation', t => {
+  const f = fixture(t)
+  assert.throws(() => f.create({ plan: { objective: 'x'.repeat(40000), scope: [], non_goals: [], deliverables: [] } }), { code: 'E_WORKFLOW_INPUT' })
+  assert.equal(f.store.stats(run).tasks.total, 0)
+  const id = f.create().task_id
+  const output = JSON.stringify(f.flow.state({ task_id: id }, run))
+  assert.ok(Buffer.byteLength(output) <= 65536)
+  assert.equal(output.includes('verification_command'), false)
+  assert.equal(output.includes(f.store.root), false)
+})

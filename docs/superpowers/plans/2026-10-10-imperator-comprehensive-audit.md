@@ -27,11 +27,12 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** Existing workflow methods and recordExecution pending hook; no new model tool. Root return consumes existing bounded rework count.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-1-brief.md
 
-- [ ] Write discriminating regressions: Direct artifact after failed review; source-change verify and artifact after failed review; verify after lead_acceptance; same-current-revision fail/unverified then pass; old active fail→pass acceptance; root return→new revision succeeds; original-key replay remains; restore root-return path and max_reworks0 refuse; rejection writes no receipt and calls no native executor.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Use shared exact-current-revision failure/frozen-stage admission in artifact/verification/review/acceptance. Keep request replay before rejecting an already-completed identical request and retain historical terminal outcomes.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Write discriminating regressions: Direct artifact after failed review; source-change verify and artifact after failed review; verify after lead_acceptance; same-current-revision fail/unverified then pass; old active fail→pass acceptance; root return→new revision succeeds; original-key replay remains; restore root-return path and max_reworks0 refuse; rejection writes no receipt and calls no native executor.
+- [x] Run tests against unchanged production; record expected RED assertions and SHA/run.
+- [x] Implement minimal correction: Use shared exact-current-revision failure/frozen-stage admission in artifact/verification/review/acceptance. Keep request replay before rejecting an already-completed identical request and retain historical terminal outcomes.
+- [x] Verify full six-job available matrix and write task report with exact-head evidence.
+- [x] Complete independent module spec/quality review, including actual-PR findings.
+- [ ] Complete current clean-PR and integrated release gates.
 
 ### Task 2: Repair store reporting and submission chronology
 
@@ -39,11 +40,12 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** migrate/unassignedSummary/apply boot diagnostics; acceptTask.resolved_blockers; submitTask/closeTask submitted_at; statsAllRuns.blockers_late; scope_integrity_totals.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-2-brief.md
 
-- [ ] Write discriminating regressions: Only NULL receipt/waiver diagnostics and boot warning;0/1/2 distinct resolved blockers and duplicate resolvers; fixed T0 submit then T1 fact/decision and aliases; resubmission uses new time, old schema yields null; all runs/NULL/pending-state/foreign-scope statistics; second WAL writer cannot split snapshot; each recovery table foreign/NULL board/detail totals and acceptance refusal; terminal preclosure leftovers stay visible.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Add nullable TEXT task.submitted_at migration and project field; stamp actual submission transition only. Reuse existing evidence predicates and five-table diagnostics. Count recovery integrity using scope-safe joins; healthy output retains prior shape. Wrap all-runs multiquery reads in existing deferred snapshot helper.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Write discriminating regressions: Only NULL receipt/waiver diagnostics and boot warning;0/1/2 distinct resolved blockers and duplicate resolvers; fixed T0 submit then T1 fact/decision and aliases; resubmission uses new time, old schema yields null; all runs/NULL/pending-state/foreign-scope statistics; second WAL writer cannot split snapshot; each recovery table foreign/NULL board/detail totals and acceptance refusal; terminal preclosure leftovers stay visible.
+- [x] Run tests against unchanged production; record expected RED assertions and SHA/run.
+- [x] Implement minimal correction: Add nullable TEXT task.submitted_at migration and project field; stamp actual submission transition only. Reuse existing evidence predicates and five-table diagnostics. Count recovery integrity using scope-safe joins; healthy output retains prior shape. Wrap all-runs multiquery reads in existing deferred snapshot helper.
+- [x] Verify full six-job available matrix and write task report with exact-head evidence.
+- [x] Complete independent module spec/quality review, including actual-PR findings.
+- [ ] Complete current clean-PR and integrated release gates.
 
 ### Task 3: Allow safe historical settled replay
 
@@ -51,11 +53,12 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** settle(input,runId,actor) and scheduler transition; only terminal historical settled replay extends old fence behavior.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-3-brief.md
 
-- [ ] Write discriminating regressions: R1 settle→same-task R2 reserve→R1 same-proof settle replay; reopen persistence; different proof/row generation/cross-run/current or captured owner refusal; stale bind and markUnknown remain fenced; R2 resources/budgets/audit byte-row snapshots unchanged; scheduler two queue admissions same task old settle.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Narrow settled-only row-generation/owner/scope authorization before skipping the latest task fence. Compare canonical proof, return original row without write. Explicitly replace obsolete settled-fence assertion and document this contract extension; no new adapter activation.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Write discriminating regressions: R1 settle→same-task R2 reserve→R1 same-proof settle replay; reopen persistence; different proof/row generation/cross-run/current or captured owner refusal; stale bind and markUnknown remain fenced; R2 resources/budgets/audit byte-row snapshots unchanged; scheduler two queue admissions same task old settle.
+- [x] Run tests against unchanged production; record expected RED assertions and SHA/run.
+- [x] Implement minimal correction: Narrow settled-only row-generation/owner/scope authorization before skipping the latest task fence. Compare canonical proof, return original row without write. Explicitly replace obsolete settled-fence assertion and document this contract extension; no new adapter activation.
+- [x] Verify full six-job available matrix and write task report with exact-head evidence.
+- [x] Complete independent module spec/quality review, including actual-PR findings.
+- [ ] Complete current clean-PR and integrated release gates.
 
 ### Task 4: Repair execution root resolution and complete operation schema checks
 
@@ -63,11 +66,12 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** strictExecutionEvidence physical versus textual paths; doctor/currentSchema/preflight all required core columns including task.submitted_at afterTask2.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-4-brief.md
 
-- [ ] Write discriminating regressions: Actual successful foreground receipts at direct-root/ancestor symlink accepted; external receipt-dir/file links and archived old-root receipt refused; DROP task.note/fact core field and wrong object type cause doctor incompatibility/preflight refusal; valid old additive schema migrates on isolated copy; original files/bytes unchanged.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Canonicalize only trusted root for containment; preserve textual provenance and reject receipt escape links. Validate full core requirements from trusted schema declarations or complete map, including receipt/waiver SQL columns, and object types. Preserve supported migration behavior and operations canonical-path policy.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Write discriminating regressions: Actual successful foreground receipts at direct-root/ancestor symlink accepted; external receipt-dir/file links and archived old-root receipt refused; DROP task.note/fact core field and wrong object type cause doctor incompatibility/preflight refusal; valid old additive schema migrates on isolated copy; original files/bytes unchanged.
+- [x] Run tests against unchanged production; record expected RED assertions and SHA/run.
+- [x] Implement minimal correction: Canonicalize only trusted root for containment; preserve textual provenance and reject receipt escape links. Validate full core requirements from trusted schema declarations or complete map, including receipt/waiver SQL columns, and object types. Preserve supported migration behavior and operations canonical-path policy.
+- [x] Verify full six-job available matrix and write task report with exact-head evidence.
+- [x] Complete independent module spec/quality review, including actual-PR findings.
+- [ ] Complete current clean-PR and integrated release gates.
 
 ### Task 5: Repair scope activation and ambiguous guard outcomes
 
@@ -75,11 +79,12 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** createScopeMembership resolution invariant; guard event projection and echo/demotion behavior.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-5-brief.md
 
-- [ ] Write discriminating regressions: Direct resolution lacks either/both native functions→activation error; direct valid module distinguishes own/foreign/empty scope; existing fallback+standalone preserved. Matched native TOOL_OUTCOME_UNKNOWN and durable E_CONTROL_OUTCOME_UNKNOWN repeated histories do not become definite failed echo/change-arguments guidance; definite TOOL_NOT_STARTED/genuine failure and mixed histories still behave correctly; native SDK result shape parity.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Apply native export contract symmetrically after successful resolution. Classify unknown outcomes independently of definite failure using actual shared tool event envelopes; no memory/projection optimization unrelated to the bug.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Write discriminating regressions: Direct resolution lacks either/both native functions→activation error; direct valid module distinguishes own/foreign/empty scope; existing fallback+standalone preserved. Matched native TOOL_OUTCOME_UNKNOWN and durable E_CONTROL_OUTCOME_UNKNOWN repeated histories do not become definite failed echo/change-arguments guidance; definite TOOL_NOT_STARTED/genuine failure and mixed histories still behave correctly; native SDK result shape parity.
+- [x] Run tests against unchanged production; record expected RED assertions and SHA/run.
+- [x] Implement minimal correction: Apply native export contract symmetrically after successful resolution. Classify unknown outcomes independently of definite failure using actual shared tool event envelopes; no memory/projection optimization unrelated to the bug.
+- [x] Verify full six-job available matrix and write task report with exact-head evidence.
+- [x] Complete independent module spec/quality review, including actual-PR findings.
+- [ ] Complete current clean-PR and integrated release gates.
 
 ### Task 6: Prevent control replay during journal service degradation
 
@@ -87,11 +92,12 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** controlIntent/finishControl durable envelope; send/resume/stop effect dispatch; detached legacy controls.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-6-brief.md
 
-- [ ] Write discriminating regressions: Persistent pending outcome then journal unavailable same explicit retry key and trusted-coordinate retry→zero second host effect; closed database, replaced/unavailable recovery service and earlier journal-backed activation fail before effect; journal returns original pending/replayed result; genuinely detached legacy no-request control retains documented behavior; error hint never recommends new-key repetition.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Fail closed at durable control boundary before native effect when durability was requested or this activation depends on prior journal-backed operation. Retain exact stable key semantics and safe unavailable diagnostics without raw messages/errors.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Write discriminating regressions: Persistent pending outcome then journal unavailable same explicit retry key and trusted-coordinate retry→zero second host effect; closed database, replaced/unavailable recovery service and earlier journal-backed activation fail before effect; journal returns original pending/replayed result; genuinely detached legacy no-request control retains documented behavior; error hint never recommends new-key repetition.
+- [x] Run tests against unchanged production; record expected RED assertions and SHA/run.
+- [x] Implement minimal correction: Fail closed at durable control boundary before native effect when durability was requested or this activation depends on prior journal-backed operation. Retain exact stable key semantics and safe unavailable diagnostics without raw messages/errors.
+- [x] Verify full six-job available matrix and write task report with exact-head evidence.
+- [x] Complete independent module spec/quality review, including actual-PR findings.
+- [ ] Complete current clean-PR and integrated release gates.
 
 ### Task 7: Integrate, close audit coverage and verify release
 
@@ -118,6 +124,10 @@ Task2 also owns only sqlite.test exact additive-migration diagnostic expectation
 
 ## Actual PR review follow-up
 
-Initial six modules completed actual six-job GREEN and independent spec/quality review. PR60–66 were created and attached; none merged. Actual PR review then found four further defects requiring discriminating RED: old failed workflow whose active revision was cleared before upgrade; explicit-null recovery misclassified as detached; authoritative ctx.get missing service obscured by reflective Cordis miss; missing task-first index for recovery integrity counts. Tasks1/2/6 are reopened for these findings; original GREEN remains historical evidence only. Final integration, current PR checks, original-base independent review and a fresh extra premerge round remain pending.
+Initial six modules completed actual six-job GREEN and independent spec/quality review. PR60–66 were created and attached; none merged. Actual PR review then found four further defects requiring discriminating RED: old failed workflow whose active revision was cleared before upgrade; explicit-null recovery misclassified as detached; authoritative ctx.get missing service obscured by reflective Cordis miss; missing task-first index for recovery integrity counts. Tasks1/2/6 completed new discriminating RED, all six GREEN jobs and independent full-original-base spec/quality follow-up; the four inline threads are answered and resolved. Initial GREEN remains historical evidence. Current clean-PR checks, integrated matrix, original-base release review and a fresh extra premerge round remain pending.
 
 Task6 additionally owns only new real-Cordis control cases in host-boundaries.test.mjs; root integrates their hunk with Task4's two independently approved root-alias cases. Task6 tests its own baseline+hunk without copying Task4 production; aggregate verifies the union.
+
+## Integration snapshot
+
+All six corrected modules and follow-ups are independently approved. Parent combines only approved owned blobs. Shared STORE is latest Task2 plus exactly two Task4 paragraphs; shared host-boundaries is baseline plus exactly Task4 two alias cases and Task6 six Cordis cases. Task5's three SDK guard tests live separately in host-api-contract. PR dependency order is63→66→62; PR60/61/64/65 are independent. No PR has merged at this snapshot. Package/README move to0.4.1; actual aggregate CI, original-base review, fresh final premerge review and final-main verification are the remaining gates. Existing Task2/Task4 tests supply Task7 legacy/alias coverage; integration and metadata add no separate behavioral correction requiring duplicated tests.

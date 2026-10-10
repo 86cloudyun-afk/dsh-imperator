@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { randomUUID } from 'node:crypto'
 import { writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
@@ -7,7 +8,7 @@ import { Worker } from 'node:worker_threads'
 import { TaskforceStore } from '../../lib/store/index.js'
 import { TaskforceGovernor } from '../../lib/governor/index.js'
 import { TaskforceRecovery } from '../../lib/store/recovery.js'
-import { workflowAdmission } from '../../lib/store/workflow.js'
+import { workflowAdmission, workflowAudit, workflowDeliveryGate } from '../../lib/store/workflow.js'
 import { runTaskVerification } from '../../lib/tools/verification.js'
 import { tempStore } from './helpers.mjs'
 
@@ -20,10 +21,12 @@ const worker = { sessionId: ' worker ', isRoot: false }
 const reviewer = { sessionId: ' reviewer ', isRoot: false }
 function fixture(t) {
   assert.equal(typeof module.TaskforceWorkflow, 'function', 'workflow core must be implemented')
-  const store = tempStore(t); store.open()
+  let store
+  t.after(() => store?.close())
+  store = tempStore(t); store.open()
   writeFileSync(join(store.root, 'source.js'), 'export const answer = 42\n')
-  const flow = new module.TaskforceWorkflow(store)
-  let sequence = 0
+  let flow = new module.TaskforceWorkflow(store)
+  let sequence = 0, executions = 0
   const key = () => 'request-' + (++sequence)
   const actor = { ...lead, cwd: store.root }
   const create = (extra = {}) => flow.create({ title: 'coding task', plan: { objective: 'ship code', scope: ['source.js'], non_goals: [], deliverables: ['tested source'] },
@@ -37,6 +40,7 @@ function fixture(t) {
     return runTaskVerification({ store, identity: { ...worker, runId: run }, agent,
       exec: { agent, token: {}, rootCallId: key(), signal: new AbortController().signal },
       task_id: id, command: 'node --check source.js', execute: async () => {
+        executions++
         const result = spawnSync(process.execPath, ['--check', 'source.js'], { cwd: store.root, encoding: 'utf8' })
         return { isError: false, content: [], value: { kind: 'foreground', exitCode: result.status, signal: result.signal,
           timedOut: false, aborted: false, timeoutMs: 60000,
@@ -48,7 +52,12 @@ function fixture(t) {
     requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer)
   const accept = id => { store.submitTask({ task_id: id }, run, worker); return store.acceptTask({ task_id: id,
     expected_version: flow.state({ task_id: id }, run).row_version, request_key: key() }, run, lead) }
-  return { store, flow, actor, create, change, claim, open, verify, artifact, review, accept, key }
+  const reopen = () => {
+    const root = store.root; store.close()
+    store = new TaskforceStore(root); store.open()
+    flow = new module.TaskforceWorkflow(store)
+  }
+  return { get store() { return store }, get flow() { return flow }, actor, create, change, claim, open, verify, artifact, review, accept, key, reopen, executions: () => executions }
 }
 
 // Replacing the template with legacy policy or accepting model provenance breaks these.
@@ -138,13 +147,11 @@ test('review and artifact cannot accept model supplied receipt/provenance overri
   assert.throws(() => f.change('recordArtifact', id, {}, { sessionId: 'worker', isRoot: false }), { code: 'E_WORKFLOW_ROLE' })
 })
 
-test('latest failed execution, modified source and tampered logs invalidate accepted review', async t => {
-  for (const mutation of ['source', 'log', 'pending']) {
+test('modified source and tampered logs invalidate accepted review', async t => {
+  for (const mutation of ['source', 'log']) {
     const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
     if (mutation === 'source') writeFileSync(join(f.store.root, 'source.js'), 'export const answer = 43\n')
     if (mutation === 'log') writeFileSync(f.store.board({ task_id: id }, run).receipts[0].logs.stdout.path, 'tamper')
-    if (mutation === 'pending') f.store.recordExecution({ task_id: id, status: 'pending',
-      command: 'node --check source.js', timeout_ms: 60000, call_id: 'pending', root_call_id: 'root' }, run, worker)
     f.store.submitTask({ task_id: id }, run, worker)
     assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version,
       request_key: f.key() }, run, lead), { code: 'E_VERIFICATION_RECEIPT' })
@@ -506,4 +513,283 @@ test('workflow submission preserves bound ownership, submitted replay and comple
   assert.throws(() => f.store.submitTask({ task_id: id }, run, worker), { code: 'E_TERMINAL' })
   const legacy = f.store.openTask({ title: 'unowned legacy submission' }, run).task_id
   assert.equal(f.store.submitTask({ task_id: legacy }, run).status, 'submitted')
+})
+
+function deliveryRows(f, id) {
+  return Object.fromEntries(['workflow', 'workflow_artifact', 'workflow_review', 'workflow_decision', 'execution_receipt']
+    .map(table => [table, f.store.open().prepare('SELECT * FROM ' + table + ' WHERE task_id=? ORDER BY rowid').all(id)]))
+}
+function outcomeReview(f, id, result) {
+  return f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+    requirements_result: result, quality_result: 'pass', findings: result === 'pass' ? [] : ['requires root decision'] }, reviewer)
+}
+
+for (const outcome of ['unreviewed', 'fail', 'unverified', 'pass']) {
+  test('delivered ' + outcome + ' revision refuses direct artifact replacement', async t => {
+    const f = fixture(t), id = f.open({ max_reworks: 0 }); await f.artifact(id)
+    if (outcome !== 'unreviewed') outcomeReview(f, id, outcome)
+    const before = deliveryRows(f, id)
+    assert.throws(() => f.change('recordArtifact', id, {}, worker), { code: 'E_WORKFLOW_STAGE' })
+    assert.deepEqual(deliveryRows(f, id), before)
+  })
+  test('delivered ' + outcome + ' revision refuses fresh verification before intent or native execution', async t => {
+    const f = fixture(t), id = f.open({ max_reworks: 0 }); await f.artifact(id)
+    if (outcome !== 'unreviewed') outcomeReview(f, id, outcome)
+    const before = deliveryRows(f, id), calls = f.executions()
+    if (outcome !== 'pass') writeFileSync(join(f.store.root, 'source.js'), 'export const answer = 43\n')
+    await assert.rejects(f.verify(id), { code: 'E_WORKFLOW_STAGE' })
+    assert.equal(f.executions(), calls)
+    assert.deepEqual(deliveryRows(f, id), before)
+    assert.throws(() => f.store.recordExecution({ task_id: id, status: 'pending',
+      command: 'node --check source.js', timeout_ms: 60000, call_id: 'blocked', root_call_id: 'root' }, run, worker),
+      { code: 'E_WORKFLOW_STAGE' })
+    assert.deepEqual(deliveryRows(f, id), before)
+    assert.throws(() => f.change('recordArtifact', id, {}, worker), { code: 'E_WORKFLOW_STAGE' })
+  })
+}
+
+for (const [dimension, result] of [['requirements_result','fail'], ['requirements_result','unverified'], ['quality_result','fail'], ['quality_result','unverified']]) {
+  test('current ' + dimension + '=' + result + ' review cannot be superseded by another passing review', async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', [dimension]: result, findings: ['root return required'] }, reviewer)
+    const before = deliveryRows(f, id)
+    for (const nextReviewer of [reviewer, { sessionId: 'another independent reviewer', isRoot: false }]) {
+      assert.throws(() => f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+        requirements_result: 'pass', quality_result: 'pass', findings: [] }, nextReviewer), { code: 'E_WORKFLOW_REVIEW' })
+      assert.deepEqual(deliveryRows(f, id), before)
+    }
+  })
+
+  test('pre-upgrade active ' + dimension + '=' + result + '-then-pass history cannot be accepted without root return', async t => {
+    const f = fixture(t), id = f.open({ max_reworks: 1 }); await f.artifact(id)
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', [dimension]: result, findings: ['root return required'] }, reviewer)
+    // Model durable rows produced by the former fail-to-pass API, not a new allowed write.
+    const db = f.store.open()
+    db.prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,'pass','pass','[]',created_at FROM workflow_review WHERE task_id=? ORDER BY id DESC LIMIT 1").run(id)
+    db.prepare("UPDATE workflow SET stage='lead_acceptance',row_version=row_version+1 WHERE task_id=?").run(id)
+    f.store.submitTask({ task_id: id }, run, worker)
+    const before = deliveryRows(f, id)
+    assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version,
+      request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_EVIDENCE' })
+    assert.deepEqual(deliveryRows(f, id), before)
+    const oldRevision = f.flow.state({ task_id: id }, run).revision_id
+    f.change('returnForRework', id, { reason: 'repair failed revision' }); f.claim(id)
+    await f.artifact(id); f.review(id)
+    assert.notEqual(f.flow.state({ task_id: id }, run).revision_id, oldRevision)
+    assert.equal(f.accept(id).status, 'accepted')
+    assert.equal(f.flow.state({ task_id: id }, run).evidence_generation, 1)
+  })
+}
+
+test('original artifact and review requests replay without reopening frozen delivery', async t => {
+  const f = fixture(t), id = f.open({ max_reworks: 1 }); await f.verify(id)
+  const artifactArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const artifact = f.flow.recordArtifact(artifactArgs, run, worker)
+  const reviewArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key(),
+    revision_id: artifact.revision_id, requirements_result: 'fail', quality_result: 'pass', findings: ['return required'] }
+  const failed = f.flow.recordReview(reviewArgs, run, reviewer)
+  let before = deliveryRows(f, id)
+  assert.deepEqual(f.flow.recordArtifact(artifactArgs, run, worker), artifact)
+  assert.deepEqual(f.flow.recordReview(reviewArgs, run, reviewer), failed)
+  assert.deepEqual(deliveryRows(f, id), before)
+  f.change('returnForRework', id, { reason: 'approved correction' }); f.claim(id)
+  await f.artifact(id); f.review(id); f.accept(id)
+  before = deliveryRows(f, id)
+  assert.deepEqual(f.flow.recordArtifact(artifactArgs, run, worker), artifact)
+  assert.deepEqual(f.flow.recordReview(reviewArgs, run, reviewer), failed)
+  assert.deepEqual(deliveryRows(f, id), before)
+})
+
+test('root return is required after passing review and exhausted budget cannot be bypassed', async t => {
+  const f = fixture(t), id = f.open({ max_reworks: 1 }); await f.artifact(id); f.review(id)
+  f.change('returnForRework', id, { reason: 'revalidate delivered work' }); f.claim(id)
+  await f.artifact(id); f.review(id)
+  const before = deliveryRows(f, id), calls = f.executions()
+  assert.throws(() => f.change('returnForRework', id, { reason: 'one more retry' }), { code: 'E_WORKFLOW_BUDGET' })
+  await assert.rejects(f.verify(id), { code: 'E_WORKFLOW_STAGE' })
+  assert.throws(() => f.change('recordArtifact', id, {}, worker), { code: 'E_WORKFLOW_STAGE' })
+  assert.equal(f.executions(), calls)
+  assert.deepEqual(deliveryRows(f, id), before)
+})
+
+test('failure from another revision, plan or evidence generation does not poison the current delivery', async t => {
+  for (const dimension of ['revision_id', 'plan_version', 'evidence_generation']) {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const state = f.flow.state({ task_id: id }, run)
+    const history = { revision_id: state.revision_id, plan_version: state.plan_version, evidence_generation: state.evidence_generation }
+    history[dimension] += 100
+    f.store.open().prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) VALUES(?,?,?,?,?,?,'fail','pass','[]','historical')")
+      .run(id, run, history.revision_id, history.plan_version, history.evidence_generation, reviewer.sessionId)
+    f.review(id)
+    assert.equal(f.accept(id).status, 'accepted')
+  }
+})
+
+test('historical completed fail-then-pass outcome keeps original acceptance replay read-only', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const accepted = f.store.acceptTask(args, run, lead)
+  f.store.open().prepare("INSERT INTO workflow_review(id,task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT 0,task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,'fail','pass','[]',created_at FROM workflow_review WHERE task_id=? LIMIT 1").run(id)
+  const before = deliveryRows(f, id)
+  assert.deepEqual(f.store.acceptTask(args, run, lead), accepted)
+  assert.throws(() => f.store.acceptTask({ ...args, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }, run, lead), { code: 'E_TERMINAL' })
+  assert.deepEqual(deliveryRows(f, id), before)
+  assert.equal(f.store.taskOf(id, run).task.status, 'accepted')
+})
+
+/** Reproduce the exact durable writes of 0.4.0 (81b7ce6) after a nonpassing
+ * review: recordExecution(pending) resets stage/revision without advancing
+ * evidence_generation. Optional old artifact/review writes reproduce later
+ * crash boundaries. Completion still uses the real store and real Node output.
+ * SQL is intentional: the upgraded API must refuse these historical writes. */
+async function legacyReplacement(f, id, stage, dimension = 'requirements_result', result = 'fail') {
+  await f.verify(id)
+  const artifactArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const artifact = f.flow.recordArtifact(artifactArgs, run, worker)
+  const reviewArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key(),
+    revision_id: artifact.revision_id, requirements_result: 'pass', quality_result: 'pass', [dimension]: result,
+    findings: ['legacy failure requiring root return'] }
+  const failed = f.flow.recordReview(reviewArgs, run, reviewer)
+  const original = f.flow.state({ task_id: id }, run), db = f.store.open(), stamp = new Date().toISOString()
+  const receiptId = randomUUID()
+  db.exec('BEGIN IMMEDIATE')
+  try {
+    db.prepare("UPDATE workflow SET stage='test',revision_id=NULL,row_version=row_version+1,updated_at=? WHERE task_id=?").run(stamp, id)
+    db.prepare("INSERT INTO execution_receipt(receipt_id,task_id,run_id,evidence_generation,owner_session,actor_session,command,cwd,verification_files,status,started_at,call_id,root_call_id,parent_call_id,timeout_ms,snapshot) SELECT ?,task_id,run_id,evidence_generation,owner_session,actor_session,command,cwd,verification_files,'pending',?,?,'legacy-root',NULL,timeout_ms,snapshot FROM execution_receipt WHERE receipt_id=?")
+      .run(receiptId, stamp, 'legacy-call', artifact.receipt_id)
+    db.exec('COMMIT')
+  } catch (error) { db.exec('ROLLBACK'); throw error }
+  if (stage !== 'test') {
+    const processResult = spawnSync(process.execPath, ['--check', 'source.js'], { cwd: f.store.root, encoding: 'utf8' })
+    const completed = f.store.recordExecution({ task_id: id, receipt_id: receiptId, native_result: { isError: false,
+      value: { kind: 'foreground', exitCode: processResult.status, signal: processResult.signal, timedOut: false,
+        aborted: false, timeoutMs: 60000, stdout: { text: processResult.stdout, truncated: false },
+        stderr: { text: processResult.stderr, truncated: false } } } }, run, worker)
+    assert.equal(completed.verified, true)
+    db.exec('BEGIN IMMEDIATE')
+    try {
+      const task = db.prepare('SELECT * FROM task WHERE id=?').get(id)
+      let flow = db.prepare('SELECT * FROM workflow WHERE task_id=?').get(id)
+      const receipt = db.prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(receiptId)
+      const revision = Number(db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
+        .run(id, run, flow.plan_version, task.evidence_generation, worker.sessionId, receiptId, receipt.snapshot, receipt.logs, stamp).lastInsertRowid)
+      const args = { task_id: id, expected_version: flow.row_version, request_key: f.key() }
+      db.prepare("UPDATE workflow SET stage='review',revision_id=?,row_version=row_version+1,updated_at=? WHERE task_id=?").run(revision, stamp, id)
+      workflowAudit(db, task, 'recordArtifact', args, worker, flow.row_version, { task_id: id, receipt_id: receiptId,
+        snapshot: JSON.parse(receipt.snapshot), logs: JSON.parse(receipt.logs), evidence_generation: task.evidence_generation,
+        row_version: flow.row_version + 1, revision_id: revision })
+      if (stage === 'lead_acceptance') {
+        flow = db.prepare('SELECT * FROM workflow WHERE task_id=?').get(id)
+        const reviewId = Number(db.prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) VALUES(?,?,?,?,?,?,'pass','pass','[]',?)")
+          .run(id, run, revision, flow.plan_version, task.evidence_generation, reviewer.sessionId, stamp).lastInsertRowid)
+        const args = { task_id: id, expected_version: flow.row_version, request_key: f.key(), revision_id: revision,
+          requirements_result: 'pass', quality_result: 'pass', findings: [] }
+        db.prepare("UPDATE workflow SET stage='lead_acceptance',row_version=row_version+1,updated_at=? WHERE task_id=?").run(stamp, id)
+        workflowAudit(db, task, 'recordReview', args, reviewer, flow.row_version, { task_id: id, review_id: reviewId,
+          revision_id: revision, stage: 'lead_acceptance', row_version: flow.row_version + 1 })
+      }
+      db.exec('COMMIT')
+    } catch (error) { db.exec('ROLLBACK'); throw error }
+  }
+  const durable = deliveryRows(f, id)
+  f.reopen()
+  assert.deepEqual(deliveryRows(f, id), durable, 'upgrade fixture must survive closing and reopening SQLite')
+  const state = f.flow.state({ task_id: id }, run)
+  assert.equal(state.stage, stage)
+  assert.equal(state.evidence_generation, original.evidence_generation)
+  assert.equal(state.plan_version, original.plan_version)
+  assert.equal(state.rework_count, 0)
+  if (stage === 'test') assert.equal(state.revision_id, null)
+  else assert.notEqual(state.revision_id, artifact.revision_id)
+  return { artifactArgs, artifact, reviewArgs, failed }
+}
+
+for (const stage of ['test', 'review', 'lead_acceptance']) {
+  for (const [dimension, result] of [['requirements_result','fail'], ['requirements_result','unverified'], ['quality_result','fail'], ['quality_result','unverified']]) {
+    test('legacy ' + stage + ' replacement preserves ' + dimension + '=' + result + ' failure until root return', async t => {
+      const f = fixture(t), id = f.open({ max_reworks: 0 })
+      await legacyReplacement(f, id, stage, dimension, result)
+      if (stage === 'lead_acceptance') f.store.submitTask({ task_id: id }, run, worker)
+      const before = deliveryRows(f, id), calls = f.executions()
+      if (stage === 'test') {
+        await assert.rejects(async () => {
+          await f.artifact(id); f.review(id)
+          assert.equal(f.accept(id).status, 'accepted', 'unfixed old-generation replacement reaches acceptance')
+        }, { code: 'E_WORKFLOW_STAGE' })
+      } else if (stage === 'review') {
+        assert.throws(() => f.review(id), { code: 'E_WORKFLOW_REVIEW' })
+      } else {
+        assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version,
+          request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_EVIDENCE' })
+      }
+      assert.equal(f.executions(), calls)
+      assert.deepEqual(deliveryRows(f, id), before)
+      assert.throws(() => f.change('returnForRework', id, { reason: 'no budget remains' }), { code: 'E_WORKFLOW_BUDGET' })
+      assert.deepEqual(deliveryRows(f, id), before)
+    })
+  }
+}
+
+for (const entry of ['pending', 'artifact', 'accept']) {
+  test('legacy cleared revision rejects direct ' + entry + ' through the shared failure gate', async t => {
+    const f = fixture(t), id = f.open({ max_reworks: 0 }); await legacyReplacement(f, id, 'test')
+    if (entry === 'accept') f.store.submitTask({ task_id: id }, run, worker)
+    const before = deliveryRows(f, id), calls = f.executions()
+    const action = entry === 'pending' ? () => f.store.recordExecution({ task_id: id, status: 'pending',
+      command: 'node --check source.js', timeout_ms: 60000, call_id: 'blocked', root_call_id: 'root' }, run, worker)
+      : entry === 'artifact' ? () => f.change('recordArtifact', id, {}, worker)
+      : () => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }, run, lead)
+    assert.throws(action, { code: entry === 'accept' ? 'E_WORKFLOW_EVIDENCE' : 'E_WORKFLOW_STAGE' })
+    assert.equal(f.executions(), calls)
+    assert.deepEqual(deliveryRows(f, id), before)
+  })
+}
+
+test('legacy replacement history preserves read-only replay and budgeted root-return recovery at every crash boundary', async t => {
+  for (const stage of ['test', 'review', 'lead_acceptance']) {
+    const f = fixture(t), id = f.open({ max_reworks: 1 })
+    const original = await legacyReplacement(f, id, stage)
+    let before = deliveryRows(f, id)
+    assert.deepEqual(f.flow.recordArtifact(original.artifactArgs, run, worker), original.artifact)
+    assert.deepEqual(f.flow.recordReview(original.reviewArgs, run, reviewer), original.failed)
+    assert.deepEqual(deliveryRows(f, id), before)
+    f.change('returnForRework', id, { reason: 'explicitly recover interrupted legacy replacement' }); f.claim(id)
+    await f.artifact(id); f.review(id)
+    assert.equal(f.accept(id).status, 'accepted')
+    const state = f.flow.state({ task_id: id }, run)
+    assert.equal(state.evidence_generation, 1)
+    assert.equal(state.rework_count, 1)
+    assert.notEqual(state.revision_id, original.artifact.revision_id)
+    before = deliveryRows(f, id)
+    assert.deepEqual(f.flow.recordArtifact(original.artifactArgs, run, worker), original.artifact)
+    assert.deepEqual(f.flow.recordReview(original.reviewArgs, run, reviewer), original.failed)
+    assert.deepEqual(deliveryRows(f, id), before)
+  }
+})
+
+test('historical failure association requires matching artifact task, run, plan and generation', async t => {
+  for (const dimension of ['task_id', 'run_id', 'plan_version', 'evidence_generation']) {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const db = f.store.open(), task = db.prepare('SELECT * FROM task WHERE id=?').get(id)
+    const flow = db.prepare('SELECT * FROM workflow WHERE task_id=?').get(id)
+    const prior = { ...db.prepare('SELECT * FROM workflow_artifact WHERE id=?').get(flow.revision_id) }
+    prior[dimension] = dimension === 'run_id' ? 'foreign artifact run' : prior[dimension] + 100
+    const revision = Number(db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) VALUES(?,?,?,?,?,?,?,?,?)')
+      .run(prior.task_id, prior.run_id, prior.plan_version, prior.evidence_generation, prior.producer_session,
+        prior.receipt_id, prior.snapshot, prior.logs, prior.created_at).lastInsertRowid)
+    db.prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) VALUES(?,?,?,?,?,?,'fail','pass','[]','historical')")
+      .run(id, run, revision, flow.plan_version, task.evidence_generation, reviewer.sessionId)
+    // Isolate attribution from the separate public scope-integrity check: a
+    // foreign-run artifact attached to this task must still fail that check.
+    for (const action of ['review', 'accept']) assert.doesNotThrow(() => workflowDeliveryGate(db, task, flow, action))
+    if (dimension === 'run_id') {
+      assert.throws(() => f.review(id), error => error.code === 'E_STORE_INTEGRITY' && !error.message.includes(prior.run_id))
+    } else {
+      f.review(id)
+      assert.equal(f.accept(id).status, 'accepted')
+    }
+  }
 })

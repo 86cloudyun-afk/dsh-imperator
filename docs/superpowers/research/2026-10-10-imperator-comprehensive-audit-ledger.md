@@ -32,13 +32,13 @@ These are historical module gates, not final release approval. Every production 
 
 Counts are tests/pass/fail/skip. Task1 offline873/867/0/6, native873/861/0/12; Task2 878/872/0/6 and878/866/0/12; Task3 857/851/0/6 and857/845/0/12; Task4 903/897/0/6 and903/891/0/12; Task5 871/862/0/9 and871/856/0/15; Task6 876/870/0/6 and876/864/0/12. Anchored boundaries are40 except Task4's42 and Task5's43; all native jobs also passed17 host and13 isolation. Task5's three additional SDK cases really execute in the anchored stage despite expected primary SKIP; Task4's two alias cases execute native task_verify→bash→accept.
 
-## Actual PR review and reopened work
+## Actual PR review and completed follow-up
 
 Seven topic PRs [60](https://github.com/86cloudyun-afk/dsh-imperator/pull/60), [61](https://github.com/86cloudyun-afk/dsh-imperator/pull/61), [62](https://github.com/86cloudyun-afk/dsh-imperator/pull/62), [63](https://github.com/86cloudyun-afk/dsh-imperator/pull/63), [64](https://github.com/86cloudyun-afk/dsh-imperator/pull/64), [65](https://github.com/86cloudyun-afk/dsh-imperator/pull/65), [66](https://github.com/86cloudyun-afk/dsh-imperator/pull/66) were created and attached; none merged. PR66 is explicitly stacked on PR63. Common plan/spec/briefs/ledger belong to the parent release branch.
 
 Independent actual-PR reviewer read all effective base→head diffs, verified every owned blob against tested candidates, found no deletions or shared-plan changes, and audited real reviews/comments/threads. CI evidence reviewer read42 full PR-triggered job logs, including28 unpacked-native jobs; current90 check-runs are success. Initial PR runs:60=38031598942,61=38031748483,62=38032165643,63=38032277881,64=38032282466,65=38032287694,66=38032448799. These GREEN results did not override actual review findings.
 
-Four newly confirmed paths hold all merging and reopen Tasks1/2/6 for tests-only RED and repair:
+Four newly confirmed paths held all merging and reopened Tasks1/2/6. They have now completed tests-only RED, six-job GREEN and independent spec/quality follow-up:
 
 | PR feedback | Follow-up |
 |---|---|
@@ -47,7 +47,7 @@ Four newly confirmed paths hold all merging and reopen Tasks1/2/6 for tests-only
 | [62 real Cordis miss](https://github.com/86cloudyun-afk/dsh-imperator/pull/62#discussion_r4236775617) | Normal authoritative ctx.get undefined cannot become a lookup failure through optional reflective missing-service throw. Require actual pinned-native positive and failure controls. |
 | [63 control integrity index](https://github.com/86cloudyun-afk/dsh-imperator/pull/63#discussion_r4236774781) | Whole-run correlated anomaly counts need task-leading access; test actual production SQL EQP and substantial scoped fixtures before the additive index fix. |
 
-Pending: follow-up RED/GREEN and independent review; updated exact PR checks/threads; complete0.4.1 integrated checkout/actual-packed matrix; original-base release review; fresh additional final premerge review; dependency-ordered expected-head merges; actual final-main tree and six-job verification. Future completion will be recorded only after execution.
+All four inline threads were answered with actual evidence and resolved after independent repair review. Current PR heads/base dependencies changed; no merge has occurred. Pending: updated exact clean-PR checks; complete0.4.1 integrated checkout/actual-packed matrix; original-base release review; fresh additional final premerge review; dependency-ordered expected-head merges; actual final-main tree and six-job verification. Exact future completion will be recorded only after execution in the release PR and final task response.
 
 ## Failure history and ownership
 
@@ -64,3 +64,17 @@ Managed executor failed capability startup; no local shell, target-production or
 The original-main and Task5 native logs share four MaxListenersExceeded types at11 listeners during repeated official profile boot. Independent SDK/source comparison finds no new repository hook evidence; logs lack registration stacks, so neither per-listener runtime attribution nor production-crash cause is asserted.
 
 Node `^22.23.2 || ^24.19.0`, pinned DSH rc.2/alpha.2, acceptance60s/cleanup12s, names/database location and no-external-runtime-dependency policy remain. H01/H03 helper evidence does not establish H02/H04/H05/H06; full-tree managed adapter stays closed. Existing100k history and bounded fault/SIGKILL probes do not prove production uptime, long paid-model task behavior or expenses.
+
+## Follow-up and assembled0.4.1 evidence
+
+| Task | Tested candidate / report head | Actual RED / GREEN | Independent result |
+|---|---|---|---|
+|1|`4a5d03755f9674d11682efca88c6a191f7376b2e` / `30232c06f264eae9416960511bff681cb806d701`|[38033436454](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38033436454) / [38033601930](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38033601930)|v04_release_review spec/quality PASS|
+|2|`de88459306d8e77de2ebb5cfdb004ab21450ed9a` / `48b3b6a80c74f73a0347a903e762fd2034c6e319`|[38033102913](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38033102913) / [38033267129](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38033267129)|board_review spec/quality PASS|
+|6|`5488c0c61216d50bfea19f7f9318d8675c273c8c` / `1a6bf2d8f0873cfbde7f4d40c2cfaef61b96ad6e`|[38033145348](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38033145348) / [38033318869](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38033318869)|v04_release_review spec/quality PASS|
+
+Parent and independent reviewers read every follow-up RED/GREEN log. Task1 effective RED has15 failures per suite; GREEN offline890/884/0/6, native890/878/0/12 +40 boundaries. Task2 RED has2 failures; GREEN offline880/874/0/6, native880/868/0/12 +40 boundaries. Task6 RED has8 primary failures plus4 actual native failures; GREEN offline886/880/0/6, native886/874/0/12 +46 boundaries. All native jobs have HOST17/ISOLATION13. A Task1 first follow-up fixture tried reopening a permanently closed store object; it was corrected in tests only and is not accepted RED evidence.
+
+Task1 upgrade history uses scoped real artifact lineage in the current plan/generation, includingNULL and already-produced replacement states. Unrelated orphan references remain outside actual delivery ancestry. Task2 seven production queries on280 tasks/8120 controls use the task-key covering index; old journal rows/columns remain identical. The performance index does not become a doctor's data-readability prerequisite; preflight adds it on its copy and records schemaHash. Task6 real running Cordis contexts distinguish authoritative absence, primary lookup failures and null publication; common service resolver stays baseline.
+
+Clean component heads at assembly:60 d3a30c2;61 4e6cae1;63 8976957;64 35a6016;65 fb38b09;66 6a09c55 (base63);62 4febf0d (base66). Dependency order63→66→62 avoids competing end-of-file additions. LatestTask2 STORE text plus only two Task4 paragraphs reconstructs Task2 byte-for-byte when additions are removed. Shared native file is exact baseline + Task4 alias hunk + Task6 Cordis hunk; parent verified both identities. Original full-tree files and registered test lists are preserved; package/README now target0.4.1. Integration counts and final merge/main evidence await actual execution and are never inferred from module GREEN.

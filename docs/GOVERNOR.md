@@ -119,8 +119,14 @@ second charge or audit. Different content is `E_GOVERNOR_CONFLICT`. Replay is
 checked before the expected-generation fence, but still after scope/owner checks.
 A replay is a lookup result, **never permission to repeat delivery or effects**.
 
-Every transition includes the returned generation. Old generations fail after a
-new admission, even if the referenced prior reservation was already settled.
+Every transition includes the reservation's returned generation, which must match
+that reservation's own row. Binding, unknown marking and first settlement also
+require the latest task admission generation. As a narrow extension of the earlier
+fence contract, an already-settled reservation may replay its identical normalized
+proof after a newer admission. Run and current/captured worker ownership checks
+still apply; conflicting proof fails. This historical replay returns the existing
+settled row without changing reservations, holds, budgets or audit, and never
+authorizes another dispatch.
 This database fence cannot stop an old OS process; native ownership and recovery
 remain blocked. Do not dispatch until the outermost transaction has committed
 when composing these calls with another store transaction.

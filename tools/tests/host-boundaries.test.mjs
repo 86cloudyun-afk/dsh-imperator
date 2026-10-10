@@ -952,3 +952,133 @@ test('native public message constructors retain continuation and unknown-outcome
     assert.equal(flow.inFlight, 1)
   }
 })
+
+for (const kind of ['direct', 'ancestor']) {
+  test('actual native task_verify accepts a ' + kind + ' store root symlink with exact textual log provenance', options, async t => {
+    const { ctx, agent } = await fixture(t)
+    const [{ LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, bash,
+      { apply: applyTools }, { TaskforceStore }] = await Promise.all([
+      native('@deepseek-ai/dsh-subprocess-local'), native('@deepseek-ai/dsh-bash-local'),
+      native('@deepseek-ai/dsh-shell-env'), native('@deepseek-ai/dsh-tool-bash'),
+      import('../../lib/tools/index.js'), import('../../lib/store/index.js'),
+    ])
+    const { mkdir, realpath, symlink, writeFile, readFile } = await import('node:fs/promises')
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'taskforce-native-linked-receipt-')))
+    const physical = join(directory, 'physical'), alias = join(directory, 'alias'), cwd = join(directory, 'workspace')
+    await mkdir(physical); await mkdir(cwd); await symlink(physical, alias)
+    await writeFile(join(cwd, 'source.js'), 'source\n')
+    const root = kind === 'direct' ? alias : join(alias, 'nested')
+    const store = new TaskforceStore(root)
+    t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }) })
+    new LocalSubprocessRuntime(ctx)
+    new ShellEnvRegistry(ctx)
+    new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
+    await mountNativeWorkingDirectory(ctx, cwd)
+    await ctx.plugin(bash, { enableRunInBackground: false, promoteOnTimeout: false })
+    const main = agent('linked-root', undefined, { cwd })
+    const worker = agent('linked-worker', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'linked-root' })
+    const byId = new Map([main, worker].map(value => [value.session.header.id, value]))
+    ctx.provide('taskforceStore', store)
+    ctx.provide('agents', { get: id => byId.get(id) })
+    applyTools(ctx)
+    applyScope(ctx)
+    await ctx.serial('agent/created', { agent: main })
+    await ctx.serial('agent/created', { agent: worker })
+    const command = "printf 'linked native receipt\\n'; printf 'linked native stderr\\n' >&2"
+    const id = store.openTask({ title: 'native linked receipt', evidence_policy: 'execution',
+      verification_files: ['source.js'], verification_command: command },
+    'linked-root', { sessionId: 'linked-root', cwd, isRoot: true }).task_id
+    store.claimTask({ task_id: id, child_id: 'worker-label' }, 'linked-root', 'linked-worker', 'linked-worker')
+    let bashCalls = 0, outerToken
+    ctx.tools.guard(exec => {
+      if (exec.name === 'task_verify') outerToken = exec.token
+      if (exec.name === 'bash' && exec.agent === worker) {
+        bashCalls++
+        assert.equal(exec.parent, outerToken)
+        assert.equal(exec.rootCallId, 'linked-symlink-' + kind)
+        assert.equal(store.board(id, 'linked-root').receipts[0].status, 'pending')
+      }
+    })
+    const nativeResult = await worker.ctx.tools.execute({ agent: worker,
+      callId: 'linked-symlink-' + kind, name: 'task_verify', arguments: { task_id: id, command },
+      signal: new AbortController().signal })
+    assert.equal(nativeResult.isError, false, nativeResult.error?.message)
+    const result = JSON.parse(nativeResult.value)
+    assert.equal(result.verified, true, JSON.stringify(result))
+    assert.equal(bashCalls, 1)
+    const receipt = store.board(id, 'linked-root').receipts[0]
+    assert.equal(receipt.kind, 'foreground')
+    assert.equal(receipt.exit_code, 0)
+    assert.equal(receipt.output_complete, true)
+    for (const stream of ['stdout', 'stderr']) {
+      const path = join(root, 'receipts', receipt.receipt_id + '.' + stream + '.log')
+      assert.equal(receipt.logs[stream].path, path)
+      assert.notEqual(await realpath(path), path)
+    }
+    assert.equal(await readFile(receipt.logs.stdout.path, 'utf8'), 'linked native receipt\n')
+    assert.equal(await readFile(receipt.logs.stderr.path, 'utf8'), 'linked native stderr\n')
+    store.submitTask({ task_id: id }, 'linked-root', 'linked-worker', 'linked-worker')
+    assert.equal(store.acceptTask({ task_id: id }, 'linked-root', 'lead', 'linked-root').execution_verified, true)
+  })
+}
+
+for (const action of ['send', 'stop']) {
+  for (const publication of ['absent', 'failed-primary', 'null-journal']) {
+    test('actual native Cordis ' + publication + ' journal boundary for keyless ' + action, options, async t => {
+      const { ctx, agent } = await fixture(t)
+      const { apply: applyTools } = await import('../../lib/tools/index.js')
+      const main = agent('cordis-control-root')
+      main.session.append('turn/start', { turn: 1 })
+      main.session.append('step/start', { turn: 1, step: 1 })
+      let effects = 0
+      ctx.provide('agents', { get: id => id === main.session.header.id ? main : undefined })
+      ctx.provide('subagents', {
+        async listChildren() { return [{ id: 'cordis-control-child', mode: 'continuable', createdAt: 0 }] },
+        async sendMessage(sender) { assert.equal(sender, main); effects++; return 'cordis-control-message' },
+        interrupt(target, authority) { assert.equal(authority.agent, main); effects++ },
+      })
+      if (publication === 'null-journal') ctx.provide('taskforceStore', { recovery: null })
+      await ctx.plugin({
+        name: 'native-control-journal-probe',
+        inject: ['tools'],
+        apply(pluginCtx) {
+          assert.ok(pluginCtx.fiber.runtime, 'exercise a running Cordis plugin, not the unguarded root context')
+          if (publication !== 'null-journal') {
+            assert.equal(pluginCtx.get('taskforceStore'), undefined)
+            assert.throws(() => pluginCtx.taskforceStore, /without inject/,
+              'the actual proxy reports normal non-injected absence through its reflective exception')
+          } else {
+            assert.equal(pluginCtx.get('taskforceStore').recovery, null)
+          }
+          const toolsCtx = publication === 'failed-primary' ? pluginCtx.extend({
+            get(name) {
+              if (name === 'taskforceStore') throw new Error('PRIVATE_PRIMARY_LOOKUP_FAILURE')
+              return pluginCtx.get(name)
+            },
+          }) : pluginCtx
+          applyTools(toolsCtx)
+        },
+      })
+      const nativeResult = await main.ctx.tools.execute({
+        agent: main, callId: 'cordis-control-call', name: 'task_child_' + action,
+        arguments: { target_id: 'cordis-control-child', ...(action === 'send' ? { message: 'native boundary probe' } : {}) },
+        signal: new AbortController().signal,
+      })
+      assert.equal(nativeResult.isError, false, nativeResult.error?.message)
+      const result = JSON.parse(nativeResult.value)
+      if (publication === 'absent') {
+        assert.equal(result.ok, true, JSON.stringify(result))
+        assert.equal(result.operation.durable, false)
+        assert.equal(result.operation.durability, 'unavailable')
+        assert.equal(effects, 1, 'normal Cordis service absence retains one legacy effect')
+      } else {
+        assert.equal(effects, 0, 'failed or explicitly null journal must deny before native effect')
+        assert.equal(result.code, 'E_CONTROL_JOURNAL_UNAVAILABLE', JSON.stringify(result))
+        assert.match(result.hint, /原.*(?:键|retry_key)|retry_key/)
+        assert.match(result.hint, /不得换键|禁止.*新.*键/)
+        assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PRIMARY_LOOKUP_FAILURE|without inject/)
+        for (const field of ['sent', 'stopped', 'delivery', 'execution']) assert.equal(Object.hasOwn(result, field), false)
+      }
+    })
+  }
+}

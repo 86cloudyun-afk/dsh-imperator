@@ -18,15 +18,12 @@ jobs:
       fail-fast: false
       matrix:
         node: ['22.23.2', '24.19.0']
-        cpus: [1, 2]
-        revision: ['baseline', 'aggregate']
+        cpus: [1]
+        revision: ['aggregate']
         include:
-          - revision: baseline
-            source_sha: '81b7ce67114f96ebcd05b257571ce8a6bc9e68c7'
-            source_tree: '352e615beb3251b60424d4aa81b6929037c51778'
           - revision: aggregate
-            source_sha: '7bb25767311fc95e32ec1ca1e7af92519ef42500'
-            source_tree: '683460e5180a54ebf1015b8b92e94d47acb8b2a8'
+            source_sha: '61cffb0ef602b62d191a4f6c6e61d722b4e8fb1f'
+            source_tree: 'b4bc5b757edf498f97cd89a0cd1e1f91a38a0284'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

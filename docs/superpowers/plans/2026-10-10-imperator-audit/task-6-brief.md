@@ -40,3 +40,7 @@ Do not spawn subagents or reviewers. Parent assigns independent review, integrat
 ## Synchronous journal result follow-up
 
 PR62's new actual review requires valid synchronous begin/finish envelopes. Test malformed absence, fields, statuses, identifiers and thenables before minimal validation. Retain short new begin and full SQLite pending/accepted/rejected/unknown replay/finish positives. Rejected native/cross-realm Promise results must fail closed without crashing strict child Node or leaking private errors; observe rejection without accepting async durability. Invalid finish after dispatch reports unknown under the original key, with no repeat effect. Preserve the six actual Cordis cases and all original continuity tests; add no duplicate resume API.
+
+## Early-unavailable stable-key follow-up
+
+ActualPR62 feedback requires the three early journal-unavailable refusals to preserve validated explicit or trusted-coordinate original keys. Real SQLite tests must distinguish zero second effects from missing response metadata, cover send/stop, lookup throw/missing/null/unreadable/replacement, closed original owner and same-object handle reconnect. Keep no-coordinate/no-explicit-key unavailable responses free of fabricated UUIDs; keep genuine detached success and normal mounted UUID fallback. Invalid supplied keys are not echoed as validated metadata. Preserve original shared native hunk and all envelope/strict-Promise tests; perform genuine tests-only RED before the narrow production correction.

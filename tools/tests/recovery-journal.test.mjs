@@ -300,6 +300,7 @@ test('failed outcome persistence returns safe operation identity for reconciliat
   store.open().exec("CREATE TRIGGER failed_receipt BEFORE UPDATE ON control_operation BEGIN SELECT RAISE(ABORT, 'SECRET error'); END")
   const h = toolsHarness(store)
   const result = await h.call('task_child_send', { target_id: 'worker', message: 'SECRET' })
+  assert.equal(typeof result.operation, 'object', 'ambiguous completion must identify the durable operation')
   assert.equal(typeof result.operation.operation_id, 'string')
   assert.equal(typeof result.operation.retry_key, 'string')
   assert.equal(JSON.stringify(result).includes('SECRET'), false)

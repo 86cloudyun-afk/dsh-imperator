@@ -42,17 +42,17 @@ function fixture(t) {
 
 function workflow(store, workspace, prefix) {
   const flow = new TaskforceWorkflow(store)
-  let sequence = 0
+  let sequence = 0, executions = 0
   const key = () => prefix + '-' + (++sequence)
   const state = id => flow.state({ task_id: id }, run)
   const change = (method, id, extra = {}, actor = lead) => flow[method]({
     task_id: id, expected_version: state(id).row_version, request_key: key(), ...extra,
   }, run, actor)
-  const create = () => {
+  const create = (extra = {}) => {
     const id = flow.create({
       title: 'restore reviewed code', request_key: key(),
       plan: { objective: 'ship checked source', scope: ['source.js'], non_goals: [], deliverables: ['checked source'] },
-      verification_files: ['source.js'], verification_command: command,
+      verification_files: ['source.js'], verification_command: command, ...extra,
     }, run, { ...lead, cwd: workspace }).task_id
     change('approvePlan', id)
     store.claimTask({ task_id: id, child_id: 'worker' }, run, worker, worker.sessionId)
@@ -66,6 +66,7 @@ function workflow(store, workspace, prefix) {
       exec: { agent, token, rootCallId: key(), signal },
       // The injected native boundary executes a real subprocess, never a fabricated success.
       execute: async call => {
+        executions++
         assert.equal(call.agent, agent)
         assert.equal(call.parent, token)
         assert.equal(call.signal, signal)
@@ -95,7 +96,7 @@ function workflow(store, workspace, prefix) {
   const accept = id => store.acceptTask({
     task_id: id, expected_version: state(id).row_version, request_key: key(),
   }, run, lead)
-  return { state, create, verify, artifact, review, accept }
+  return { state, create, verify, artifact, review, accept, change, executions: () => executions }
 }
 
 function files(root) {
@@ -139,11 +140,19 @@ test('restored lead acceptance requires current-root execution and a new indepen
 
   assert.throws(() => resumed.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
   assert.deepEqual(resumed.state(id), before, 'refused acceptance must preserve reviewed audit')
+  const receiptCount = store.open().prepare('SELECT COUNT(*) AS n FROM execution_receipt WHERE task_id=?').get(id).n
+  await assert.rejects(resumed.verify(id), { code: 'E_WORKFLOW_STAGE' })
+  assert.equal(resumed.executions(), 0)
+  assert.equal(store.open().prepare('SELECT COUNT(*) AS n FROM execution_receipt WHERE task_id=?').get(id).n, receiptCount)
+  assert.deepEqual(resumed.state(id), before)
+  resumed.change('returnForRework', id, { reason: 'restore requires current-root verification' })
+  store.claimTask({ task_id: id, child_id: 'worker' }, run, worker, worker.sessionId)
   const fresh = await resumed.verify(id)
   assert.notEqual(fresh.receipt_id, oldReceipt.receipt_id)
   assert.throws(() => resumed.accept(id), { code: 'E_WORKFLOW_EVIDENCE' },
     'fresh execution alone cannot reuse the historical artifact and review')
-  assert.equal(resumed.state(id).task_status, 'submitted')
+  assert.equal(resumed.state(id).task_status, 'claimed')
+  store.submitTask({ task_id: id }, run, worker)
   const artifact = resumed.artifact(id)
   assert.notEqual(artifact.revision_id, oldArtifact.revision_id)
   assert.equal(artifact.receipt_id, fresh.receipt_id)
@@ -154,7 +163,8 @@ test('restored lead acceptance requires current-root execution and a new indepen
   const completed = resumed.state(id)
   assert.equal(completed.stage, 'completed')
   assert.equal(completed.task_status, 'accepted')
-  assert.equal(completed.evidence_generation, before.evidence_generation)
+  assert.equal(completed.evidence_generation, before.evidence_generation + 1)
+  assert.equal(completed.rework_count, before.rework_count + 1)
   assert.equal(completed.artifacts.length, 2)
   assert.equal(completed.reviews.length, 2)
   assert.equal(store.taskOf(id, run).task.owner_session, worker.sessionId)
@@ -217,4 +227,23 @@ test('doctor and disposable preflight retain workflow review, pending control, a
   assert.deepEqual(new TaskforceScheduler(reopened).state({}, run, schedulerLead), before.scheduler)
   assert.deepEqual(new TaskforceGovernor(reopened).snapshot(run), before.governor)
   assert.equal((await doctor({ root: reopened.root })).ok, true)
+})
+
+test('restored frozen delivery with zero rework budget refuses revalidation without receipt or execution', async t => {
+  const f = fixture(t), original = workflow(f.store, f.workspace, 'zero-original')
+  const id = original.create({ max_reworks: 0 })
+  await original.verify(id); original.artifact(id); original.review(id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const archive = join(f.directory, 'zero-backup'), root = join(f.directory, 'zero-restored')
+  assert.equal((await backup({ root: f.store.root, out: archive })).ok, true)
+  assert.equal((await restore({ backup: archive, out: root })).ok, true)
+  const store = f.open(root), resumed = workflow(store, f.workspace, 'zero-resumed')
+  const before = resumed.state(id), receipts = store.open().prepare('SELECT * FROM execution_receipt WHERE task_id=?').all(id)
+  assert.throws(() => resumed.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+  assert.throws(() => resumed.change('returnForRework', id, { reason: 'restore revalidation' }), { code: 'E_WORKFLOW_BUDGET' })
+  await assert.rejects(resumed.verify(id), { code: 'E_WORKFLOW_STAGE' })
+  assert.throws(() => resumed.artifact(id), { code: 'E_WORKFLOW_STAGE' })
+  assert.equal(resumed.executions(), 0)
+  assert.deepEqual(resumed.state(id), before)
+  assert.deepEqual(store.open().prepare('SELECT * FROM execution_receipt WHERE task_id=?').all(id), receipts)
 })

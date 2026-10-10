@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { tempStore } from './helpers.mjs'
 import { withWriteTransaction } from '../../lib/store/sqlite.js'
 
-test('scoped exhausted late continuation visits blocker access paths and retains uncapped resolver invalidation', t => {
+for (const scoped of [true, false]) test(`${scoped ? 'scoped' : 'unscoped'} exhausted late continuation uses blocker access paths and retains uncapped resolver invalidation`, t => {
   const store = tempStore(t)
   store.open()
   for (const run of ['run-a', null]) {
@@ -14,10 +14,11 @@ test('scoped exhausted late continuation visits blocker access paths and retains
       store.handle.prepare("UPDATE task SET status='accepted' WHERE id=?").run(id)
       for (let i = 0; i < 3; i++) insert.run(id, run, 'blocker', 'late', 'PLAUSIBLE', 'now')
     })
-    const first = store.boardPage({ view: 'late_blockers', task_id: id, limit: 1 }, run)
+    const scope = scoped ? { task_id: id } : {}
+    const first = store.boardPage({ view: 'late_blockers', ...scope, limit: 1 }, run)
     const state = JSON.parse(Buffer.from(first.pagination.page_token, 'base64url').toString('utf8'))
     const oldest = Number(store.handle.prepare("SELECT MIN(id) AS n FROM fact WHERE task_id=? AND kind='blocker'").get(id).n)
-    const args = { view: 'late_blockers', task_id: id, limit: 1, cursor: oldest,
+    const args = { view: 'late_blockers', ...scope, limit: 1, cursor: oldest,
       page_token: Buffer.from(JSON.stringify({ ...state, c: oldest })).toString('base64url') }
     const original = store.handle.prepare, prepare = original.bind(store.handle), plans = []
     store.handle.prepare = sql => {

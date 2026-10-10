@@ -286,3 +286,92 @@ test('actual npm archive CLI executes help doctor backup preflight and restore w
   }
   assert.equal(lstatSync(join(f.directory, 'packed-restored', 'taskforce.db')).isFile(), true)
 })
+
+test('restored historical logs remain diagnosable and back up without accessing their old root', async t => {
+  const ops = api(), f = fixture(t); seed(f, true)
+  const backup = join(f.directory, 'first-backup'), restored = join(f.directory, 'restored')
+  await ops.backup({ root: f.root, out: backup })
+  const original = tableRows(f.store.handle)
+  await ops.restore({ backup, out: restored })
+  f.store.close(); rmSync(f.root, { recursive: true })
+  const status = safe(await ops.doctor({ root: restored }))
+  assert.equal(status.ok, true, 'restored log archives are valid even when original root no longer exists')
+  assert.equal(status.counts.invalid_logs, 0)
+  const second = join(f.directory, 'second-backup')
+  assert.equal(safe(await ops.backup({ root: restored, out: second })).ok, true)
+  assert.deepEqual(database(join(second, 'taskforce.db'), tableRows), original)
+  const third = join(f.directory, 'restored-again')
+  await ops.restore({ backup: second, out: third })
+  assert.equal(safe(await ops.doctor({ root: third })).ok, true)
+})
+test('fresh verification at restored root permits backup of mixed historical and current receipt provenance', async t => {
+  const ops = api(), f = fixture(t), task = seed(f, true)
+  const { strictExecutionEvidence } = await import('../../lib/store/execution.js')
+  const backup = join(f.directory, 'first-backup'), restored = join(f.directory, 'restored')
+  await ops.backup({ root: f.root, out: backup })
+  await ops.restore({ backup, out: restored })
+  const resumed = new TaskforceStore(restored)
+  t.after(() => resumed.close())
+  const db = resumed.open()
+  const row = db.prepare('SELECT * FROM task WHERE id=?').get(task.task_id)
+  assert.throws(() => strictExecutionEvidence(db, restored, row), { code: 'E_VERIFICATION_RECEIPT' },
+    'copying historical logs cannot revive strict acceptance')
+  const caller = { isRoot: false, sessionId: 'worker' }
+  const pending = resumed.recordExecution({ task_id: task.task_id, status: 'pending',
+    command: 'node source.js', call_id: 'restored-call', root_call_id: 'restored-call', timeout_ms: 1000 }, 'run', caller)
+  resumed.recordExecution({ task_id: task.task_id, receipt_id: pending.receipt_id,
+    native_result: { isError: false, value: { kind: 'foreground', exitCode: 0, signal: null,
+      timedOut: false, aborted: false, timeoutMs: 1000,
+      stdout: { text: 'fresh', truncated: false }, stderr: { text: '', truncated: false } } } }, 'run', caller)
+  assert.equal(strictExecutionEvidence(db, restored, row).receipt_id, pending.receipt_id)
+  const second = join(f.directory, 'second-backup')
+  assert.equal(safe(await ops.backup({ root: restored, out: second })).ok, true,
+    'old receipt provenance must not prevent archiving fresh verification')
+  assert.equal(safe(await ops.doctor({ root: restored })).ok, true)
+  const rows = database(join(second, 'taskforce.db'), handle => handle.prepare('SELECT receipt_id,logs FROM execution_receipt ORDER BY id').all())
+  assert.equal(rows.length, 2)
+  assert.equal(JSON.parse(rows[0].logs).stdout.path, join(f.root, 'receipts', task.receipt_id + '.stdout.log'))
+  assert.equal(JSON.parse(rows[1].logs).stdout.path, join(restored, 'receipts', pending.receipt_id + '.stdout.log'))
+})
+for (const fault of ['foreign-path', 'parent-escape']) {
+  test('restored audit refuses forged ' + fault + ' without normalizing stored provenance', async t => {
+    const ops = api(), f = fixture(t); seed(f, true)
+    const backup = join(f.directory, 'first-backup'), restored = join(f.directory, 'restored')
+    await ops.backup({ root: f.root, out: backup }); await ops.restore({ backup, out: restored })
+    const db = new DatabaseSync(join(restored, 'taskforce.db'))
+    const row = db.prepare('SELECT receipt_id,logs FROM execution_receipt').get()
+    const logs = JSON.parse(row.logs)
+    logs.stdout.path = fault === 'foreign-path' ? join(f.directory, 'foreign', 'receipts', row.receipt_id + '.stdout.log')
+      : f.root + '/receipts/../receipts/' + row.receipt_id + '.stdout.log'
+    db.prepare('UPDATE execution_receipt SET logs=?').run(JSON.stringify(logs)); db.close()
+    assert.equal((await ops.doctor({ root: restored })).ok, false)
+    await assert.rejects(ops.backup({ root: restored, out: join(f.directory, 'rejected') }), { code: 'E_OPERATIONS_LOG' })
+    assert.equal(existsSync(join(f.directory, 'rejected')), false)
+  })
+}
+test('restore rejects a manifest that forges historical log provenance', async t => {
+  const ops = api(), f = fixture(t); seed(f, true)
+  const backup = join(f.directory, 'backup'), restored = join(f.directory, 'restored')
+  await ops.backup({ root: f.root, out: backup })
+  const path = join(backup, 'manifest.json'), manifest = JSON.parse(readFileSync(path, 'utf8'))
+  manifest.files.find(file => file.path.endsWith('.stdout.log')).original_path = join(f.directory, 'forged', 'receipts', 'forged.stdout.log')
+  writeFileSync(path, JSON.stringify(manifest))
+  await assert.rejects(ops.restore({ backup, out: restored }), error => /^E_OPERATIONS_(MANIFEST|LOG)$/.test(error.code))
+  assert.equal(existsSync(restored), false)
+})
+test('restored provenance metadata is required and rejects tampering and symlinks', async t => {
+  const ops = api(), f = fixture(t); seed(f, true)
+  const backup = join(f.directory, 'backup'), restored = join(f.directory, 'restored')
+  await ops.backup({ root: f.root, out: backup }); await ops.restore({ backup, out: restored })
+  const path = join(restored, 'receipt-provenance.json')
+  assert.equal(existsSync(path), true, 'restore must preserve explicit archival provenance')
+  const bytes = readFileSync(path), provenance = JSON.parse(bytes)
+  provenance.files[0].original_path = join(f.directory, 'forged', provenance.files[0].path)
+  writeFileSync(path, JSON.stringify(provenance))
+  assert.equal((await ops.doctor({ root: restored })).ok, false)
+  writeFileSync(path, bytes)
+  const foreign = join(f.directory, 'foreign-provenance'); writeFileSync(foreign, bytes)
+  rmSync(path); symlinkSync(foreign, path)
+  assert.equal((await ops.doctor({ root: restored })).ok, false)
+  await assert.rejects(ops.backup({ root: restored, out: join(f.directory, 'rejected') }), error => /^E_OPERATIONS_(PATH|LOG)$/.test(error.code))
+})

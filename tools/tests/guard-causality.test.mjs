@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import * as guard from '../../lib/plugins/guard.mjs'
+import { nativeModule, resolveInstallAnchor } from '../host-runtime.mjs'
 
 const call = (id, args = { path: 'a' }, tool = 'read') =>
   ({ type: 'tool/call', data: { name: tool, arguments: args, callId: id } })
@@ -280,4 +281,94 @@ test('semantic ECHO warnings acknowledge durable evidence without changing reque
   const resumed = harness({ echoFailures: 6 })
   resumed.agent.session.events = [...h.agent.session.events, { type: 'user/message', data: warning }]
   assert.equal((await resumed.pre()).messages.length, 0)
+})
+
+const unknownNativeResult = id => ({ type: 'tool/result', data: {
+  message: { source: { callId: id }, isError: true, content: [{ type: 'text', text: 'uncommitted outcome' }] },
+  error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' },
+} })
+const unknownControlText = (status = 'unknown', code = 'E_CONTROL_OUTCOME_UNKNOWN') => JSON.stringify({
+  ok: false, error: 'external effect is unresolved', code,
+  hint: 'keep the original retry key; do not repeat the effect under another key',
+  operation: { status, retry_key: 'original-retry-key' },
+})
+const ambiguousNativeEvents = () => Array.from({ length: 3 }, (_, i) => [
+  call('unknown-' + i, { command: 'one fixed effect' }, 'bash'), unknownNativeResult('unknown-' + i),
+]).flat()
+
+test('matched native unknown effects do not produce definite-failure ECHO', () => {
+  assert.equal(signal(ambiguousNativeEvents()), undefined)
+})
+
+test('an ambiguous matched outcome breaks a definite failure tail and its replay cannot overwrite it', () => {
+  const events = [...failures('before', 2), call('ambiguous'), unknownNativeResult('ambiguous')]
+  assert.equal(signal(events), undefined)
+  assert.equal(signal([...events, result('ambiguous')]), undefined, 'first observed outcome remains ambiguous')
+  assert.equal(signal([...events, ...failures('after', 2)]), undefined)
+  assert.equal(signal([...events, ...failures('after', 3)]), 'echo', 'later definite failures still protect the agent')
+})
+
+test('definite TOOL_NOT_STARTED outcomes still produce ECHO', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [
+    call('not-started-' + i),
+    { type: 'tool/result', data: { message: { source: { callId: 'not-started-' + i }, isError: true },
+      error: { name: 'ToolNotStartedError', code: 'TOOL_NOT_STARTED' } } },
+  ]).flat()
+  assert.equal(signal(events), 'echo')
+})
+
+for (const [status, code] of [
+  ['pending', 'E_CONTROL_OUTCOME_UNKNOWN'], ['unknown', 'E_CONTROL_OUTCOME_UNKNOWN'],
+  ['unknown', 'PERSISTENCE_UNAVAILABLE'], ['unknown', null],
+]) {
+  test('durable ' + status + '/' + code + ' control effects do not produce definite-failure ECHO', () => {
+    assert.equal(guard.foldGuardSignal(semanticEvents('task_child_send', unknownControlText(status, code)),
+      { echoFailures: 6, detectStall: false }).signal, undefined)
+  })
+}
+
+test('PTC durable unknown control effects do not produce definite-failure ECHO', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [
+    { type: 'step/start', data: { turn: 1, step: i + 1 } },
+    call('unknown-root-' + i, { code: 'transport' }, 'run_code'),
+    { type: 'tool/ptc-dispatch-start', data: { rootCallId: 'unknown-root-' + i, subCallId: 'inner',
+      name: 'task_child_send', arguments: { target_id: 'child', message: 'continue' } } },
+    { type: 'tool/ptc-dispatch', data: { rootCallId: 'unknown-root-' + i, subCallId: 'inner',
+      isError: false, content: [{ type: 'text', text: unknownControlText() }] } },
+    result('unknown-root-' + i, false), { type: 'step/end', data: { turn: 1, step: i + 1 } },
+  ]).flat()
+  assert.equal(signal(events), undefined)
+})
+
+test('unknown controls cannot inject change-arguments guidance or arm effort demotion', async () => {
+  const h = harness({ stepDownRequests: 3 })
+  h.agent.session.events = semanticEvents('task_child_send', unknownControlText())
+  assert.deepEqual((await h.pre()).messages, [])
+  const request = { reasoningEffort: 'max' }
+  assert.equal(await h.request(request), request)
+})
+
+let unknownOutcomeAnchor, unknownOutcomeSkip = false
+try { unknownOutcomeAnchor = resolveInstallAnchor({}) }
+catch (error) { unknownOutcomeSkip = 'native SDK result parity requires a DSH installation: ' + error.message }
+test('native SDK result constructors preserve the unknown-effect ECHO boundary', { skip: unknownOutcomeSkip }, async () => {
+  const [{ Session }, { createToolResultMessage }] = await Promise.all([
+    nativeModule(unknownOutcomeAnchor, '@deepseek-ai/dsh-session'),
+    nativeModule(unknownOutcomeAnchor, '@deepseek-ai/dsh-llm'),
+  ])
+  const session = Session.create('guard-unknown-outcome-native')
+  for (let step = 1; step <= 3; step++) {
+    const callId = 'same-provider-id'
+    session.append('step/start', { turn: 1, step })
+    const invoked = session.append('tool/call', { turn: 1, step, callId, name: 'bash',
+      arguments: '{"command":"one fixed effect"}' })
+    session.append('tool/result', { turn: 1, step,
+      message: createToolResultMessage({ callId, content: [{ type: 'text', text: 'uncommitted outcome' }], isError: true }),
+      error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' },
+    }, { surfaceOp: 'append', sourceEventSeqs: [invoked.seq] })
+    session.append('step/end', { turn: 1, step })
+  }
+  const events = session.snapshotEvents()
+  assert.equal(signal(events), undefined)
+  assert.equal(guard.createGuardProjection({ echoFailures: 3 }).read(events).echo, undefined)
 })

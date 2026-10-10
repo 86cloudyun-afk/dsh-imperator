@@ -407,3 +407,16 @@ test('lifecycle persistence failure cannot change host request behavior', async 
   assert.equal(state.observation_gaps.includes('lifecycle_write_failed'), true)
   assert.equal(JSON.stringify(state).includes('SECRET'), false)
 })
+
+test('lifecycle preserves documented core terminal kinds including synthetic history closures', t => {
+  const { recovery } = fixture(t)
+  const reasons = ['completed', 'aborted', 'blocked', 'error', 'max-tokens', 'interrupted', 'forked']
+  for (const [i, reason] of reasons.entries()) {
+    recovery.recordLifecycle({ event_type: 'turn/end', source: 'session_event', event_seq: i,
+      reason_kind: reason }, authority)
+  }
+  assert.deepEqual(recovery.inspect({ limit: 100 }, 'root').lifecycle.map(row => row.reason_kind), [...reasons].reverse())
+  recovery.recordLifecycle({ event_type: 'turn/end', source: 'session_event', event_seq: reasons.length,
+    reason_kind: 'refusal', raw_error: 'SECRET' }, authority)
+  assert.equal(recovery.inspect({}, 'root').lifecycle[0].reason_kind, null)
+})

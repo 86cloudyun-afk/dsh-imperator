@@ -42,10 +42,12 @@ new milestone, task label, or arbitrary child root.
   No prompts, raw error messages, resource paths, receipt logs or other-run
   occupants are returned. Responses report resource counts and are bounded
   to 65536 UTF-8 bytes. This is a live keyset view, not a frozen membership
-  snapshot; restarting at zero refreshes changed states.
+  snapshot; restarting at zero refreshes changed states. An oversized record
+  introduced through another host API fails with `E_SCHEDULER_CONFLICT`
+  instead of emitting an oversized page or a cursor that cannot advance.
 
 Run/session/request keys are nonblank, preserve whitespace and have a 512-byte
-limit. A request permits at most 64 canonical resource strings of 256 bytes
+limit; the existing store also limits task run IDs to 200 characters. A request permits at most 64 canonical resource strings of 256 bytes
 each. Resource duplicates are removed and sorted. Queue refusals use
 `E_SCHEDULER_CONFLICT` or `E_SCHEDULER_STALE`; governor refusals retain their
 existing codes. SQLite failures propagate rather than becoming queue success.
@@ -65,7 +67,7 @@ existing `createNativeGovernorAdapter()` still unconditionally rejects.
 
 `prepareNativeIdentity(ctx,{version,parentAgent,session_id})` reads the actual
 live agent registry and durable session headers. It rejects impersonated Agent
-objects, missing/cyclic ancestors, a claimed delegated root, occupied session
+objects, missing/cyclic ancestors, a claimed delegated root, occupied live session
 IDs and depth above two. It returns a frozen reserved ID, exact parent ID,
 root run ID and delegation depth. It neither creates nor sends. Recheck the
 same live parent and inherited policy/composition after asynchronous

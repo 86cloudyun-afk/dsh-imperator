@@ -20,7 +20,8 @@ function processes() {
       const end = raw.lastIndexOf(')')
       const parts = raw.slice(end + 2).split(' ')
       const args = readFileSync('/proc/' + directory + '/cmdline', 'utf8').split('\0')
-      const file = args.map(value => basename(value)).find(value => allowed.has(value)) ?? null
+      const candidates = args.map(value => basename(value)).filter(value => allowed.has(value))
+      const file = candidates.length === 1 ? candidates[0] : null
       rows.push({ pid: Number(directory), ppid: Number(parts[1]), state: parts[0],
         utime_ticks: Number(parts[11]), stime_ticks: Number(parts[12]),
         file, wchan: readFileSync('/proc/' + directory + '/wchan', 'utf8').trim().slice(0,64) })

@@ -1,7 +1,7 @@
 const { appendFileSync } = require('node:fs')
 const { basename } = require('node:path')
 const destination = process.env.IMPERATOR_TIMEOUT_AUDIT_FILE
-const testFile = process.argv.find(value => /[/\\][a-z0-9-]+\.test\.mjs$/.test(value))
+const testFile = process.argv.length === 2 && process.argv.find(value => /[/\\][a-z0-9-]+\.test\.mjs$/.test(value))
 if (destination && testFile) {
   const file = basename(testFile)
   const emit = phase => {

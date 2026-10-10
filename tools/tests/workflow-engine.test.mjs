@@ -375,3 +375,24 @@ test('corrupt accepted dependency cycles fail closed instead of recursing or rep
   assert.equal(f.flow.state({ task_id: id }, run).blocked_code, 'E_STORE_INTEGRITY')
   assert.throws(() => f.claim(id), { code: 'E_STORE_INTEGRITY' })
 })
+
+test('returned unapproved plans allow dependency revision until the first approval', t => {
+  const f = fixture(t), original = f.create().task_id, replacement = f.create().task_id
+  const id = f.create({ dependencies: [original] }).task_id
+  f.change('returnForRework', id, { reason: 'replace the planned prerequisite' })
+  const before = f.flow.state({ task_id: id }, run)
+  const changed = f.change('setDependencies', id, { prerequisite_task_ids: [replacement] })
+  const after = f.flow.state({ task_id: id }, run)
+  assert.deepEqual(changed.dependencies, [replacement])
+  assert.deepEqual(after.dependencies, [replacement])
+  assert.equal(after.row_version, before.row_version + 1)
+  assert.equal(after.stage, 'plan')
+  assert.equal(after.task_status, 'rejected')
+  assert.equal(after.evidence_generation, 1)
+  assert.throws(() => f.claim(id), { code: 'E_WORKFLOW_STAGE' })
+  f.change('approvePlan', id)
+  assert.throws(() => f.change('setDependencies', id, { prerequisite_task_ids: [] }), { code: 'E_WORKFLOW_STAGE' })
+  f.change('returnForRework', id, { reason: 'approved implementation needs rework' })
+  assert.throws(() => f.change('setDependencies', id, { prerequisite_task_ids: [] }), { code: 'E_WORKFLOW_STAGE' })
+  assert.deepEqual(f.flow.state({ task_id: id }, run).dependencies, [replacement])
+})

@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
 import { apply as applyTools } from '../../lib/tools/index.js'
 import { STORE_CODES } from '../../lib/store/index.js'
 import { tempStore } from './helpers.mjs'
@@ -102,4 +103,64 @@ test('rejected 仍须先 task_claim（E_STATUS）—— 既有语义不回退', 
   const denied = await call('task_submit', { task_id: id }, childOf('worker-a'))
   assert.equal(denied.ok, false)
   assert.equal(denied.code, STORE_CODES.status, 'rejected 仍走 E_STATUS（状态边界优先于 owner 权限）')
+})
+
+
+for (const kind of ['fact', 'decision']) test('submission time survives a later ' + kind + ' and submit aliases', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 0, 1) })
+  const store = tempStore(t)
+  const id = store.openTask({ title: 'submission chronology' }, RUN).task_id
+  store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+  const blocker = kind === 'decision'
+    ? store.recordFact({ task_id: id, kind: 'blocker', statement: 'waiting' }, RUN).fact_id : null
+  const first = store.submitTask({ task_id: id }, RUN)
+  t.mock.timers.tick(1000)
+  const later = store.recordFact({ task_id: id, kind, statement: 'later activity',
+    ...(blocker === null ? {} : { resolves_fact_id: blocker }) }, RUN)
+  assert.notEqual(later.created_at, first.submitted_at)
+  const before = snapshot(store, id)
+  for (const result of [undefined, 'done', 'partial']) {
+    const retry = result === undefined ? store.submitTask({ task_id: id }, RUN)
+      : store.closeTask({ task_id: id, result }, RUN)
+    assert.equal(retry.already, true)
+    assert.equal(retry.submitted_at, first.submitted_at)
+    assert.notEqual(retry.submitted_at, later.created_at)
+    assert.deepEqual(snapshot(store, id), before, 'retries must remain read-only')
+  }
+  assert.equal(before.task.submitted_at, first.submitted_at)
+  assert.equal(before.task.updated_at, later.created_at)
+})
+
+test('a fresh submission after reject and claim persists its new time', t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.UTC(2026, 0, 1) })
+  const store = tempStore(t)
+  const id = store.openTask({ title: 'resubmission chronology' }, RUN).task_id
+  store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+  const first = store.submitTask({ task_id: id }, RUN)
+  t.mock.timers.tick(1000)
+  store.rejectTask({ task_id: id, reason: 'redo' }, RUN, 'lead')
+  store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+  t.mock.timers.tick(1000)
+  const second = store.submitTask({ task_id: id }, RUN)
+  assert.equal(second.already, false)
+  assert.notEqual(second.submitted_at, first.submitted_at)
+  assert.equal(store.taskOf(id, RUN).task.submitted_at, second.submitted_at)
+  assert.equal(store.board({ task_id: id }, RUN).task.submitted_at, second.submitted_at)
+})
+
+test('old-schema submitted rows migrate with an unknown nullable submission time', t => {
+  const store = tempStore(t)
+  const legacy = new DatabaseSync(store.dbPath)
+  legacy.exec("CREATE TABLE task (id INTEGER PRIMARY KEY, title TEXT NOT NULL, note TEXT, status TEXT NOT NULL, owner TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)")
+  legacy.prepare('INSERT INTO task(title,status,created_at,updated_at) VALUES(?,?,?,?)')
+    .run('legacy submission', 'submitted', '2025-01-01T00:00:00.000Z', '2025-02-01T00:00:00.000Z')
+  legacy.close()
+  store.open()
+  const retry = store.submitTask({ task_id: 1 })
+  assert.equal(retry.already, true)
+  assert.equal(retry.submitted_at, null, 'last activity cannot establish legacy submission time')
+  assert.equal(store.taskOf(1).task.submitted_at, null)
+  const column = store.handle.prepare('PRAGMA table_info(task)').all().find(row => row.name === 'submitted_at')
+  assert.equal(column.type, 'TEXT')
+  assert.equal(column.notnull, 0)
 })

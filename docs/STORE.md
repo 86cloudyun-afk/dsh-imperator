@@ -181,6 +181,8 @@ token 绑定实际 run、逻辑集合、有效 task 筛选、首轮候选 ID 上
 
 control 归属异常统计按父任务查找；迁移在恢复表建好后增加覆盖索引 `idx_control_task(task_id,run_id)`，避免分页总计与兼容详情对每个任务全扫 control 日志。旧库重开幂等补索引，原行与列不变。它是查询访问路径，doctor 的数据可读 schema 闸门不因缺此性能索引而拒绝旧库；preflight 会在隔离副本实际迁移并记录 schema 变化。
 
+启动、迁移与 `unassignedSummary` 共用五表未归属诊断。迁移同事务补 `idx_execution_receipt_unassigned(run_id)` 与 `idx_execution_waiver_unassigned(run_id)`，两者仅收录 `run_id IS NULL` 行，让审计计数按 NULL 范围查找，避免遍历已归属回执与豁免历史；不改变五表计数、显式领养或异常隔离规则。旧库首次建立索引仍需读取既有表，后续打开幂等复用。它们同样是可选性能索引，doctor 不将缺索引视为数据不可读；preflight 隔离副本实际补索引并记录 schemaHash。规模回归检查真实 SQL 的查找计划及原行/列保留，不设耗时阈值或承诺任意启动延迟。
+
 迁移诊断 `migration.unassigned`、`unassignedSummary()` 与 boot 警告共用 task/fact/handoff/execution_receipts/execution_waivers 五表口径。已归属父任务上的 NULL-run receipt/waiver 也会告警，但继续隔离，`adoptUnassigned` 不会吸收它们；须管理员人工核对归属。
 
 `adoptUnassigned` 在同一写事务中先按原本 `task.run_id IS NULL` 的父任务迁移 NULL-run 执行回执与豁免，再迁移任务及既有事实/交接。它只改变审计归属，不改变 owner、generation、命令、快照、结果或日志；已归属任务上的 NULL/异域审计保留异常，不自动纳入。原本未归属任务如附有已归属的执行审计，接管在任何迁移前以 `E_STORE_INTEGRITY` 拒绝，避免父任务移动让异常审计重新可见；须管理员核对修复。任一步写入失败回滚全部五张表与迁移诊断。人工豁免仍是非验证通过，旧失败、pending 或旧代回执不会因接管而变成有效依据。

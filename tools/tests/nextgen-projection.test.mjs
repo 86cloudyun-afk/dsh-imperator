@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { createEventCursor } from '../../lib/plugins/event-projection.mjs'
 import * as context from '../../lib/plugins/working-context.mjs'
+import * as guard from '../../lib/plugins/guard.mjs'
 
 function freeze(value) {
   if (value !== null && typeof value === 'object') {
@@ -165,4 +166,78 @@ test('mutable proxies are validated from own data descriptors without invoking t
   assert.equal(cursor.read(events).reset, true)
   assert.deepEqual(cursor.read(events), { reset: false, events: [] })
   assert.equal(reads, 0)
+})
+
+test('public guard and flow projections replay mutable Proxy values instead of descriptor identities', () => {
+  const result = id => ({ type: 'tool/result', data: { callId: id, isError: true } })
+  const source = freeze([call('a'), result('a'), call('b'), result('b')])
+  let exposed = source[3]
+  const events = new Proxy([...source], { get(target, key, receiver) {
+    return key === '3' ? exposed : Reflect.get(target, key, receiver)
+  } })
+  const g = guard.createGuardProjection({ echoFailures: 2 }), f = context.createFlowProjection()
+  assert.deepEqual(g.read(events), guard.foldGuardSignals(events, { echoFailures: 2 }))
+  assert.deepEqual(f.read(events), context.foldSubagentFlow(events))
+  exposed = freeze({ type: 'turn/start', data: { turn: 2 } })
+  assert.deepEqual(g.read(events), guard.foldGuardSignals(events, { echoFailures: 2 }))
+  assert.deepEqual(f.read(events), context.foldSubagentFlow(events))
+})
+
+test('runtime TODO follows changed mutable Proxy indexed values with unchanged descriptors', async () => {
+  let exposed = freeze(todo('visible first'))
+  const events = new Proxy([freeze(todo('descriptor'))], { get(target, key, receiver) {
+    return key === '0' ? exposed : Reflect.get(target, key, receiver)
+  } })
+  const h = runtime(), agent = { session: { header: { id: 'proxy' }, events } }
+  assert.equal(text(await h.pre(agent)), context.renderWorkingContext(events))
+  exposed = freeze(todo('visible second'))
+  assert.equal(text(await h.pre(agent)), context.renderWorkingContext(events))
+  assert.match(text(await h.pre(agent)), /visible second/)
+})
+
+test('runtime TODO replays nested Proxy graphs that expose changing absent properties', async () => {
+  let data = freeze(todo('first nested').data)
+  const event = new Proxy(freeze({ type: 'todo/write' }), { get(target, key, receiver) {
+    return key === 'data' ? data : Reflect.get(target, key, receiver)
+  } })
+  const events = freeze([event]), h = runtime()
+  const agent = { session: { header: { id: 'nested-proxy' }, events } }
+  assert.equal(text(await h.pre(agent)), context.renderWorkingContext(events))
+  data = freeze(todo('second nested').data)
+  assert.equal(text(await h.pre(agent)), context.renderWorkingContext(events))
+  assert.match(text(await h.pre(agent)), /second nested/)
+})
+
+for (const kind of ['own', 'inherited', 'frozen-proxy']) {
+  test('runtime preserves custom iterator replay semantics: ' + kind, async () => {
+    let exposed = freeze(todo('iterator first'))
+    const iterator = function* () { yield exposed }
+    let events = [freeze(todo('descriptor'))]
+    if (kind === 'own') Object.defineProperty(events, Symbol.iterator, { value: iterator })
+    if (kind === 'inherited') Object.setPrototypeOf(events,
+      Object.create(Array.prototype, { [Symbol.iterator]: { value: iterator } }))
+    Object.freeze(events)
+    if (kind === 'frozen-proxy') events = new Proxy(events, { get(target, key, receiver) {
+      return key === Symbol.iterator ? iterator : Reflect.get(target, key, receiver)
+    } })
+    const h = runtime(), agent = { session: { header: { id: 'iterator' }, events } }
+    assert.equal(text(await h.pre(agent)), context.renderWorkingContext(events))
+    exposed = freeze(todo('iterator second'))
+    assert.equal(text(await h.pre(agent)), context.renderWorkingContext(events))
+    assert.match(text(await h.pre(agent)), /iterator second/)
+  })
+}
+
+test('frozen ordinary containers recheck inherited iterator semantics after certification', () => {
+  const events = freeze([call('a')]), extra = freeze(call('b'))
+  const projection = context.createFlowProjection()
+  assert.deepEqual(projection.read(events), context.foldSubagentFlow(events))
+  const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)
+  try {
+    Object.defineProperty(Array.prototype, Symbol.iterator, { ...descriptor, value: function* () {
+      yield* descriptor.value.call(this)
+      if (this === events) yield extra
+    } })
+    assert.deepEqual(projection.read(events), context.foldSubagentFlow(events))
+  } finally { Object.defineProperty(Array.prototype, Symbol.iterator, descriptor) }
 })

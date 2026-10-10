@@ -268,8 +268,8 @@ test('two processes cannot admit the same request twice or replay into the next 
 
 test('state byte budget includes JSON escaping of the exact trusted run identity', t => {
   const { store, scheduler: s } = setup(t)
-  const escapedRun = String.fromCharCode(1).repeat(511) + 'x'
-  for (let i = 0; i < 25; i++) s.enqueue(input(task(store, worker.sessionId, escapedRun)), escapedRun, lead)
+  const escapedRun = String.fromCharCode(1).repeat(194) + 'x'
+  for (let i = 0; i < 100; i++) s.enqueue(input(task(store, worker.sessionId, escapedRun)), escapedRun, lead)
   const page = s.state({ limit: 100 }, escapedRun, lead)
   assert.ok(page.requests.length > 0)
   assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 65536)

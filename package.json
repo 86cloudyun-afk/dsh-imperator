@@ -18,7 +18,8 @@
     "./store": "./lib/store/index.js",
     "./governor": "./lib/governor/index.js",
     "./tools": "./lib/tools/index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./workflow": "./lib/workflow/index.js"
   },
   "files": [
     "lib",

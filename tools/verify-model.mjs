@@ -82,6 +82,7 @@ const diagnosticTools = new Set([
   'subagent_fork', 'ask_user_question', 'exit_plan_mode', 'web_search', 'web_fetch',
   'task_open', 'task_claim', 'task_fact', 'task_submit', 'task_verify', 'task_accept',
   'task_reject', 'task_close', 'task_board', 'task_child_spawn', 'task_child_fork',
+  'task_workflow_create', 'task_workflow_submit', 'task_workflow_state',
   'task_child_send', 'task_child_interrupt', 'task_child_list',
 ])
 // rc.2 ToolFailure.info is persisted as event.data.error by AgentLoop and PTC.

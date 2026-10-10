@@ -164,3 +164,57 @@ test('old-schema submitted rows migrate with an unknown nullable submission time
   assert.equal(column.type, 'TEXT')
   assert.equal(column.notnull, 0)
 })
+
+
+test('legacy unbound non-owner submission notes identify the real caller', async t => {
+  const store = tempStore(t), call = toolCaller(store)
+  const id = store.openTask({ title: 'non-owner submission audit' }, RUN).task_id
+  store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+  const result = await call('task_submit', { task_id: id, note: 'substitute delivery' }, childOf('worker-b'))
+  assert.equal(result.ok, true)
+  assert.equal(result.status, 'submitted')
+  const audit = store.handle.prepare('SELECT * FROM fact WHERE task_id=? AND statement=?').get(id, '提交验收：substitute delivery')
+  assert.ok(audit)
+  assert.equal(audit.kind, 'decision')
+  assert.equal(audit.created_by, 'worker-b')
+  assert.equal(audit.actor_session, 'worker-b')
+  assert.equal(store.taskOf(id, RUN).task.owner, 'worker-a')
+})
+
+test('both close submission aliases preserve owner, non-owner and root audit identity', async t => {
+  const store = tempStore(t), call = toolCaller(store)
+  for (const result of ['done', 'partial']) {
+    for (const [agent, display, session] of [
+      [childOf('worker-a'), 'worker-a', 'worker-a'],
+      [childOf('worker-b'), 'worker-b', 'worker-b'],
+      [lead, 'lead', RUN],
+    ]) {
+      const id = store.openTask({ title: 'alias audit ' + result + '/' + display }, RUN).task_id
+      store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+      const delivered = await call('task_close', { task_id: id, result, note: 'alias delivery' }, agent)
+      assert.equal(delivered.ok, true)
+      assert.equal(delivered.status, 'submitted')
+      assert.equal(delivered.alias_of, 'submitTask')
+      const audit = store.handle.prepare('SELECT * FROM fact WHERE task_id=? AND statement=?').get(id, '提交验收：alias delivery')
+      assert.ok(audit)
+      assert.equal(audit.created_by, display)
+      assert.equal(audit.actor_session, session)
+      assert.equal(store.taskOf(id, RUN).task.owner, 'worker-a')
+    }
+  }
+})
+
+test('empty submission notes add no audit fact through submit or either close alias', async t => {
+  const store = tempStore(t), call = toolCaller(store)
+  for (const result of [undefined, 'done', 'partial']) {
+    for (const note of [undefined, '', ' \t ']) {
+      const id = store.openTask({ title: 'empty submission audit' }, RUN).task_id
+      store.claimTask({ task_id: id, child_id: 'worker-a' }, RUN)
+      const submitted = await call(result === undefined ? 'task_submit' : 'task_close',
+        { task_id: id, ...(result === undefined ? {} : { result }), ...(note === undefined ? {} : { note }) }, childOf('worker-a'))
+      assert.equal(submitted.ok, true)
+      assert.equal(submitted.status, 'submitted')
+      assert.equal(store.handle.prepare('SELECT COUNT(*) AS n FROM fact WHERE task_id=?').get(id).n, 0)
+    }
+  }
+})

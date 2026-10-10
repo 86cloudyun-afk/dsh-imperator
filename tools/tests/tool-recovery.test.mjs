@@ -246,9 +246,9 @@ for (const [method, name, args, diagnostic] of [
 }
 
 // Real SQLite journal; only native service publication and child control are fixtures.
-function controlJournalFixture(t, { detached = false } = {}) {
+function controlJournalFixture(t, { detached = false, unreadableStore = false, malformedJournal = false } = {}) {
   const store = tempStore(t)
-  let published = detached ? undefined : store
+  let published = detached ? undefined : malformedJournal ? { recovery: {} } : store
   const events = [
     { type: 'turn/start', data: { turn: 1 } },
     { type: 'step/start', data: { turn: 1, step: 1 } },
@@ -264,7 +264,10 @@ function controlJournalFixture(t, { detached = false } = {}) {
   applyTools({
     logger: { warn() {} },
     get(name) {
-      if (name === 'taskforceStore') return published
+      if (name === 'taskforceStore') {
+        if (unreadableStore) throw new Error('PRIVATE_SERVICE_FAILURE')
+        return published
+      }
       if (name === 'subagents') return subagents
       if (name === 'agents') return { get: id => id === RUN ? agent : undefined }
     },
@@ -389,5 +392,21 @@ for (const action of ['send', 'stop']) {
     assert.equal(result.operation.durable, false)
     assert.equal(result.operation.durability, 'unavailable')
     assert.equal(f.effects[action], 1)
+  })
+}
+
+for (const action of ['send', 'stop']) {
+  test('unreadable store resolution cannot authorize initial detached ' + action, async t => {
+    const f = controlJournalFixture(t, { unreadableStore: true })
+    const denied = await f.call(action)
+    assert.equal(f.effects[action], 0, 'a failed service lookup is not a known journal-free adapter')
+    assertJournalUnavailable(denied)
+  })
+  test('malformed initial journal cannot authorize ' + action + ' or leak method diagnostics', async t => {
+    const f = controlJournalFixture(t, { malformedJournal: true })
+    const denied = await f.call(action)
+    assert.equal(f.effects[action], 0)
+    assertJournalUnavailable(denied)
+    assert.doesNotMatch(denied.error, /not a function|beginControl|finishControl/)
   })
 }

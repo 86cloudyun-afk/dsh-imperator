@@ -540,10 +540,11 @@ for (const outcome of ['unreviewed', 'fail', 'unverified', 'pass']) {
   })
 }
 
-for (const result of ['fail', 'unverified']) {
-  test('current ' + result + ' review cannot be superseded by another passing review', async t => {
+for (const [dimension, result] of [['requirements_result','fail'], ['requirements_result','unverified'], ['quality_result','fail'], ['quality_result','unverified']]) {
+  test('current ' + dimension + '=' + result + ' review cannot be superseded by another passing review', async t => {
     const f = fixture(t), id = f.open(); await f.artifact(id)
-    outcomeReview(f, id, result)
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', [dimension]: result, findings: ['root return required'] }, reviewer)
     const before = deliveryRows(f, id)
     for (const nextReviewer of [reviewer, { sessionId: 'another independent reviewer', isRoot: false }]) {
       assert.throws(() => f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
@@ -552,9 +553,10 @@ for (const result of ['fail', 'unverified']) {
     }
   })
 
-  test('pre-upgrade active ' + result + '-then-pass history cannot be accepted without root return', async t => {
+  test('pre-upgrade active ' + dimension + '=' + result + '-then-pass history cannot be accepted without root return', async t => {
     const f = fixture(t), id = f.open({ max_reworks: 1 }); await f.artifact(id)
-    outcomeReview(f, id, result)
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', [dimension]: result, findings: ['root return required'] }, reviewer)
     // Model durable rows produced by the former fail-to-pass API, not a new allowed write.
     const db = f.store.open()
     db.prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,'pass','pass','[]',created_at FROM workflow_review WHERE task_id=? ORDER BY id DESC LIMIT 1").run(id)
@@ -602,4 +604,30 @@ test('root return is required after passing review and exhausted budget cannot b
   assert.throws(() => f.change('recordArtifact', id, {}, worker), { code: 'E_WORKFLOW_STAGE' })
   assert.equal(f.executions(), calls)
   assert.deepEqual(deliveryRows(f, id), before)
+})
+
+test('failure from another revision, plan or evidence generation does not poison the current delivery', async t => {
+  for (const dimension of ['revision_id', 'plan_version', 'evidence_generation']) {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const state = f.flow.state({ task_id: id }, run)
+    const history = { revision_id: state.revision_id, plan_version: state.plan_version, evidence_generation: state.evidence_generation }
+    history[dimension] += 100
+    f.store.open().prepare("INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) VALUES(?,?,?,?,?,?,'fail','pass','[]','historical')")
+      .run(id, run, history.revision_id, history.plan_version, history.evidence_generation, reviewer.sessionId)
+    f.review(id)
+    assert.equal(f.accept(id).status, 'accepted')
+  }
+})
+
+test('historical completed fail-then-pass outcome keeps original acceptance replay read-only', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const accepted = f.store.acceptTask(args, run, lead)
+  f.store.open().prepare("INSERT INTO workflow_review(id,task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT 0,task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,'fail','pass','[]',created_at FROM workflow_review WHERE task_id=? LIMIT 1").run(id)
+  const before = deliveryRows(f, id)
+  assert.deepEqual(f.store.acceptTask(args, run, lead), accepted)
+  assert.throws(() => f.store.acceptTask({ ...args, request_key: f.key() }, run, lead), { code: 'E_TERMINAL' })
+  assert.deepEqual(deliveryRows(f, id), before)
+  assert.equal(f.store.taskOf(id, run).task.status, 'accepted')
 })

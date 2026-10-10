@@ -149,10 +149,10 @@ test('restored lead acceptance requires current-root execution and a new indepen
   store.claimTask({ task_id: id, child_id: 'worker' }, run, worker, worker.sessionId)
   const fresh = await resumed.verify(id)
   assert.notEqual(fresh.receipt_id, oldReceipt.receipt_id)
-  assert.throws(() => resumed.accept(id), { code: 'E_WORKFLOW_EVIDENCE' },
-    'fresh execution alone cannot reuse the historical artifact and review')
   assert.equal(resumed.state(id).task_status, 'claimed')
   store.submitTask({ task_id: id }, run, worker)
+  assert.throws(() => resumed.accept(id), { code: 'E_WORKFLOW_EVIDENCE' },
+    'fresh execution alone cannot reuse the historical artifact and review')
   const artifact = resumed.artifact(id)
   assert.notEqual(artifact.revision_id, oldArtifact.revision_id)
   assert.equal(artifact.receipt_id, fresh.receipt_id)

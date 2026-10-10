@@ -53,7 +53,7 @@ test('submitted submit and close(done/partial) retries preserve task timestamps 
   const task_id = seedSubmitted(store, run)
   // A fixed earlier timestamp makes a spurious transition observable even within one millisecond.
   const submittedAt = '2026-01-01T00:00:00.000Z'
-  store.handle.prepare('UPDATE task SET updated_at = ? WHERE id = ?').run(submittedAt, task_id)
+  store.handle.prepare('UPDATE task SET updated_at = ?, submitted_at = ? WHERE id = ?').run(submittedAt, submittedAt, task_id)
   const before = store.board({ task_id }, run)
   for (const result of [undefined, 'done', 'partial']) {
     const args = { task_id, note: '重复说明不得落库' }

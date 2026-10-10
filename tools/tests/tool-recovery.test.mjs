@@ -246,9 +246,13 @@ for (const [method, name, args, diagnostic] of [
 }
 
 // Real SQLite journal; only native service publication and child control are fixtures.
-function controlJournalFixture(t, { detached = false, unreadableStore = false, malformedJournal = false } = {}) {
+function controlJournalFixture(t, { detached = false, unreadableStore = false, malformedJournal = false,
+  initialPublication, reflectedStore = false } = {}) {
   const store = tempStore(t)
   let published = detached ? undefined : malformedJournal ? { recovery: {} } : store
+  if (initialPublication === 'null-store') published = null
+  if (initialPublication === 'null-journal') published = { recovery: null }
+  if (initialPublication === 'undefined-journal') published = { recovery: undefined }
   const events = [
     { type: 'turn/start', data: { turn: 1 } },
     { type: 'step/start', data: { turn: 1, step: 1 } },
@@ -263,6 +267,7 @@ function controlJournalFixture(t, { detached = false, unreadableStore = false, m
   }
   applyTools({
     logger: { warn() {} },
+    taskforceStore: reflectedStore ? store : undefined,
     get(name) {
       if (name === 'taskforceStore') {
         if (unreadableStore) throw new Error('PRIVATE_SERVICE_FAILURE')
@@ -408,5 +413,45 @@ for (const action of ['send', 'stop']) {
     assert.equal(f.effects[action], 0)
     assertJournalUnavailable(denied)
     assert.doesNotMatch(denied.error, /not a function|beginControl|finishControl/)
+  })
+}
+
+for (const action of ['send', 'stop']) {
+  for (const initialPublication of ['null-store', 'null-journal']) {
+    test('explicit ' + initialPublication + ' cannot authorize keyless ' + action, async t => {
+      const f = controlJournalFixture(t, { initialPublication })
+      const before = operationRows(f.store)
+      const result = await f.call(action)
+      assert.equal(f.effects[action], 0, 'explicit null is not evidence of a never-journaled activation')
+      assertJournalUnavailable(result)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+  }
+  test('a failed primary store lookup cannot use reflected journal for ' + action, async t => {
+    const f = controlJournalFixture(t, { unreadableStore: true, reflectedStore: true })
+    const before = operationRows(f.store)
+    const result = await f.call(action)
+    assert.equal(f.effects[action], 0, 'a reflected journal cannot waive primary lookup failure')
+    assertJournalUnavailable(result)
+    assert.deepEqual(operationRows(f.store), before)
+  })
+  test('normal undefined primary lookup remains authoritative for detached ' + action, async t => {
+    const f = controlJournalFixture(t, { detached: true, reflectedStore: true })
+    const before = operationRows(f.store)
+    const result = await f.call(action)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.operation.durable, false, 'a normal primary miss must not discover a shadow journal')
+    assert.equal(result.operation.durability, 'unavailable')
+    assert.equal(f.effects[action], 1)
+    assert.deepEqual(operationRows(f.store), before)
+  })
+  test('undefined journal retains never-journaled keyless ' + action, async t => {
+    const f = controlJournalFixture(t, { initialPublication: 'undefined-journal' })
+    const result = await f.call(action)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.operation.durable, false)
+    assert.equal(result.operation.durability, 'unavailable')
+    assert.equal(f.effects[action], 1)
+    assert.equal(operationRows(f.store).length, 0)
   })
 }

@@ -356,7 +356,7 @@ export async function hookEvidence(count, rounds) {
     }
     await scenario('initial_replay')
     for (let i = 0; i < rounds; i++) await scenario('unchanged_reread')
-    await scenario('append', () => {
+    for (let i = 0; i < rounds; i++) await scenario('append', () => {
       const event = freeze({ seq: history.length, type: 'todo/write', data: { todos: [{ content: 'appended task', status: 'in_progress' }] } })
       if (containerMode === 'frozen_outer') history = [...history, event]
       else history.push(event)
@@ -407,7 +407,8 @@ async function main() {
     emit({ kind: 'nextgen_events', events: Number(args[1]), measurements: await hookEvidence(Number(args[1]), Number(args[2])) }); return
   }
   const opts = options(args), root = syntheticRoot()
-  emit({ kind: 'nextgen_configuration', ...opts, node: process.version, timing_gate: false,
+  emit({ kind: 'nextgen_configuration', ...opts, node: process.version, sqlite: process.versions.sqlite, v8: process.versions.v8,
+    platform: process.platform, architecture: process.arch, timing_gate: false,
     cold_os_cache: 'not measured', workload: 'synthetic; no provider calls', variants: VARIANTS,
     counters: 'rows returned to JavaScript and separate projection reducer inputs; not SQLite visits',
     event_timing: 'complete guard/context pre-step hooks; replay oracles and separate reducer counters outside timing',
@@ -451,6 +452,19 @@ async function main() {
     const { report, fresh_process_total_wall_ms } = await invokeWorker(['--worker-events', String(opts.events), String(opts.rounds)])
     emit({ kind: report.kind, events: report.events, fresh_process_total_wall_ms })
     for (const measurement of report.measurements) emit({ kind: 'nextgen_event_measurement', ...measurement })
+    const groups = new Map()
+    for (const m of report.measurements) {
+      const key = JSON.stringify([m.scenario, m.container_mode, m.repeated_failure_tail])
+      if (!groups.has(key)) groups.set(key, [])
+      groups.get(key).push(m)
+    }
+    for (const measurements of groups.values()) {
+      const first = measurements[0]
+      emit({ kind: 'nextgen_event_summary', scenario: first.scenario, container_mode: first.container_mode,
+        repeated_failure_tail: first.repeated_failure_tail, ...summary(measurements.map(m => m.hook_ms)),
+        max_sampled_rss_bytes: Math.max(...measurements.map(m => m.rss_bytes)),
+        whole_process_peak_rss_bytes: Math.max(...measurements.map(m => m.peak_rss_bytes)) })
+    }
     emit({ kind: 'nextgen_complete', semantic_assertions: 'passed', timing_gate: false })
   } finally { rmSync(root, { recursive: true, force: true }) }
 }

@@ -158,7 +158,7 @@ test('strict checkpoint readback rejects listener-only success, mismatches, and 
   assert.equal(typeof host.flushNativeCheckpoint, 'function', 'strict checkpoint helper missing')
   const session = { header: { id: 'actual' }, events: [{ seq: 0, type: 'test', data: { value: 1 } }] }
   let closed = 0, durable = { header: session.header, events: session.events }
-  const backend = { async open(id, mode) { assert.equal(id, 'actual'); assert.equal(mode, 'read'); return { async read() { return durable }, async close() { closed++ } } } }
+  const backend = { async flush() {}, async open(id, mode) { assert.equal(id, 'actual'); assert.equal(mode, 'read'); return { id, access: mode, header: session.header, async read() { return durable }, async close() { closed++ } } } }
   const sessions = { get: id => id === 'actual' ? session : undefined, async flush() { return true } }
   const ctx = { get: name => ({ sessions, sessionPersistence: backend })[name] }
   const args = { version: '0.2.0-rc.2', session, persistence: backend }

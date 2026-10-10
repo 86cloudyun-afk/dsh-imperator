@@ -21,6 +21,7 @@
 |---|---|---|
 | `target_id` | 是 | 目标子代理的 sessionId（派发返回的 `childId`） |
 | `message` | 是 | **模型撰写的新指令全文**（改要求 / 补边界 / 纠正方向），不是 id、不是占位符 |
+| `request_key` | 否 | 原操作的重试键，最多 256 UTF-8 字节；显式提供时必须有可用恢复日志 |
 
 成功返回（紧凑 JSON）：
 
@@ -47,11 +48,18 @@
 |---|---|---|
 | `target_id` | 是 | 目标子代理 sessionId |
 | `reason` | 否 | 只写进**返回体**供对账，不投递给目标（要它知道原因就先 `task_child_send` 再停） |
+| `request_key` | 否 | 原操作的重试键，最多 256 UTF-8 字节；显式提供时必须有可用恢复日志 |
 
 成功返回额外带 `stopped.accepted`、`state_truth`（区分「信号已发出」与「已安静」）。
 `next` 给出机械路径：**要确认真实状态就去读能证明状态的地方**（`task_board` 看它落的事实、
 `list_agents` 看 status），并显式警告**不要为了查状态重复调 `task_child_stop`** —— 那是
 「再发一次停止信号」，不是查询；要它带着新要求接着干就先 `task_child_send` 再等它落事实。
+
+挂载恢复日志时，控制效果前先持久化 intent，并返回 `operation.retry_key`。同键或同一可信 turn/step/rootCallId/callId 重放只读既有 operation，不再调用宿主。pending/unknown 不证明先前效果失败；必须保留原键，禁止换键自动重复发送或停止。
+
+每个 tools activation 绑定首次观察到的恢复日志对象（包括首次控制之前已挂载的日志）。日志消失、不可读、关闭或换成另一个对象时，在效果调用前返回 `E_CONTROL_JOURNAL_UNAVAILABLE`。新 activation 的显式 `request_key` 同样要求日志。该码仅证明**本次未调用宿主**，不能推定此前同键效果失败；停止自动重试并向主控报告，恢复原日志后用原键读取 pending/replayed 结果。日志对象确需替换时，由主控核实原持久数据库并重新激活 tools；同一日志对象重连原数据库无需更换绑定。
+
+只有从未观察到日志且没有显式 `request_key` 的 detached 旧适配器保留原控制行为，返回 `operation.durable:false`、`durability:"unavailable"`，不提供重放保护。服务解析抛错不属于这种兼容场景。更多持久化边界见 [RECOVERY.md](RECOVERY.md)。
 
 ## 3. 授权判据（不靠提示词，靠代码）
 
@@ -79,6 +87,8 @@
 | `E_CHILD_MISSING` | 保留码：目标不存在（当前与 `E_CHILD_NOT_OWN` 合并，二者对调用方动作相同） | — |
 | `E_CHILD_NO_ID` | 无法核对归属（`listChildren` 读失败） | 服务问题，不冒险操作 |
 | `E_CHILD_SERVICE` | `ctx.subagents` 未挂载或**缺所需方法** | 部署/宿主集成问题，核对原生 subagents 服务，不盲目换入口重试 |
+| `E_CONTROL_JOURNAL_UNAVAILABLE` | 控制日志不可用或更换；本次未 dispatch，但此前效果仍可能未知 | 保留原键，**不得换键重试**；报告主控，恢复原日志后只读原结果 |
+| `E_CONTROL_OUTCOME_UNKNOWN` | 既有操作 pending/unknown，或宿主效果后结果未能持久化 | 不推定失败，不重放；保留 `operation.retry_key` 核对持久日志和实际回执 |
 
 ## 5. 契约依据（实测，不是推测）
 

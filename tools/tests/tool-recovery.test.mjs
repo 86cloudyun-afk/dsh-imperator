@@ -244,3 +244,169 @@ for (const [method, name, args, diagnostic] of [
     assertHint(result, 'runtime')
   })
 }
+
+// Real SQLite journal; only native service publication and child control are fixtures.
+function controlJournalFixture(t, { detached = false, unreadableStore = false, malformedJournal = false } = {}) {
+  const store = tempStore(t)
+  let published = detached ? undefined : malformedJournal ? { recovery: {} } : store
+  const events = [
+    { type: 'turn/start', data: { turn: 1 } },
+    { type: 'step/start', data: { turn: 1, step: 1 } },
+  ]
+  const agent = { id: RUN, session: { header: { id: RUN }, events } }
+  const definitions = new Map()
+  const effects = { send: 0, stop: 0 }
+  const subagents = {
+    async listChildren() { return [{ id: CHILD, mode: 'continuable', createdAt: 0 }] },
+    async sendMessage() { effects.send++; return 'journal-message-' + effects.send },
+    interrupt() { effects.stop++ },
+  }
+  applyTools({
+    logger: { warn() {} },
+    get(name) {
+      if (name === 'taskforceStore') {
+        if (unreadableStore) throw new Error('PRIVATE_SERVICE_FAILURE')
+        return published
+      }
+      if (name === 'subagents') return subagents
+      if (name === 'agents') return { get: id => id === RUN ? agent : undefined }
+    },
+    tools: { register(definition) { definitions.set(definition.name, definition); return () => {} } },
+  })
+  return {
+    store, effects, events,
+    publish(value) { published = value },
+    async call(action, request_key) {
+      const args = { target_id: CHILD, ...(action === 'send' ? { message: 'PRIVATE_CONTROL_MESSAGE' } : {}),
+        ...(request_key === undefined ? {} : { request_key }) }
+      return JSON.parse(await definitions.get('task_child_' + action).execute(args, {
+        agent, callId: 'journal-call', rootCallId: 'journal-root-call', signal: new AbortController().signal,
+      }))
+    },
+  }
+}
+function pendingControl(f) {
+  f.store.open().exec("CREATE TRIGGER deny_control_outcome BEFORE UPDATE ON control_operation BEGIN SELECT RAISE(ABORT, 'PRIVATE_OUTCOME_FAILURE'); END")
+}
+function operationRows(store) {
+  return store.open().prepare('SELECT * FROM control_operation ORDER BY id').all()
+}
+function assertJournalUnavailable(result) {
+  assert.equal(result.ok, false, JSON.stringify(result))
+  assert.equal(result.code, 'E_CONTROL_JOURNAL_UNAVAILABLE', JSON.stringify(result))
+  assert.match(result.hint, /原.*(?:键|retry_key)|retry_key/)
+  assert.match(result.hint, /不得换键|禁止.*新.*键/)
+  assert.match(result.hint, /日志|journal|恢复/)
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_CONTROL_MESSAGE|PRIVATE_OUTCOME_FAILURE|PRIVATE_SERVICE_FAILURE/)
+  for (const field of ['sent', 'stopped', 'execution', 'delivery']) {
+    assert.equal(Object.hasOwn(result, field), false, 'unavailable journal cannot return ' + field)
+  }
+}
+
+for (const action of ['send', 'stop']) {
+  for (const coordinate of ['explicit key', 'trusted coordinates']) {
+    for (const degradation of ['missing', 'replacement']) {
+      test('pending ' + action + ' with ' + coordinate + ' cannot repeat after journal ' + degradation, async t => {
+        const f = controlJournalFixture(t)
+        pendingControl(f)
+        const key = coordinate === 'explicit key' ? 'journal-original-key' : undefined
+        const first = await f.call(action, key)
+        assert.equal(first.code, 'E_CONTROL_OUTCOME_UNKNOWN', JSON.stringify(first))
+        assert.equal(first.operation.status, 'pending')
+        assert.equal(typeof first.operation.retry_key, 'string')
+        assert.equal(f.effects[action], 1)
+        const before = operationRows(f.store)
+        const replacement = degradation === 'replacement' ? tempStore(t) : undefined
+        f.publish(replacement)
+        const denied = await f.call(action, key)
+        assert.equal(f.effects[action], 1, 'same operation must not reach the native effect twice: ' + JSON.stringify(denied))
+        assertJournalUnavailable(denied)
+        assert.deepEqual(operationRows(f.store), before)
+        if (replacement) assert.equal(operationRows(replacement).length, 0)
+        f.publish(f.store)
+        const restored = await f.call(action, first.operation.retry_key)
+        assert.equal(restored.operation.operation_id, first.operation.operation_id)
+        assert.equal(restored.operation.replayed, true)
+        assert.equal(restored.operation.status, 'pending')
+        assert.equal(f.effects[action], 1)
+        assert.deepEqual(operationRows(f.store), before)
+      })
+    }
+  }
+
+  test('explicit ' + action + ' retry key needs a journal even on a new detached activation', async t => {
+    const f = controlJournalFixture(t, { detached: true })
+    const denied = await f.call(action, 'persisted-elsewhere-key')
+    assert.equal(f.effects[action], 0, 'an explicit retry key cannot fall back to a legacy effect')
+    assertJournalUnavailable(denied)
+  })
+
+  test('journal observed at activation cannot disappear before the first ' + action, async t => {
+    const f = controlJournalFixture(t)
+    f.publish(undefined)
+    const denied = await f.call(action)
+    assert.equal(f.effects[action], 0)
+    assertJournalUnavailable(denied)
+  })
+
+  test('closed journal denies ' + action + ' before a new native effect with safe diagnostics', async t => {
+    const f = controlJournalFixture(t)
+    pendingControl(f)
+    const first = await f.call(action, 'closed-journal-original')
+    assert.equal(first.operation.status, 'pending')
+    f.store.close()
+    const denied = await f.call(action, first.operation.retry_key)
+    assert.equal(f.effects[action], 1)
+    assertJournalUnavailable(denied)
+    assert.equal(JSON.stringify(denied).includes(f.store.root), false, 'closed-store paths are not recovery diagnostics')
+  })
+
+  test('unreadable replacement recovery denies ' + action + ' without exposing its exception', async t => {
+    const f = controlJournalFixture(t)
+    pendingControl(f)
+    const first = await f.call(action, 'unreadable-journal-original')
+    assert.equal(first.operation.status, 'pending')
+    const before = operationRows(f.store)
+    f.publish({ get recovery() { throw new Error('PRIVATE_SERVICE_FAILURE') } })
+    const denied = await f.call(action, first.operation.retry_key)
+    assert.equal(f.effects[action], 1)
+    assertJournalUnavailable(denied)
+    assert.deepEqual(operationRows(f.store), before)
+  })
+
+  test('a fresh key cannot bypass a missing journal after durable ' + action, async t => {
+    const f = controlJournalFixture(t)
+    const first = await f.call(action)
+    assert.equal(first.ok, true, JSON.stringify(first))
+    f.publish(undefined)
+    f.events.push({ type: 'step/start', data: { turn: 1, step: 2 } })
+    const denied = await f.call(action)
+    assert.equal(f.effects[action], 1)
+    assertJournalUnavailable(denied)
+  })
+
+  test('genuinely detached ' + action + ' without a request key retains explicit legacy durability', async t => {
+    const f = controlJournalFixture(t, { detached: true })
+    const result = await f.call(action)
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.operation.durable, false)
+    assert.equal(result.operation.durability, 'unavailable')
+    assert.equal(f.effects[action], 1)
+  })
+}
+
+for (const action of ['send', 'stop']) {
+  test('unreadable store resolution cannot authorize initial detached ' + action, async t => {
+    const f = controlJournalFixture(t, { unreadableStore: true })
+    const denied = await f.call(action)
+    assert.equal(f.effects[action], 0, 'a failed service lookup is not a known journal-free adapter')
+    assertJournalUnavailable(denied)
+  })
+  test('malformed initial journal cannot authorize ' + action + ' or leak method diagnostics', async t => {
+    const f = controlJournalFixture(t, { malformedJournal: true })
+    const denied = await f.call(action)
+    assert.equal(f.effects[action], 0)
+    assertJournalUnavailable(denied)
+    assert.doesNotMatch(denied.error, /not a function|beginControl|finishControl/)
+  })
+}

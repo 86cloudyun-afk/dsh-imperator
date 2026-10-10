@@ -560,8 +560,8 @@ section('6. 服务不可用：可读错误而非崩溃（不静默降级到 team
   )
   check(
     'C28',
-    '同上：注册期已告警（不静默），且工具仍保持注册（11 个）',
-    noService.state.warnings.some((w) => w.includes('subagents')) && noService.state.tools.length === 11,
+    '同上：注册期已告警（不静默），且工具仍保持注册（14 个）',
+    noService.state.warnings.some((w) => w.includes('subagents')) && noService.state.tools.length === 14,
     JSON.stringify({ warnings: noService.state.warnings, tools: noService.state.tools.length }),
   )
 

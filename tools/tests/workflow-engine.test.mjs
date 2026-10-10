@@ -6,6 +6,8 @@ import { spawnSync } from 'node:child_process'
 import { Worker } from 'node:worker_threads'
 import { TaskforceStore } from '../../lib/store/index.js'
 import { TaskforceGovernor } from '../../lib/governor/index.js'
+import { TaskforceRecovery } from '../../lib/store/recovery.js'
+import { workflowAdmission } from '../../lib/store/workflow.js'
 import { runTaskVerification } from '../../lib/tools/verification.js'
 import { tempStore } from './helpers.mjs'
 
@@ -397,4 +399,111 @@ test('returned unapproved plans allow dependency revision until the first approv
   f.change('returnForRework', id, { reason: 'approved implementation needs rework' })
   assert.throws(() => f.change('setDependencies', id, { prerequisite_task_ids: [] }), { code: 'E_WORKFLOW_STAGE' })
   assert.deepEqual(f.flow.state({ task_id: id }, run).dependencies, [replacement])
+})
+
+for (const table of ['task_event', 'task_checkpoint', 'control_operation']) {
+  for (const transitive of [false, true]) {
+    test(table + ' ownership corruption blocks ' + (transitive ? 'transitive' : 'direct') + ' workflow dependencies at every gate', async t => {
+      const f = fixture(t), recovery = new TaskforceRecovery(f.store)
+      const complete = async dependencies => {
+        const id = f.open({ dependencies }); await f.artifact(id); f.review(id); f.accept(id); return id
+      }
+      const upstream = await complete([])
+      const prerequisite = transitive ? await complete([upstream]) : upstream
+      const pending = f.create({ dependencies: [prerequisite] }).task_id; f.change('approvePlan', pending)
+      const active = f.open({ dependencies: [prerequisite] })
+      await f.artifact(active); f.review(active); f.store.submitTask({ task_id: active }, run, worker)
+      const bound = f.open({ dependencies: [prerequisite] })
+      const governor = new TaskforceGovernor(f.store), authority = { role: 'lead', sessionId: run }
+      const reservation = governor.reserve({ operation_key: 'before-corruption', task_id: bound, generation: 0,
+        kind: 'new', mode: 'read', resources: [] }, run, authority)
+      recovery.checkpoint({ task_id: upstream, summary: 'private checkpoint content', next_action: 'private next action' }, run, lead)
+      recovery.beginControl({ task_id: upstream, action: 'stop', target_id: 'private control target',
+        payload_hash: 'a'.repeat(64), request_key: 'control' }, { ...lead, runId: run })
+      const db = f.store.open()
+      const fences = () => db.prepare('SELECT * FROM task_dependency_fence ORDER BY task_id,evidence_generation,prerequisite_task_id').all()
+      const beforeFences = fences(), beforeGovernor = governor.snapshot(run)
+      const secretSafe = error => error.code === 'E_STORE_INTEGRITY' && !/private|foreign secret/.test(error.message + JSON.stringify(error))
+      for (const corruptRun of ['foreign secret run', null]) {
+        assert.ok(db.prepare('UPDATE ' + table + ' SET run_id=? WHERE task_id=?').run(corruptRun, upstream).changes > 0)
+        for (const id of [pending, active, bound]) {
+          const state = f.flow.state({ task_id: id }, run)
+          assert.equal(state.blocked, true)
+          assert.equal(state.blocked_code, 'E_STORE_INTEGRITY')
+          assert.equal(/private|foreign secret/.test(JSON.stringify(state)), false)
+        }
+        assert.equal(f.flow.ready({}, run).tasks.some(row => [pending, active, bound].includes(row.task_id)), false)
+        assert.throws(() => f.claim(pending), secretSafe)
+        assert.throws(() => governor.reserve({ operation_key: 'after-corruption', task_id: pending, generation: 0,
+          kind: 'new', mode: 'read', resources: [] }, run, authority), secretSafe)
+        assert.throws(() => governor.bind({ reservation_id: reservation.reservation_id, generation: reservation.generation,
+          session_id: worker.sessionId }, run, authority), secretSafe)
+        assert.throws(() => f.store.submitTask({ task_id: active }, run, worker), secretSafe)
+        assert.throws(() => f.store.acceptTask({ task_id: active,
+          expected_version: f.flow.state({ task_id: active }, run).row_version, request_key: f.key() }, run, lead), secretSafe)
+        assert.equal(f.store.taskOf(pending, run).task.status, 'open')
+        assert.equal(f.store.taskOf(active, run).task.status, 'submitted')
+        assert.deepEqual(fences(), beforeFences)
+        assert.deepEqual(governor.snapshot(run), beforeGovernor)
+      }
+    })
+  }
+}
+
+test('correct recovery attribution and nullable unassigned controls preserve workflow readiness', async t => {
+  const f = fixture(t), recovery = new TaskforceRecovery(f.store), upstream = f.open()
+  await f.artifact(upstream); f.review(upstream); f.accept(upstream)
+  recovery.checkpoint({ task_id: upstream, summary: 'planning context' }, run, lead)
+  recovery.beginControl({ task_id: upstream, action: 'stop', target_id: 'worker', payload_hash: 'b'.repeat(64),
+    request_key: 'attached-control' }, { ...lead, runId: run })
+  for (const runId of [null, 'foreign run']) recovery.beginControl({ action: 'stop', target_id: 'other',
+    payload_hash: 'c'.repeat(64), request_key: 'unassigned-' + runId }, { sessionId: 'foreign caller', runId })
+  const id = f.open({ dependencies: [upstream] })
+  assert.equal(f.flow.state({ task_id: id }, run).blocked, false)
+  await f.artifact(id); f.review(id); assert.equal(f.accept(id).status, 'accepted')
+})
+
+test('detached workflow gates remain usable without optional recovery tables', async t => {
+  const f = fixture(t), upstream = f.open()
+  await f.artifact(upstream); f.review(upstream); f.accept(upstream)
+  const id = f.create({ dependencies: [upstream] }).task_id; f.change('approvePlan', id)
+  const db = f.store.open()
+  db.exec('DROP TRIGGER recovery_task_insert; DROP TRIGGER recovery_task_update; DROP TABLE task_event; DROP TABLE task_checkpoint; DROP TABLE control_operation;')
+  assert.equal(f.flow.state({ task_id: id }, run).blocked, false)
+  assert.doesNotThrow(() => workflowAdmission(db, db.prepare('SELECT * FROM task WHERE id=?').get(id)))
+})
+
+test('zero-rework coding tasks reject premature submission without stranding the workflow', async t => {
+  const f = fixture(t), id = f.create({ max_reworks: 0 }).task_id
+  for (const stage of ['plan', 'implement']) {
+    const before = f.flow.state({ task_id: id }, run)
+    assert.equal(before.stage, stage)
+    const events = f.store.open().prepare('SELECT COUNT(*) AS n FROM task_event WHERE task_id=?').get(id).n
+    for (const actor of [worker, lead]) {
+      assert.throws(() => f.store.submitTask({ task_id: id, note: 'out of order' }, run, actor), { code: 'E_WORKFLOW_STAGE' })
+      assert.deepEqual(f.flow.state({ task_id: id }, run), before)
+      assert.equal(f.store.taskOf(id, run).task.status, 'open')
+      assert.equal(f.store.open().prepare('SELECT COUNT(*) AS n FROM task_event WHERE task_id=?').get(id).n, events)
+    }
+    if (stage === 'plan') f.change('approvePlan', id)
+  }
+  assert.equal(f.claim(id).status, 'claimed')
+  await f.artifact(id); f.review(id)
+  assert.equal(f.accept(id).status, 'accepted')
+  assert.equal(f.flow.state({ task_id: id }, run).rework_count, 0)
+})
+
+test('workflow submission preserves bound ownership, submitted replay and completed acceptance replay', async t => {
+  const f = fixture(t), id = f.open()
+  assert.throws(() => f.store.submitTask({ task_id: id }, run, reviewer), { code: 'E_TASK_CONFLICT' })
+  assert.equal(f.store.taskOf(id, run).task.status, 'claimed')
+  assert.equal(f.store.submitTask({ task_id: id }, run, lead).status, 'submitted')
+  assert.equal(f.store.submitTask({ task_id: id }, run, worker).already, true)
+  await f.artifact(id); f.review(id)
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const accepted = f.store.acceptTask(args, run, lead)
+  assert.deepEqual(f.store.acceptTask(args, run, lead), accepted)
+  assert.throws(() => f.store.submitTask({ task_id: id }, run, worker), { code: 'E_TERMINAL' })
+  const legacy = f.store.openTask({ title: 'unowned legacy submission' }, run).task_id
+  assert.equal(f.store.submitTask({ task_id: legacy }, run).status, 'submitted')
 })

@@ -14,6 +14,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
   const helpers = await import('../../lib/scheduler/dsh-host.js').catch(e => { if (e.code === 'ERR_MODULE_NOT_FOUND') return {}; throw e })
   assert.equal(typeof helpers.prepareNativeIdentity, 'function', 'native identity preparation missing')
   assert.equal(typeof helpers.flushNativeCheckpoint, 'function', 'strict native checkpoint missing')
+  const previousExitCode = process.exitCode
   const version = installationVersion(anchor)
   const fixture = await controlledProfile(anchor, root)
   const cleanup = () => fixture.dispose()
@@ -61,6 +62,6 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
     console.log('SCHEDULER_HOST_VERIFIED ' + JSON.stringify({ version, checks: ['prebound-id', 'live-parent', 'strict-flush', 'raw-readback'], native_enabled: false, model_requests: requests }))
   } finally {
     try { for (const handle of handles.reverse()) await handle.dispose() }
-    finally { try { await application?.shutdown() } finally { process.off('exit', cleanup); fixture.dispose() } }
+    finally { try { await application?.shutdown.shutdown(1) } finally { process.off('exit', cleanup); fixture.dispose(); process.exitCode = previousExitCode } }
   }
 })

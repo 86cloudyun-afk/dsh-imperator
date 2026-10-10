@@ -12,6 +12,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 - lib/operations/index.js
 - tools/tests/execution-receipts.test.mjs
 - tools/tests/operations.test.mjs
+- tools/tests/host-boundaries.test.mjs (two anchor-enabled native receipt cases)
 - docs/OPERATIONS.md
 - docs/STORE.md
 
@@ -36,3 +37,7 @@ Canonicalize only trusted root for containment; preserve textual provenance and 
 5. Write the report at docs/superpowers/research/2026-10-10-imperator-audit/task-4-report.md. Return status/head/tree/owned-file blobs, one-line test evidence and concerns.
 
 Do not spawn subagents or reviewers. Parent assigns independent review, integrates shared hunks, creates PRs and merges. Do not touch other branches/main, weaken assertions, alter workflow gates, or print credentials. Without shell, use structured GitHub tree/commit/ref tools with expected_sha leases and real Actions. Report remote evidence honestly.
+
+## Exact dependency
+
+After genuine baseline RED, Task4 may integrate Task2 candidate8834bdb7dae458936f93e120a022b4838cd317c6 as a commit parent and copy its exact owned blobs for joint schema verification. Carry all its required migration fixtures; do not edit dependencies. Record dependency SHA/blobs separately. Parent integrates only Task4-owned files and the STORE documentation delta. Native symlink positives run in the existing anchor-enabled host-boundaries stage, not a skipped node:test stage.

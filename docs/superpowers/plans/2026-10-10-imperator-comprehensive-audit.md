@@ -111,3 +111,5 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 Task2 also owns the existing submit-status-code fixture: preserve its no-write assertions, but pin submitted_at after the genuine chronology RED. Task5 also owns one native guard parity hunk in host-api-contract, the existing anchor-enabled stage, avoiding an ineffective skipped node:test check. All implementers retain the frozen234a789 production base; these grants do not authorize other files.
 
 Task2 additionally owns only the owner-session additive-migration expected-row hunk: explicitly assert submitted_at:null and preserve every old row value/identity assertion. No identity behavior or other owner-session tests may change.
+
+Task4 owns two native symlink receipt cases in host-boundaries, the actual anchor-enabled stage. Task4 may carry the exact Task2 candidate as a documented dependency before final core-column validation. Task5 covers Task6 E_CONTROL_JOURNAL_UNAVAILABLE as an ambiguous historical outcome; this does not prove the rejected current call executed.

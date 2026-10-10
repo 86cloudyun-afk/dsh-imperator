@@ -35,3 +35,7 @@ Keep existing data, public names, scope isolation, strict native execution and m
 ## Delivery
 
 Implement independent fixes in isolated branches with explicit owned files. Integrate shared-file hunks without whole-side replacement. Publish cohesive component PRs as practical, each with its original-main/full-range review and exact-head checks; carry common planning evidence without claiming future merge gates in source. Verify final main tree and main CI. Record every issue disposition, actual test/commit evidence, external limitations and decisions in the ledger/PR records.
+
+## Durable journal availability interface
+
+`E_CONTROL_JOURNAL_UNAVAILABLE` means the current control dispatch is refused before a native effect, while missing journal state cannot establish the result of earlier requests with the same key. Preserve the original retry key and advise reading its receipt after recovery; never suggest changing the key or repeating an effect. Guard treats this envelope conservatively as an unknown historical outcome, retaining definite-failure controls separately.

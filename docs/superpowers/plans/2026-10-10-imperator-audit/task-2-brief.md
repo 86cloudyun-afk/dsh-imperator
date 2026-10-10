@@ -45,3 +45,7 @@ Do not spawn subagents or reviewers. Parent assigns independent review, integrat
 ## Recorded follow-up
 
 Preserve existing diagnostic zero counts and exact schema expectations while adding receipt/waiver and submitted_at. PR63's actual review found missing task-leading access for control_operation integrity queries. Test production SQL EXPLAIN QUERY PLAN and correct scoped counts with a substantial fixture before the minimal additive index correction; retain all original rows and columns.
+
+## Startup diagnostic performance follow-up
+
+PR63's new actual review requires testing shared NULL-run audit diagnostics against 100k assigned receipts and 100k assigned waivers, including sparse NULL/quarantined rows. Observe real migrate/open/boot/adopt SQL, then add a discriminating run-key SEARCH plan assertion before the minimal additive partial-index correction inside the existing core migration transaction. Preserve row hashes, column metadata, added_columns[], counts, control task-key index, adoption and quarantine. Old index absence remains readable to doctor; preflight records its real copy schema change. Timings are observations, not thresholds.

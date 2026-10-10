@@ -36,3 +36,7 @@ Fail closed at durable control boundary before native effect when durability was
 5. Write the report at docs/superpowers/research/2026-10-10-imperator-audit/task-6-report.md. Return status/head/tree/owned-file blobs, one-line test evidence and concerns.
 
 Do not spawn subagents or reviewers. Parent assigns independent review, integrates shared hunks, creates PRs and merges. Do not touch other branches/main, weaken assertions, alter workflow gates, or print credentials. Without shell, use structured GitHub tree/commit/ref tools with expected_sha leases and real Actions. Report remote evidence honestly.
+
+## Synchronous journal result follow-up
+
+PR62's new actual review requires valid synchronous begin/finish envelopes. Test malformed absence, fields, statuses, identifiers and thenables before minimal validation. Retain short new begin and full SQLite pending/accepted/rejected/unknown replay/finish positives. Rejected native/cross-realm Promise results must fail closed without crashing strict child Node or leaking private errors; observe rejection without accepting async durability. Invalid finish after dispatch reports unknown under the original key, with no repeat effect. Preserve the six actual Cordis cases and all original continuity tests; add no duplicate resume API.

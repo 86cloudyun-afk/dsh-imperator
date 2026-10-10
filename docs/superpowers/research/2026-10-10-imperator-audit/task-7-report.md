@@ -12,6 +12,10 @@ Each corrected production/test/module-doc blob comes from an independently appro
 
 Seven component PRs are attached. Updated dependency stack63→66→62 allows shared-file changes without silent conflict-side replacement. Independently tested legacy evidence/strict receipt isolation and PR41 coverage are adopted; no redundant implementation-shaped metadata tests are added.
 
+## Historical aggregate and latest inputs
+
+Initial aggregate be24024f / tree641d8c6c passed actual push38034288333 and PR38034290717 six-job acceptance:1001 primary tests and51 anchored boundaries. Whole original-base review held release for two subsequently confirmed interface/performance findings. Task2 latest tested code bb2ee34e5e28ec5cd350d0a8834f21cedc2fe06f passedGREEN38035489681 after selective NULL-run query RED; Task6 latest tested code b3dc0d7d7d10e5fdc3dd983c9fd632cadd79b146 passedGREEN38035848255 after214-negative valid RED including strict child-process Promise crash regressions. Their final reports/manifests were independently approved; root read the full actual logs. Original failed fixture/source histories remain in each report. These results do not replace the revised aggregate gate.
+
 ## Remaining actual gates
 
 At this assembly commit no audit PR has merged. Whole checkout/actual-unpacked-package six-job acceptance, complete original-base release review and an additional fresh actual-PR premerge round are pending. Final exact-head merges, issue dispositions and main-tree/six-job verification are recorded later in the release PR; this file does not assert its own future merge.

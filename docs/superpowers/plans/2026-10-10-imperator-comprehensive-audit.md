@@ -105,16 +105,17 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 **Interfaces:** Version0.4.1; full integration tree; issue/PR dispositions; complete independent final and PR audit; exact-head merge.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-7-brief.md
 
-- [ ] Write discriminating regressions: Strict execution cannot use legacy resolved-blocker-path sequence without valid actual receipt; caller/alias coverage versus PR41 verified; npm test and actual unpacked native six-job matrix; full current/baseline parity and SIGKILL soak; final identical-main-tree and postmerge six checks.
-- [ ] Run tests against unchanged production; record expected RED assertions and SHA/run.
-- [ ] Implement minimal correction: Apply reviewed owned files and shared hunks only, preserve all tests/tool maps/indexes. Advance package/README version once final code is verified. Attach every created PR, inspect its actual checks/threads/comments, merge only reviewed expected head, verify actual main.
-- [ ] Verify full six-job available matrix and write task report with exact-head evidence.
-- [ ] Complete independent spec/quality review, integrate reviewed files and record actual PR gate.
+- [x] Adopt reviewed legacy resolved-blocker-path versus strict execution isolation and PR41 caller/alias coverage from Tasks2/4; preserve registered tests and all original assertions.
+- [x] Integrate reviewed owned blobs and verified shared STORE/host hunks; preserve all157 baseline paths and advance package/README to0.4.1.
+- [x] Verify the initial aggregate six-job run and record why subsequent actual review held release for two more repairs; complete those module RED/GREEN and independent reviews.
+- [ ] Verify the final assembled checkout and actual unpacked-package six-job matrix, current/baseline semantic probes and bounded fault/SIGKILL soak.
+- [ ] Complete full81b7ce67→final release review and a fresh additional actual-PR premerge round; inspect latest exact-head checks/comments/threads.
+- [ ] Merge dependency-ordered expected heads, then verify exact final-main tree and all six final-main jobs before issue/obsolete-PR disposition.
 
 
 ## Ownership amendments
 
-Task2 also owns the existing submit-status-code fixture: preserve its no-write assertions, but pin submitted_at after the genuine chronology RED. Task5 also owns one native guard parity hunk in host-api-contract, the existing anchor-enabled stage, avoiding an ineffective skipped node:test check. All implementers retain the frozen234a789 production base; these grants do not authorize other files.
+Task2 also owns the existing submit-status-code fixture: preserve its no-write assertions, but pin submitted_at after the genuine chronology RED. Task5 also owns one native guard parity hunk in host-api-contract, the existing anchor-enabled stage, avoiding an ineffective skipped node:test check. All implementers retain the frozen81b7ce67114f96ebcd05b257571ce8a6bc9e68c7 production base; these grants do not authorize other files.
 
 Task2 additionally owns only the owner-session additive-migration expected-row hunk: explicitly assert submitted_at:null and preserve every old row value/identity assertion. No identity behavior or other owner-session tests may change.
 
@@ -130,4 +131,8 @@ Task6 additionally owns only new real-Cordis control cases in host-boundaries.te
 
 ## Integration snapshot
 
-All six corrected modules and follow-ups are independently approved. Parent combines only approved owned blobs. Shared STORE is latest Task2 plus exactly two Task4 paragraphs; shared host-boundaries is baseline plus exactly Task4 two alias cases and Task6 six Cordis cases. Task5's three SDK guard tests live separately in host-api-contract. PR dependency order is63→66→62; PR60/61/64/65 are independent. No PR has merged at this snapshot. Package/README move to0.4.1; actual aggregate CI, original-base review, fresh final premerge review and final-main verification are the remaining gates. Existing Task2/Task4 tests supply Task7 legacy/alias coverage; integration and metadata add no separate behavioral correction requiring duplicated tests.
+At this final-input snapshot all six corrected modules and both actual-review follow-up rounds are independently approved. Parent combines only approved owned blobs. Shared STORE is latest Task2 plus exactly two Task4 paragraphs; shared host-boundaries is baseline plus exactly Task4 two alias cases and Task6 six Cordis cases. Task5's three SDK guard tests live separately in host-api-contract. PR dependency order is63→66→62; PR60/61/64/65 are independent. No PR has merged at this snapshot. Package/README move to0.4.1; actual aggregate CI, original-base review, fresh final premerge review and final-main verification are the remaining gates. Existing Task2/Task4 tests supply Task7 legacy/alias coverage; integration and metadata add no separate behavioral correction requiring duplicated tests.
+
+## Second actual-review repair round
+
+Initial aggregate be24024f passed real six-job acceptance (1001 primary tests and51 native boundaries), but full original-base review held release for PR62 malformed synchronous begin/finish journal results and PR63 assigned-audit-history startup scans. Task2 added two transactional partial NULL-run indexes after diagnostic-only and tests-only RED. Task6 validated real short-new/full-replay/finish envelopes after valid214-negative RED, including strict child Node rejecting native/cross-realm Promise tests; invalid finish retains unknown original-key results even when the database already committed. Both latest modules passed actual six-job GREEN and independent original-base spec/quality review. The initial aggregate is historical evidence and does not approve the revised candidate. No audit PR has merged; final aggregate, fresh premerge and exact-main gates remain pending at this source snapshot. Actual completed results are recorded in release PR67 without pretending this file knew its own future CI or merge.

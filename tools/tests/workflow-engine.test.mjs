@@ -376,8 +376,9 @@ test('corrupt accepted dependency cycles fail closed instead of recursing or rep
   assert.throws(() => f.claim(id), { code: 'E_STORE_INTEGRITY' })
 })
 
-test('returned unapproved plans allow dependency revision until the first approval', t => {
-  const f = fixture(t), original = f.create().task_id, replacement = f.create().task_id
+test('returned unapproved plans allow dependency revision until the first approval', async t => {
+  const f = fixture(t), original = f.create().task_id, replacement = f.open()
+  await f.artifact(replacement); f.review(replacement); f.accept(replacement)
   const id = f.create({ dependencies: [original] }).task_id
   f.change('returnForRework', id, { reason: 'replace the planned prerequisite' })
   const before = f.flow.state({ task_id: id }, run)
@@ -392,6 +393,7 @@ test('returned unapproved plans allow dependency revision until the first approv
   assert.throws(() => f.claim(id), { code: 'E_WORKFLOW_STAGE' })
   f.change('approvePlan', id)
   assert.throws(() => f.change('setDependencies', id, { prerequisite_task_ids: [] }), { code: 'E_WORKFLOW_STAGE' })
+  f.claim(id)
   f.change('returnForRework', id, { reason: 'approved implementation needs rework' })
   assert.throws(() => f.change('setDependencies', id, { prerequisite_task_ids: [] }), { code: 'E_WORKFLOW_STAGE' })
   assert.deepEqual(f.flow.state({ task_id: id }, run).dependencies, [replacement])

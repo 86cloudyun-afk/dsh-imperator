@@ -216,3 +216,47 @@ test('a standalone host without native scope or a composed preset owns every age
   assert.equal(ownsComposed({ ctx: { preset: 'standard' } }), false,
     'a declared composed preset must restrict membership to the matching scope')
 })
+
+/** Exercise Node's real bare-package resolution from an isolated source copy.
+ * Package exports are the external boundary; membership logic is unchanged. */
+async function directlyResolvedScope(t, exportsSource) {
+  const { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } = await import('node:fs')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const { pathToFileURL } = await import('node:url')
+  const dir = mkdtempSync(join(tmpdir(), 'taskforce-direct-scope-'))
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const packageDir = join(dir, 'node_modules', '@deepseek-ai', 'dsh-scope')
+  mkdirSync(packageDir, { recursive: true })
+  writeFileSync(join(packageDir, 'package.json'), JSON.stringify({
+    name: '@deepseek-ai/dsh-scope', main: './index.cjs',
+  }))
+  writeFileSync(join(packageDir, 'index.cjs'), exportsSource)
+  const modulePath = join(dir, 'scope-membership.mjs')
+  writeFileSync(modulePath, readFileSync(new URL('../../lib/plugins/scope-membership.mjs', import.meta.url), 'utf8'))
+  return import(pathToFileURL(modulePath).href)
+}
+
+for (const [missing, exportsSource] of [
+  ['scopeChainOf', 'exports.scopeOf = ctx => ctx.nativeScope;'],
+  ['scopeOf', 'exports.scopeChainOf = key => key?.chain ?? [];'],
+  ['both native functions', 'module.exports = {};'],
+  ['both native functions (null exports)', 'module.exports = null;'],
+  ['both native functions (undefined exports)', 'module.exports = undefined;'],
+]) {
+  test('direct native scope resolution refuses missing ' + missing, async t => {
+    const { createScopeMembership } = await directlyResolvedScope(t, exportsSource)
+    assert.throws(() => createScopeMembership({ nativeScope: {}, get: () => undefined }),
+      /native scope unavailable/, 'a successfully resolved incomplete SDK must not activate policy')
+  })
+}
+
+test('complete directly resolved native scope distinguishes exact revisions and empty chains', async t => {
+  const { createScopeMembership } = await directlyResolvedScope(t,
+    'exports.scopeOf = ctx => ctx.nativeScope; exports.scopeChainOf = key => key?.chain ?? [];')
+  const owner = {}, foreign = {}
+  const owns = createScopeMembership({ nativeScope: owner, get: () => undefined })
+  assert.equal(owns({ ctx: { nativeScope: { chain: [owner] } } }), true)
+  assert.equal(owns({ ctx: { nativeScope: { chain: [foreign] } } }), false)
+  assert.equal(owns({ ctx: { nativeScope: { chain: [] } } }), false)
+})

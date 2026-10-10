@@ -476,3 +476,112 @@ test('late cohort queries filter blocker history through an index without sortin
     assert.doesNotMatch(plan, /TEMP B-TREE FOR ORDER BY/, 'membership IDs stream in index order')
   }
 })
+
+
+test('all-runs statistics share one snapshot across a concurrent WAL insert', t => {
+  const store = tempStore(t, { journalMode: 'wal' })
+  const id = store.openTask({ title: 'initial task' }, 'run-a').task_id
+  store.recordFact({ task_id: id, kind: 'blocker', statement: 'initial blocker' }, 'run-a')
+  const writer = new DatabaseSync(store.dbPath)
+  t.after(() => writer.close())
+  const original = store.handle.prepare, prepare = original.bind(store.handle)
+  let inserted = false
+  store.handle.prepare = sql => {
+    const statement = prepare(sql)
+    if (sql === 'SELECT status, COUNT(*) AS n FROM task GROUP BY status') {
+      const all = statement.all.bind(statement)
+      statement.all = (...params) => {
+        const result = all(...params)
+        if (!inserted) {
+          inserted = true
+          writer.exec('BEGIN IMMEDIATE')
+          try {
+            const task = writer.prepare("INSERT INTO task(title,status,run_id,created_at,updated_at) VALUES('concurrent task','open','run-b','now','now')").run().lastInsertRowid
+            writer.prepare("INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,'run-b','blocker','concurrent blocker','PLAUSIBLE','now')").run(task)
+            writer.exec('COMMIT')
+          } catch (error) { writer.exec('ROLLBACK'); throw error }
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  let first
+  try { first = store.statsAllRuns() } finally { store.handle.prepare = original }
+  assert.equal(inserted, true)
+  assert.equal(first.tasks.total, 1)
+  assert.equal(first.facts.total, 1)
+  assert.equal(first.runs, 1)
+  assert.equal(first.blockers_open, 1)
+  assert.equal(store.handle.isTransaction, false)
+  const next = store.statsAllRuns()
+  assert.equal(next.tasks.total, 2)
+  assert.equal(next.facts.total, 2)
+  assert.equal(next.runs, 2)
+  assert.equal(next.blockers_open, 2)
+})
+
+
+test('control integrity uses task-key searches on a large journal for paged and legacy boards', t => {
+  const store = tempStore(t)
+  const scopes = [['run-a', 160], ['run-b', 40], [null, 80]]
+  const groups = scopes.map(([scope, count]) => [scope, seed(store, count, 0, scope)])
+  let operations = 0
+  withWriteTransaction(store.handle, () => {
+    const insert = store.handle.prepare('INSERT INTO control_operation(operation_id,caller_session,request_key,run_id,task_id,evidence_generation,action,target_id,payload_hash,process_instance,status,created_at) VALUES(?,?,?,?,?,0,?,?,?,?,?,?)')
+    const add = (task, scope, foreign = false) => {
+      const key = 'scale-' + operations++
+      insert.run(key, 'caller-' + key, key, scope, task, 'send',
+        foreign ? 'FOREIGN_CONTROL_SECRET' : 'child', '0'.repeat(64), 'test', 'unknown', 'now')
+    }
+    for (const [scope, ids] of groups) for (const id of ids) {
+      for (let i = 0; i < 24; i++) add(id, scope)
+      if (scope === 'run-a') { add(id, 'run-b', true); add(id, null, true) }
+      if (scope === null) add(id, 'run-b', true)
+    }
+    for (let i = 0; i < 1000; i++) add(null, i % 2 ? 'run-a' : null)
+  })
+  assert.equal(operations, 8120)
+  const original = store.handle.prepare, prepare = original.bind(store.handle), plans = []
+  store.handle.prepare = sql => {
+    const statement = prepare(sql)
+    if (sql.includes('control_operation o') && sql.includes('AS mismatched_controls')) {
+      for (const method of ['get', 'all']) {
+        const execute = statement[method].bind(statement)
+        statement[method] = (...params) => {
+          plans.push({ sql, plan: prepare('EXPLAIN QUERY PLAN ' + sql).all(...params).map(row => row.detail) })
+          return execute(...params)
+        }
+      }
+    }
+    return statement
+  }
+  try {
+    for (const [scope, count, mismatches] of [['run-a', 160, 320], [null, 80, 80]]) {
+      for (const view of ['tasks', 'summary']) {
+        const page = store.boardPage({ view, limit: 1 }, scope)
+        assert.equal(page.totals.tasks, count)
+        assert.equal(page.tasks.length, view === 'tasks' ? 1 : 0)
+        assert.equal(page.scope_integrity_totals.mismatched_controls, mismatches)
+        assert.doesNotMatch(JSON.stringify(page), /FOREIGN_CONTROL_SECRET/)
+      }
+      const legacy = store.board({}, scope)
+      assert.equal(legacy.scope_integrity.length, count)
+      assert.equal(legacy.scope_integrity.reduce((sum, row) => sum + row.mismatched_controls, 0), mismatches)
+      assert.doesNotMatch(JSON.stringify(legacy), /FOREIGN_CONTROL_SECRET/)
+    }
+    assert.deepEqual({ ...store.boardPage({ limit: 1 }, 'run-b').scope_integrity_totals },
+      { mismatched_facts: 0, mismatched_handoffs: 0 }, 'detached controls are not attached anomalies')
+  } finally { store.handle.prepare = original }
+  assert.equal(plans.length, 7, 'five compact totals and two legacy full-run integrity reads must execute')
+  const accesses = plans.map(({ sql, plan }) => ({
+    path: sql.startsWith('SELECT t.id AS task_id') ? 'legacy' : 'paged',
+    access: plan.filter(detail => /\b(?:SCAN|SEARCH) o\b/.test(detail)),
+  }))
+  t.diagnostic('CONTROL_INTEGRITY_SCALE ' + JSON.stringify({ tasks: 280, operations, accesses }))
+  for (const { plan } of plans) {
+    assert.match(plan.join('\n'), /SEARCH o USING .*\(task_id=\?/,
+      'each correlated control count must seek by parent task, never scan the complete journal')
+    assert.doesNotMatch(plan.join('\n'), /\bSCAN o\b/)
+  }
+})

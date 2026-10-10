@@ -8,7 +8,7 @@ Issue #7 的原生复现：在官方 DSH 0.2.0-rc.2 中，同一空白会话从 
 
 执行限制仍注册在调用者的 agent 工具层，不改成全局限制。另以官方 scopeOf/scopeChainOf 检查该 agent 是否仍属于安装此插件的精确预设版本；相同预设 ID 的新旧版本不混用。离开后只撤销本插件持有的精确 disposer，不清空工具注册表、沙箱、宿主 guard 或其他插件的过滤器。
 
-作用域模块在插件激活时通过宿主 pluginPackages 目录解析，支持包链接在宿主 node_modules 之外的安装方式，不另装一份 SDK。真实宿主无法解析此模块时拒绝启用，而不是默认认领所有会话；无宿主的独立用法保留兼容路径。
+作用域模块在插件激活时先通过 Node 包解析，链接包无法直接解析时使用宿主 pluginPackages 目录，支持包链接在宿主 node_modules 之外的安装方式，不另装一份 SDK。两条解析路径都要求 scopeOf 和 scopeChainOf 是函数；直接解析成功却缺失函数（包括 null/undefined 导出）也拒绝启用。真实宿主无法解析此模块时拒绝启用，而不是默认认领所有会话；无原生模块及宿主目录的独立用法保留兼容路径。
 
 registry.recompose 的 tools/change 通知负责及时释放离开的限制，agent-preset/selected 负责根据实际作用域重新接入；不相信通知中的请求预设值。pre-step 等待结束时再次核对作用域。低层 recompose 进入预设而不记录 selected 时，仍由下次 scoped pre-step 建立执行守卫。正式 registry.select 路径须在切换完成后即恢复正确工具面。
 

@@ -102,7 +102,7 @@ test('operation key is durable idempotent with canonical resource set and reject
   assert.equal(g2.snapshot('run').audit.filter(a => a.action === 'reserve').length, 1)
 })
 
-test('generation fences reserve and all transitions, including stale prior settled generation', t => {
+test('generation fences admission and mutations while settled replay remains row-bound', t => {
   const { store, governor: g } = setup(t)
   const id = task(store)
   const r = g.reserve(input(id), 'run', worker)
@@ -113,7 +113,9 @@ test('generation fences reserve and all transitions, including stale prior settl
   assert.throws(() => g.reserve(input(id, 'second'), 'run', lead), code('E_GOVERNOR_FENCE'))
   const next = g.reserve(input(id, 'second', { generation: 1 }), 'run', lead)
   assert.equal(next.generation, 2)
-  assert.throws(() => never(g, r), code('E_GOVERNOR_FENCE'))
+  const before = JSON.stringify(g.snapshot('run'))
+  assert.equal(never(g, r).state, 'settled')
+  assert.equal(JSON.stringify(g.snapshot('run')), before)
 })
 
 test('cancel and idle cannot release; running settlement needs terminal plus trusted quiescence', t => {
@@ -469,4 +471,78 @@ test('rejection after reservation fences bind until rework is admitted and charg
   const rework = g.reserve(input(id, 'after-rejection', { generation: 1, resources: ['repo'] }), 'run', worker)
   assert.equal(g.snapshot('run').retries[id], 1)
   assert.equal(g.bind(ref(rework, { session_id: 'child' }), 'run', worker).state, 'running')
+})
+
+function durableGovernorRows(store) {
+  return JSON.stringify(['governor_run', 'governor_reservation', 'governor_retry_charge', 'governor_hold', 'governor_audit']
+    .map(table => ({ table, rows: store.open().prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all() })))
+}
+
+for (const kind of ['never_started', 'terminal']) {
+  test(`historical settled ${kind} replay is read-only after a newer admission and reopening`, t => {
+    const { store, governor: g } = setup(t)
+    const id = task(store)
+    const r1 = g.reserve(input(id, 'historical', { kind: 'new', mode: 'write', resources: ['repo'] }), 'run', worker)
+    const proof = kind === 'never_started' ? { kind } : { kind, outcome: 'succeeded', quiescent: true, evidence: 'trusted stopped subtree' }
+    if (kind === 'terminal') g.bind(ref(r1, { session_id: 'child' }), 'run', worker)
+    const settled = g.settle(ref(r1, { proof }), 'run', worker)
+    const r2 = g.reserve(input(id, 'current', { generation: r1.generation, kind: 'retry', mode: 'write', resources: ['repo'] }), 'run', worker)
+    const before = JSON.stringify(g.snapshot('run')), rows = durableGovernorRows(store)
+    assert.equal(g.snapshot('run').active_total, 1)
+    assert.equal(g.snapshot('run').active_writers, 1)
+    assert.equal(g.snapshot('run').created_total, 1)
+    assert.equal(g.snapshot('run').retries[id], 1)
+    assert.equal(g.snapshot('run').holds[0].reservation_id, r2.reservation_id)
+    assert.throws(() => g.bind(ref(r1, { session_id: 'child' }), 'run', worker), code('E_GOVERNOR_FENCE'))
+    assert.throws(() => g.markUnknown(ref(r1, { reason: 'late observation' }), 'run', worker), code('E_GOVERNOR_FENCE'))
+    assert.throws(() => g.settle(ref(r1, { generation: r2.generation, proof }), 'run', worker), code('E_GOVERNOR_FENCE'))
+    // Normalization makes property order irrelevant without changing trusted evidence.
+    const replayProof = kind === 'terminal'
+      ? { evidence: proof.evidence, quiescent: true, outcome: proof.outcome, kind }
+      : { kind }
+    assert.deepEqual(g.settle(ref(r1, { proof: replayProof }), 'run', worker), settled)
+    assert.equal(JSON.stringify(g.snapshot('run')), before)
+    assert.equal(durableGovernorRows(store), rows)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    t.after(() => reopened.close())
+    const restored = new TaskforceGovernor(reopened)
+    assert.deepEqual(restored.settle(ref(r1, { proof: replayProof }), 'run', worker), settled)
+    assert.equal(JSON.stringify(restored.snapshot('run')), before)
+    assert.equal(durableGovernorRows(reopened), rows)
+  })
+}
+
+test('historical settlement conflicts and scope or row-generation mistakes cannot mutate a newer reservation', t => {
+  const { store, governor: g } = setup(t)
+  const id = task(store)
+  const r1 = g.reserve(input(id, 'old'), 'run', worker)
+  never(g, r1, 'run', worker)
+  const r2 = g.reserve(input(id, 'new', { generation: r1.generation, mode: 'write', resources: ['repo'] }), 'run', worker)
+  const before = JSON.stringify(g.snapshot('run')), rows = durableGovernorRows(store)
+  assert.throws(() => g.settle(ref(r1, { proof: { kind: 'terminal', outcome: 'failed', quiescent: true, evidence: 'different proof' } }), 'run', worker),
+    error => error.code === 'E_GOVERNOR_CONFLICT' && error.message === 'settlement conflicts with durable proof')
+  assert.throws(() => never(g, { ...r1, generation: r2.generation }, 'run', worker), code('E_GOVERNOR_FENCE'))
+  assert.throws(() => never(g, r1, 'other', lead), code('E_GOVERNOR_CONFLICT'))
+  assert.throws(() => never(g, r1, 'run', { role: 'worker', sessionId: 'stranger' }), code('E_GOVERNOR_CONFLICT'))
+  assert.equal(JSON.stringify(g.snapshot('run')), before)
+  assert.equal(durableGovernorRows(store), rows)
+})
+
+test('historical settled replay still requires both current and captured worker ownership', t => {
+  const { store, governor: g } = setup(t)
+  const id = task(store)
+  const r1 = g.reserve(input(id, 'old-owner'), 'run', worker)
+  const settled = never(g, r1, 'run', worker)
+  g.reserve(input(id, 'current-owner', { generation: r1.generation, mode: 'write', resources: ['repo'] }), 'run', worker)
+  store.submitTask({ task_id: id }, 'run', { isRoot: false, sessionId: 'child' })
+  store.rejectTask({ task_id: id, reason: 'replace executor' }, 'run', { isRoot: true, sessionId: 'root' })
+  store.claimTask({ task_id: id, child_id: 'replacement' }, 'run', { isRoot: true, sessionId: 'root' }, 'replacement')
+  const before = JSON.stringify(g.snapshot('run')), rows = durableGovernorRows(store)
+  for (const actor of [worker, { role: 'worker', sessionId: 'replacement' }]) {
+    assert.throws(() => never(g, r1, 'run', actor), code('E_GOVERNOR_CONFLICT'))
+  }
+  assert.deepEqual(never(g, r1, 'run', lead), settled)
+  assert.equal(JSON.stringify(g.snapshot('run')), before)
+  assert.equal(durableGovernorRows(store), rows)
 })

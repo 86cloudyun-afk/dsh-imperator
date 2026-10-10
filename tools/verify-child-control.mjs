@@ -151,7 +151,7 @@ function makeSubagents({
  * mirrored on every `agent/status` transition."（`dsh-agent/lib/types/runtime-types.d.ts:90,147`）。
  * 官方 `list_agents` 与之一致：`agents.get(id)?.status === 'running' ? 'running' : 'inactive'`。
  *
- * 表里没有该 id ⇒ `get()` 返回 undefined ⇒ 目标不 live ⇒ `inactive`（官方同一读法）。
+ * 表里没有该 id ⇒ `get()` 返回 undefined ⇒ 无法证明当前活动态 ⇒ `unknown`。
  */
 function makeAgents({ statusById = {} } = {}) {
   const calls = { get: [] }
@@ -327,7 +327,7 @@ section('1. 正常续作：sendMessage 收到正确的 sender / targetId / conte
   check(
     'C07b',
     'activity_before 来自归属快照，current_turn 来自操作后重读（两次读，2 个字段各归其位）',
-    result.target?.activity_before === 'inactive' && result.target?.current_turn === 'inactive',
+    result.target?.activity_before === 'unknown' && result.target?.current_turn === 'unknown',
     JSON.stringify(result.target),
   )
 }

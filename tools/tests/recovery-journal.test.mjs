@@ -21,7 +21,7 @@ function available(recovery) {
   return recovery
 }
 function toolsHarness(store, { live, send, stop, parentSession } = {}) {
-  const agent = { id: 'root', session: { header: { id: 'root', version: 4, ...(parentSession ? { parentSession, origin: 'subagent', delegationDepth: 1 } : {}) } } }
+  const agent = { id: 'root', session: { header: { id: 'root', version: 4, ...(parentSession ? { parentSession, origin: 'subagent', delegationDepth: 2 } : {}) } } }
   const definitions = new Map()
   let sends = 0, stops = 0
   const subagents = {

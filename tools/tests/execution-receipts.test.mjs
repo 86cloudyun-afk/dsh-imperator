@@ -1,10 +1,7 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
-import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
 import { TaskforceStore } from '../../lib/store/index.js'
-import { installationVersion } from '../host-runtime.mjs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -459,71 +456,3 @@ test('legacy resolved blocker path remains human-reviewed basis and cannot satis
   }
 })
 
-const hostAnchor = process.env.DSH_INSTALL_ANCHOR
-const hostModule = name => import(pathToFileURL(createRequire(hostAnchor).resolve(name)).href)
-for (const kind of ['direct', 'ancestor']) {
-  test('actual native bash verifies a ' + kind + ' root symlink and strict acceptance reads its real logs',
-    { skip: !hostAnchor && 'requires DSH_INSTALL_ANCHOR; offline receipt shapes are not native proof' }, async t => {
-      const f = linkedFixture(t, kind)
-      const [{ Context }, { createScope }, { SessionStore }, { ToolRuntime }, { SystemPrompt },
-        { LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, bash] = await Promise.all([
-        hostModule('@deepseek-ai/cordis'), hostModule('@deepseek-ai/dsh-scope'),
-        hostModule('@deepseek-ai/dsh-session'), hostModule('@deepseek-ai/dsh-tools'),
-        hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-subprocess-local'),
-        hostModule('@deepseek-ai/dsh-bash-local'), hostModule('@deepseek-ai/dsh-shell-env'),
-        hostModule('@deepseek-ai/dsh-tool-bash'),
-      ])
-      const scope = createScope(new Context(), {})
-      t.after(() => scope.dispose())
-      const ctx = scope.ctx
-      new SystemPrompt(ctx, { includeHarnessIdentity: false })
-      new ToolRuntime(ctx)
-      const sessions = new SessionStore(ctx)
-      new LocalSubprocessRuntime(ctx)
-      new ShellEnvRegistry(ctx)
-      new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd: f.cwd, maxTimeoutMs: 120000 }))
-      if (installationVersion(hostAnchor) === '0.2.1-alpha.2') {
-        const [{ default: LocalFileSystem }, { default: SessionProjectionRegistry }, { default: WorkingDirectory }] = await Promise.all([
-          hostModule('@deepseek-ai/dsh-fs-local'), hostModule('@deepseek-ai/dsh-session-projection'),
-          hostModule('@deepseek-ai/dsh-working-directory'),
-        ])
-        await ctx.plugin(LocalFileSystem, { cwd: f.cwd })
-        await ctx.plugin(SessionProjectionRegistry)
-        await ctx.plugin(WorkingDirectory, { defaultDirectory: f.cwd })
-      }
-      await ctx.plugin(bash, { enableRunInBackground: false, promoteOnTimeout: false })
-      const agents = [
-        { options: {}, session: sessions.create(run, { meta: { cwd: f.cwd } }) },
-        { options: {}, session: sessions.create(identity.sessionId, { meta: {
-          cwd: f.cwd, origin: 'subagent', delegationDepth: 1, parentSession: run,
-        } }) },
-      ]
-      for (const agent of agents) {
-        const childScope = createScope(ctx, agent)
-        agent.ctx = childScope.ctx
-        t.after(() => childScope.dispose())
-      }
-      const [main, worker] = agents
-      const byId = new Map(agents.map(agent => [agent.session.header.id, agent]))
-      ctx.provide('taskforceStore', f.store)
-      ctx.provide('agents', { get: id => byId.get(id) })
-      applyTools(ctx)
-      await ctx.serial('agent/created', { agent: main })
-      await ctx.serial('agent/created', { agent: worker })
-      const id = f.open(); f.claim(id)
-      const nativeResult = await worker.ctx.tools.execute({ agent: worker,
-        callId: 'linked-native-' + kind, name: 'task_verify', arguments: { task_id: id, command },
-        signal: new AbortController().signal })
-      assert.equal(nativeResult.isError, false, nativeResult.error?.message)
-      const result = JSON.parse(nativeResult.value)
-      assert.equal(result.verified, true, JSON.stringify(result))
-      const receipt = f.store.board(id, run).receipts[0]
-      assert.equal(receipt.kind, 'foreground')
-      assert.equal(receipt.exit_code, 0)
-      assert.equal(receipt.output_complete, true)
-      assert.equal(readFileSync(receipt.logs.stdout.path, 'utf8'), 'verified\n')
-      assert.equal(readFileSync(receipt.logs.stderr.path, 'utf8'), 'diagnostic\n')
-      f.submit(id)
-      assert.equal(f.accept(id).execution_verified, true)
-    })
-}

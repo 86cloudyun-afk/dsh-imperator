@@ -952,3 +952,72 @@ test('native public message constructors retain continuation and unknown-outcome
     assert.equal(flow.inFlight, 1)
   }
 })
+
+for (const kind of ['direct', 'ancestor']) {
+  test('actual native task_verify accepts a ' + kind + ' store root symlink with exact textual log provenance', options, async t => {
+    const { ctx, agent } = await fixture(t)
+    const [{ LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, bash,
+      { apply: applyTools }, { TaskforceStore }] = await Promise.all([
+      native('@deepseek-ai/dsh-subprocess-local'), native('@deepseek-ai/dsh-bash-local'),
+      native('@deepseek-ai/dsh-shell-env'), native('@deepseek-ai/dsh-tool-bash'),
+      import('../../lib/tools/index.js'), import('../../lib/store/index.js'),
+    ])
+    const { mkdir, realpath, symlink, writeFile, readFile } = await import('node:fs/promises')
+    const directory = await realpath(await mkdtemp(join(tmpdir(), 'taskforce-native-linked-receipt-')))
+    const physical = join(directory, 'physical'), alias = join(directory, 'alias'), cwd = join(directory, 'workspace')
+    await mkdir(physical); await mkdir(cwd); await symlink(physical, alias)
+    await writeFile(join(cwd, 'source.js'), 'source\n')
+    const root = kind === 'direct' ? alias : join(alias, 'nested')
+    const store = new TaskforceStore(root)
+    t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }) })
+    new LocalSubprocessRuntime(ctx)
+    new ShellEnvRegistry(ctx)
+    new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
+    await mountNativeWorkingDirectory(ctx, cwd)
+    await ctx.plugin(bash, { enableRunInBackground: false, promoteOnTimeout: false })
+    const main = agent('linked-root', undefined, { cwd })
+    const worker = agent('linked-worker', undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: 'linked-root' })
+    const byId = new Map([main, worker].map(value => [value.session.header.id, value]))
+    ctx.provide('taskforceStore', store)
+    ctx.provide('agents', { get: id => byId.get(id) })
+    applyTools(ctx)
+    applyScope(ctx)
+    await ctx.serial('agent/created', { agent: main })
+    await ctx.serial('agent/created', { agent: worker })
+    const command = "printf 'linked native receipt\\n'; printf 'linked native stderr\\n' >&2"
+    const id = store.openTask({ title: 'native linked receipt', evidence_policy: 'execution',
+      verification_files: ['source.js'], verification_command: command },
+    'linked-root', { sessionId: 'linked-root', cwd, isRoot: true }).task_id
+    store.claimTask({ task_id: id, child_id: 'worker-label' }, 'linked-root', 'linked-worker', 'linked-worker')
+    let bashCalls = 0, outerToken
+    ctx.tools.guard(exec => {
+      if (exec.name === 'task_verify') outerToken = exec.token
+      if (exec.name === 'bash' && exec.agent === worker) {
+        bashCalls++
+        assert.equal(exec.parent, outerToken)
+        assert.equal(exec.rootCallId, 'linked-symlink-' + kind)
+        assert.equal(store.board(id, 'linked-root').receipts[0].status, 'pending')
+      }
+    })
+    const nativeResult = await worker.ctx.tools.execute({ agent: worker,
+      callId: 'linked-symlink-' + kind, name: 'task_verify', arguments: { task_id: id, command },
+      signal: new AbortController().signal })
+    assert.equal(nativeResult.isError, false, nativeResult.error?.message)
+    const result = JSON.parse(nativeResult.value)
+    assert.equal(result.verified, true, JSON.stringify(result))
+    assert.equal(bashCalls, 1)
+    const receipt = store.board(id, 'linked-root').receipts[0]
+    assert.equal(receipt.kind, 'foreground')
+    assert.equal(receipt.exit_code, 0)
+    assert.equal(receipt.output_complete, true)
+    for (const stream of ['stdout', 'stderr']) {
+      const path = join(root, 'receipts', receipt.receipt_id + '.' + stream + '.log')
+      assert.equal(receipt.logs[stream].path, path)
+      assert.notEqual(await realpath(path), path)
+    }
+    assert.equal(await readFile(receipt.logs.stdout.path, 'utf8'), 'linked native receipt\n')
+    assert.equal(await readFile(receipt.logs.stderr.path, 'utf8'), 'linked native stderr\n')
+    store.submitTask({ task_id: id }, 'linked-root', 'linked-worker', 'linked-worker')
+    assert.equal(store.acceptTask({ task_id: id }, 'linked-root', 'lead', 'linked-root').execution_verified, true)
+  })
+}

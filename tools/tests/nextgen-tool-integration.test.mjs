@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { spawnSync } from 'node:child_process'
 import { apply as applyTools } from '../../lib/tools/index.js'
+import { TaskforceGovernor } from '../../lib/governor/index.js'
 import { tempStore } from './helpers.mjs'
 
 const RUN = 'nextgen-tool-root'
@@ -170,4 +171,29 @@ test('model workflow action whitelist and rework preserve durable generation fen
   assert.equal(after.row_version, before.row_version + 1)
   assert.deepEqual(await f.call('task_reject', { task_id: id, reason: 'revise approved scope',
     expected_version: before.row_version, request_key: 'return' }), rejected)
+})
+
+test('governor bind rechecks workflow dependencies after a durable reservation', async t => {
+  const f = fixture(t)
+  const upstream = await f.call('task_open', { title: 'upstream diagnostic decision' })
+  assert.equal(upstream.ok, true)
+  assert.equal((await f.call('task_submit', { task_id: upstream.task_id })).ok, true)
+  assert.equal((await f.call('task_accept', { task_id: upstream.task_id, waiver_reason: 'explicit diagnostic prerequisite' })).ok, true)
+  const created = await f.call('task_workflow_create', coding({ dependencies: [upstream.task_id] }))
+  assert.equal(created.ok, true, JSON.stringify(created))
+  assert.equal((await f.call('task_workflow_submit', { task_id: created.task_id, action: 'approve_plan',
+    expected_version: created.row_version, request_key: 'approve' })).ok, true)
+  assert.equal((await f.call('task_claim', { task_id: created.task_id, child_id: CHILD }, f.worker)).ok, true)
+  const governor = new TaskforceGovernor(f.store)
+  const authority = { role: 'lead', sessionId: RUN }
+  const admission = governor.reserve({ operation_key: 'reserve-workflow', task_id: created.task_id,
+    generation: 0, mode: 'write', kind: 'new', resources: ['source.js'] }, RUN, authority)
+  assert.equal((await f.call('task_fact', { task_id: upstream.task_id, kind: 'blocker',
+    statement: 'late upstream defect invalidates admission', confidence: 'CONFIRMED' }, f.worker)).ok, true)
+  assert.throws(() => governor.bind({ reservation_id: admission.reservation_id,
+    generation: admission.generation, session_id: CHILD }, RUN, authority), { code: 'E_WORKFLOW_DEPENDENCY' })
+  assert.equal(governor.snapshot(RUN).active_total, 1)
+  const row = f.store.handle.prepare('SELECT state,session_id FROM governor_reservation WHERE reservation_id=?').get(admission.reservation_id)
+  assert.equal(row.state, 'reserved')
+  assert.equal(row.session_id, null)
 })

@@ -59,7 +59,7 @@
 
 挂载日志的方法必须返回同步、完整且属于原调用的 durable 回包。新 intent 合法短形为 `{operation_id, invoke:true, replayed:false, durable:true, status:"pending"}`；replay 返回完整 operation 和 `invoke:false`。只有验证后的 `invoke:true` 才允许宿主效果。空值、不完整回包、非布尔 `invoke`、Promise 和 thenable 统一拒绝；begin 阶段返回 `E_CONTROL_JOURNAL_UNAVAILABLE` 并保留计算出的原 `retry_key`，不声称已 durable。已启动的原生及跨 realm Promise 会接住拒绝，但不会等待其结果来授权效果。finish 回包须匹配原 operation、可信 caller/run/action/target 和请求的 outcome；畸形回包返回 `E_CONTROL_OUTCOME_UNKNOWN`、最后已确认的 intent 和原键。此时数据库可能已提交 outcome，必须只读原记录核对，不把返回的 pending 当作数据库必然未结算。错误响应不含投递/停止接纳收据，禁止换键重试。
 
-每个 tools activation 绑定首次观察到的恢复日志对象（包括首次控制之前已挂载的日志）。日志消失、不可读、关闭或换成另一个对象时，在效果调用前返回 `E_CONTROL_JOURNAL_UNAVAILABLE`。新 activation 的显式 `request_key` 同样要求日志。该码仅证明**本次未调用宿主**，不能推定此前同键效果失败；停止自动重试并向主控报告，恢复原日志后用原键读取 pending/replayed 结果。日志对象确需替换时，由主控核实原持久数据库并重新激活 tools；同一日志对象重连原数据库无需更换绑定。
+每个 tools activation 绑定首次观察到的恢复日志对象（包括首次控制之前已挂载的日志）。日志消失、不可读、关闭或换成另一个对象时，在效果调用前返回 `E_CONTROL_JOURNAL_UNAVAILABLE`。新 activation 的显式 `request_key` 同样要求日志。该码仅证明**本次未调用宿主**，不能推定此前同键效果失败；早期错误只把通过校验的显式键或可信坐标重建键放入 `operation.retry_key`，不生成新 UUID 冒充历史键。两者都不可用时，须另行保留此前返回的键，错误响应无法重建它。停止自动重试并向主控报告，恢复原日志后用原键读取 pending/replayed 结果。日志对象确需替换时，由主控核实原持久数据库并重新激活 tools；同一日志对象重连原数据库无需更换绑定。
 
 只有从未观察到日志且没有显式 `request_key` 的 detached 旧适配器保留原控制行为，返回 `operation.durable:false`、`durability:"unavailable"`，不提供重放保护。`ctx.get` 正常返回 `undefined` 是可信缺省，不再反射查询；只有没有 `get` 的旧 context 才走属性读取。服务或 `recovery` 显式为 `null`，或主查询实际抛错，都拒绝效果调用。服务解析抛错不属于这种兼容场景。更多持久化边界见 [RECOVERY.md](RECOVERY.md)。
 

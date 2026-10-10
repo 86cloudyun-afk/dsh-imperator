@@ -1,6 +1,6 @@
 # Task 6: Control journal degradation fence
 
-Status: latest Task6 source candidate b3dc0d7d7d10e5fdc3dd983c9fd632cadd79b146 has six exact-head GREEN jobs with full logs read, after actual PR62 boundary reviews. Work remains isolated on `codex/audit-control-journal-fence`; this implementer created no PR and performed no merge or main/other-branch mutation. Root owns final integration and release review.
+Status: latest Task6 source candidate27a39e2b428edd6e5328904bcefb2378c35b3d11 has six exact-head GREEN jobs with full logs read, after actual PR62 boundary reviews including early stable-key preservation. Work remains isolated on `codex/audit-control-journal-fence`; this implementer created no PR and performed no merge or main/other-branch mutation. Root owns final integration and release review.
 
 Requirements: [task-6 brief](../../plans/2026-10-10-imperator-audit/task-6-brief.md) and [linked audit design](../../specs/2026-10-10-imperator-comprehensive-audit-design.md), read at `234a7896e44b8d4e19608e3c80ef44a982ddc6ff`. Production baseline: `81b7ce67114f96ebcd05b257571ce8a6bc9e68c7`. The environment failed before exposing shell; all edits used structured GitHub tree/commit/ref operations with expected-SHA leases, and all runtime evidence is real GitHub Actions. The repository tree has no AGENTS.md.
 
@@ -527,3 +527,96 @@ These names were read from each of the six full effective RED logs and their ded
 - rejected cross realm promise from finish does not crash stop
 
 After latest source verification only this report is committed. Root owns independent source/diff review, shared-hunk integration, repeated report-only matrix if desired, final aggregate/actual-PR audits and expected-head merge; this implementer does not merge or create PRs.
+
+## Actual PR62 revision: reconstructable keys in early unavailable replies
+
+The subsequent actual-PR thread [discussion4236982336](https://github.com/86cloudyun-afk/dsh-imperator/pull/62#discussion_r4236982336), `PRRT_kwDOU4Tz5s6rCZAh`, identified a P2 structured-response omission. At source b2785b96b73af6e12a0dc7eb01a9f8a9e8f7121f (tools blobc38e833c1567e9ea63befec406a193eabaf6c0a1), the three early unreadable/missing/replaced-journal refusals called unavailableControlJournal() without a key; the ordinary mounted path calculated its retryKey later. The refusal correctly made **zero second host effects**, but dropped operation.retry_key even when an exact explicit key or trusted invocation coordinates were available. A client retaining only its latest structured response could lose its lookup coordinate. This report does not claim that the suggested later automatic repetition occurred; the reproduced defect is the missing structured key.
+
+### Additional52-case real SQLite RED
+
+Tests-only commit `a098c56cb970f6bd02fca2dbfb7daacdd0dd32cc`, tree `bc8ff3c4aafcee25411338c5b77298cfcedf2122`, [run38037162428](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38037162428), leaves production tools blobc38e833c… unchanged. Added52 cases in the existing tool-recovery file:26 negative regressions and26 positive controls. The original238 reply-validation cases, their24 legal API controls and8 strict rejected-Promise children are retained; no shared native-host hunk changed.
+
+Each24 matrix regression creates a real SQLite pending row through a successful counted host effect followed by the existing SQLite outcome-abort trigger. It then changes the publication to a throwing primary get, missing service, explicit null service, explicit null recovery, throwing recovery getter or another actual SQLite journal. send/stop cross exact explicit keys (including preserved surrounding whitespace) and trusted coordinates. RED first confirms effect count remains1, then fails because denied.operation?.retry_key is undefined rather than the original key. Restoring the original publication and primary lookup must return the same original-key pending/replayed row, without row changes or another host effect. The replacement database must remain empty. Two further negatives require a genuinely detached *initial* activation with an explicit validated key to preserve that lookup key while refusing effects.
+
+The26 positives distinguish:
+- closed/unloaded owner×send/stop×explicit/coords:4; this is the later begin catch, which already preserves the key, not the early-path defect. A separate real connection reads the original SQLite file to prove unchanged pending; the test never forges a revival of a permanently unloaded owner.
+- same recovery object and owner reconnecting after closing only its real SQLite handle×both actions/key modes:4; exact pending replay stays usable with one total host effect.
+- no explicit key and no usable coordinates after a prior generated-key intent:2; early unavailable must **not allocate a fresh UUID and pretend it identifies prior history**. Restore and read using the separately retained first response's actual key.
+- never-journal detached keyless/no-coordinate controls:2; their documented effect and durable:false/durability:"unavailable" remain, with no invented key.
+- invalid explicit empty/blank/NUL/oversize/object/number/null values×both actions:14; early failure does not echo them as a validated key, fall back to a different coordinate, leak the private fixture marker or invoke the host.
+
+All six full RED logs were read. Their deduplicated failure sets are identical26, with no fixture errors. Offline1176 total /1144 pass /26 fail /6 skip; native1176 /1138 pass /26 fail /12 skip, plus46/46 native boundaries,17/17 host and13/13 isolation. Cancelled0 everywhere. The four native full valid RED logs were read before production changed; the two slower offline logs were read after the source push. This is the actual order authorized by root.
+
+| New RED matrix | job ID |
+|---|---:|
+|offline22.23.2|114169892944|
+|offline24.19.0|114169893005|
+|native22.23.2 /rc.2|114169892952|
+|native22.23.2 /alpha.2|114169893042|
+|native24.19.0 /rc.2|114169892858|
+|native24.19.0 /alpha.2|114169893017|
+
+### Narrow stable-key fix and latest verification
+
+Source `27a39e2b428edd6e5328904bcefb2378c35b3d11`, tree `0916cb83c2d8686615b1212ff0c7e9077aad3d26`, parenta098c56… adds only11 net production lines. The private controlRequestKey helper has allowFresh=true by default. A local earlyUnavailable factory calls it with false only when the explicit key passes the already existing recovery text validation or no explicit key is present. It catches unavailable coordinate reads and attaches only a reconstructable stable retry_key; it never fabricates durable/status/operation_id metadata. The three early refusal paths use this factory.
+
+Normal mounted new-intent calls still use the helper's original default and may allocate a fresh returned UUID when no coordinates exist. Successful never-journal/no-explicit-key detached calls do not execute the early factory or read coordinates, and retain their legacy behavior. Exact hashing, new/replay/finish validation, Promise rejection consumption, activation journal identity, outcome/error classes and fixed no-new-key hints remain unchanged. No new global state or store/workflow/governor/guard/dependency/CI/timeout change is introduced.
+
+CONTROL/RECOVERY now state the precise response contract: **reconstructable validated explicit or trusted-coordinate keys are returned structurally; without either source an early unavailable response cannot recover historical keys and must not create one.** Retain any previously returned generated key separately. The instruction to preserve a key does not promise it can always be recovered from missing coordinates.
+
+Latest exact-source [run38037335341](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38037335341) completed all six jobs successfully, and every full log was read. Offline1176 total /1170 pass /0 fail /6 skip; native1176 /1164 pass /0 fail /12 skip plus native boundaries46/46, HOST17/17 and isolation13/13. Cancelled0 everywhere. All26 effective RED failures now pass, including exact structured-key return, unchanged pending rows and restored original-key read-only replay. All26 new positive controls and the prior238 reply-validation cases (including24 real API positives and8 strict rejected-Promise child processes) remain passing. Node22.23.2/24.19.0 and actual installed native rc.2/alpha.2 are both covered. Checkout/offline and packed/native acceptance remain; model requests0 and the full-tree adapter stays closed.
+
+|Latest GREEN matrix|job ID|unit total/pass/fail/skip|native boundaries|
+|---|---:|---|---|
+|offline (22.23.2)|114170410621|1176/1170/0/6|—|
+|native-host (24.19.0, 0.2.0-rc.2)|114170410696|1176/1164/0/12|46/46|
+|offline (24.19.0)|114170410743|1176/1170/0/6|—|
+|native-host (24.19.0, 0.2.1-alpha.2)|114170410807|1176/1164/0/12|46/46|
+|native-host (22.23.2, 0.2.1-alpha.2)|114170410823|1176/1164/0/12|46/46|
+|native-host (22.23.2, 0.2.0-rc.2)|114170410832|1176/1164/0/12|46/46|
+
+
+Current source owned-file manifest (report-only final head/tree/report blob returned separately):
+
+|File|blob|
+|---|---|
+|`docs/CONTROL.md`|`310b682370865261a5f1072ce9980c640c05416a`|
+|`docs/RECOVERY.md`|`aa51dd0d18b94246333efb0904b62b3f13d75800`|
+|`lib/tools/index.js`|`8c44a61d8b2e9c2d8bf116f19af166bb5c92e6e2`|
+|`tools/tests/host-boundaries.test.mjs`|`f795eb5359e9a4abb1623d37d174887544b6d7c9`|
+|`tools/tests/nextgen-tool-integration.test.mjs`|`41c13c88396a37ef8c2c124bacaf1f641ce3a408`|
+|`tools/tests/tool-recovery.test.mjs`|`a1b2543c09fbadd174e895dd6268997d955945c8`|
+|`tools/verify-child-control.mjs`|`99d8e14e71b03653719e91dacba0043a120d4f77`|
+
+The complete191-entry source tree was inspected, truncated:false. Relative tob2785b96…, only existing tool-recovery tests, tools/index and CONTROL/RECOVERY changed. The branch's shared host-boundaries blob remainsf795eb5359e9a4abb1623d37d174887544b6d7c9 with no new hunk in this revision; root must retain its already-unioned Task4 cases. No cleanPR62/main/other-branch mutation, PR creation, agent spawning, new runtime dependency or timeout waiver occurred.
+
+### All26 new effective RED failure names
+
+- early unavailable preserves original explicit key for send: primary lookup throws
+- early unavailable preserves original explicit key for send: missing publication
+- early unavailable preserves original explicit key for send: null publication
+- early unavailable preserves original explicit key for send: null journal
+- early unavailable preserves original explicit key for send: unreadable journal
+- early unavailable preserves original explicit key for send: replaced SQLite journal
+- early unavailable preserves original trusted coordinates for send: primary lookup throws
+- early unavailable preserves original trusted coordinates for send: missing publication
+- early unavailable preserves original trusted coordinates for send: null publication
+- early unavailable preserves original trusted coordinates for send: null journal
+- early unavailable preserves original trusted coordinates for send: unreadable journal
+- early unavailable preserves original trusted coordinates for send: replaced SQLite journal
+- initial detached explicit original key survives unavailable send
+- early unavailable preserves original explicit key for stop: primary lookup throws
+- early unavailable preserves original explicit key for stop: missing publication
+- early unavailable preserves original explicit key for stop: null publication
+- early unavailable preserves original explicit key for stop: null journal
+- early unavailable preserves original explicit key for stop: unreadable journal
+- early unavailable preserves original explicit key for stop: replaced SQLite journal
+- early unavailable preserves original trusted coordinates for stop: primary lookup throws
+- early unavailable preserves original trusted coordinates for stop: missing publication
+- early unavailable preserves original trusted coordinates for stop: null publication
+- early unavailable preserves original trusted coordinates for stop: null journal
+- early unavailable preserves original trusted coordinates for stop: unreadable journal
+- early unavailable preserves original trusted coordinates for stop: replaced SQLite journal
+- initial detached explicit original key survives unavailable stop
+
+Only the report changes after this latest source verification. Root owns independent final review, shared-source integration, aggregate/actual-PR checks and merge. Earlier208/216 fixture-error rounds remain explicitly recorded as not accepted RED; earlier valid214 RED and six-job1124 GREEN remain history rather than evidence substituted for this latest source.

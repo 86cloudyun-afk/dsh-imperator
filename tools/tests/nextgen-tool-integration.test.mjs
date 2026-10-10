@@ -92,8 +92,8 @@ test('model stage approval forwards the version fence and real worker claim obey
 
 test('workflow state cannot disclose another root run plan or task content', async t => {
   const f = fixture(t)
-  const secret = 'FOREIGN_WORKFLOW_SECRET'
-  const created = await f.call('task_workflow_create', coding({ title: secret, objective: secret }))
+  const sentinel = 'FOREIGN_WORKFLOW_SECRET'
+  const created = await f.call('task_workflow_create', coding({ title: sentinel, objective: sentinel }))
   assert.equal(created.ok, true, JSON.stringify(created))
   const result = await f.call('task_workflow_state', { task_id: created.task_id, run_id: RUN, actor: RUN }, f.foreign)
   assert.equal(result.ok, false)

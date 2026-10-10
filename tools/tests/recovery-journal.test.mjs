@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TaskforceStore } from '../../lib/store/index.js'
+import { foldGuardSignal } from '../../lib/plugins/guard.mjs'
 import { apply as applyTools } from '../../lib/tools/index.js'
 
 const root = { sessionId: 'root', isRoot: true }
@@ -302,4 +303,23 @@ test('failed outcome persistence returns safe operation identity for reconciliat
   assert.equal(typeof result.operation.operation_id, 'string')
   assert.equal(typeof result.operation.retry_key, 'string')
   assert.equal(JSON.stringify(result).includes('SECRET'), false)
+})
+
+test('checkpoint semantic failures participate in registered-tool ECHO', () => {
+  const events = Array.from({ length: 3 }, (_, i) => [
+    { type: 'tool/call', data: { callId: String(i), name: 'task_checkpoint', arguments: { task_id: 1, summary: 'x' } } },
+    { type: 'tool/result', data: { callId: String(i), message: {
+      isError: false, content: [{ type: 'text', text: JSON.stringify({ ok: false, error: 'denied', code: 'E_RECOVERY_SCOPE', hint: 'read recovery' }) }],
+    } } },
+  ]).flat()
+  assert.equal(foldGuardSignal(events, { echoFailures: 3, detectStall: false }).signal, 'echo')
+})
+test('unknown replay returns the complete semantic failure envelope', async t => {
+  const { store } = fixture(t)
+  const h = toolsHarness(store, { send() { throw new Error('unknown transport') } })
+  await h.call('task_child_send', { target_id: 'worker', message: 'x' })
+  const result = await h.call('task_child_send', { target_id: 'worker', message: 'x' })
+  assert.equal(typeof result.error, 'string')
+  assert.equal(typeof result.hint, 'string')
+  assert.equal(h.sends, 1)
 })

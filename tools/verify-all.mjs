@@ -68,6 +68,7 @@ const TESTS = [
   'nextgen-board.test.mjs',
   'nextgen-tool-integration.test.mjs',
   'nextgen-restore-integration.test.mjs',
+  'test-manifest-consistency.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

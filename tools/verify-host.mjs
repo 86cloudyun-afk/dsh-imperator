@@ -103,6 +103,44 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     await task(child.agent, 'task_submit', { task_id: failed.task_id })
     assert.equal((await task(parent.agent, 'task_accept', { task_id: failed.task_id })).code, 'E_VERIFICATION_RECEIPT')
     pass('native nonzero receipt cannot be accepted and root verification is denied')
+    // Exercise the complete coding template through actual mounted native
+    // tools/identity/foreground bash, without enqueuing any model input.
+    const reviewer = await agents.create({ sessionId: 'taskforce-probe-reviewer', parentAgent: parent.agent,
+      meta: { cwd: fixture.root, origin: 'subagent', delegationDepth: 1, parentSession: parent.agent.id },
+      setup: agentCtx => applyChildComposition(agentCtx, parent.agent, { persona: workerConfig.persona }) })
+    handles.push(reviewer)
+    const workflowCommand = 'test -s evidence.txt'
+    const coding = await task(parent.agent, 'task_workflow_create', { title: 'native independent coding workflow',
+      objective: 'verify existing artifact with an independent review', scope: ['evidence.txt'],
+      deliverables: ['verified evidence'], non_goals: ['publishing'], dependencies: [],
+      verification_files: ['evidence.txt'], verification_command: workflowCommand, request_key: 'native-create' })
+    assert.equal(coding.ok, true, JSON.stringify(coding))
+    assert.equal((await task(child.agent, 'task_workflow_create', { title: 'forged root workflow',
+      objective: 'must not create', scope: [], deliverables: [], verification_files: ['evidence.txt'],
+      verification_command: workflowCommand, request_key: 'native-forged', isRoot: true })).code, 'E_NOT_LEAD')
+    const flowState = () => task(parent.agent, 'task_workflow_state', { task_id: coding.task_id })
+    const stage = async (agent, action, extra = {}) => task(agent, 'task_workflow_submit', { task_id: coding.task_id,
+      action, expected_version: (await flowState()).row_version, request_key: 'native-' + action, ...extra })
+    assert.equal((await stage(parent.agent, 'approve_plan')).ok, true)
+    assert.equal((await task(child.agent, 'task_claim', { task_id: coding.task_id, child_id: 'workflow-worker' })).ok, true)
+    const actualWorkflowReceipt = await task(child.agent, 'task_verify', { task_id: coding.task_id, command: workflowCommand })
+    assert.equal(actualWorkflowReceipt.verified, true, JSON.stringify(actualWorkflowReceipt))
+    const revision = await stage(child.agent, 'record_artifact')
+    assert.equal(revision.ok, true, JSON.stringify(revision))
+    assert.equal((await stage(child.agent, 'record_review', { revision_id: revision.revision_id,
+      requirements_result: 'pass', quality_result: 'pass', findings: [], request_key: 'native-self-review' })).code, 'E_WORKFLOW_REVIEW')
+    assert.equal((await stage(reviewer.agent, 'record_review', { revision_id: revision.revision_id,
+      requirements_result: 'pass', quality_result: 'pass', findings: [] })).ok, true)
+    assert.equal((await task(child.agent, 'task_submit', { task_id: coding.task_id })).ok, true)
+    const approvedVersion = (await flowState()).row_version
+    assert.equal((await task(parent.agent, 'task_accept', { task_id: coding.task_id,
+      expected_version: approvedVersion - 1, request_key: 'native-accept' })).code, 'E_WORKFLOW_VERSION')
+    const acceptWorkflow = { task_id: coding.task_id, expected_version: approvedVersion, request_key: 'native-accept' }
+    const acceptedWorkflow = await task(parent.agent, 'task_accept', acceptWorkflow)
+    assert.equal(acceptedWorkflow.execution_verified, true, JSON.stringify(acceptedWorkflow))
+    assert.deepEqual(await task(parent.agent, 'task_accept', acceptWorkflow), acceptedWorkflow)
+    assert.equal((await flowState()).stage, 'completed')
+    pass('native coding workflow uses real receipts, independent review and versioned acceptance')
     // Verify the live service, not an assumed global depth default.
     const { Config: subagentConfig } = await nativeModule(anchor, '@deepseek-ai/dsh-tool-subagent')
     const runtime = parent.agent.ctx.get('subagents')

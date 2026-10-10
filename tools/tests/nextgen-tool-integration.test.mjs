@@ -197,3 +197,33 @@ test('governor bind rechecks workflow dependencies after a durable reservation',
   assert.equal(row.state, 'reserved')
   assert.equal(row.session_id, null)
 })
+
+test('model root can revise prerequisites after returning an unapproved plan', async t => {
+  const f = fixture(t)
+  const prerequisite = await f.call('task_open', { title: 'missing prerequisite' })
+  const created = await f.call('task_workflow_create', coding())
+  assert.equal(created.ok, true, JSON.stringify(created))
+  const returned = await f.call('task_reject', { task_id: created.task_id, reason: 'include prerequisite',
+    expected_version: created.row_version, request_key: 'return-unapproved' })
+  assert.equal(returned.ok, true, JSON.stringify(returned))
+  const state = await f.call('task_workflow_state', { task_id: created.task_id })
+  assert.equal(state.stage, 'plan')
+  const input = { task_id: created.task_id, action: 'set_dependencies', prerequisite_task_ids: [prerequisite.task_id],
+    expected_version: state.row_version, request_key: 'revise-prerequisites' }
+  const denied = await f.call('task_workflow_submit', { ...input, isRoot: true, actor: RUN }, f.worker)
+  assert.equal(denied.ok, false)
+  assert.equal(denied.code, 'E_NOT_LEAD')
+  const changed = await f.call('task_workflow_submit', input)
+  assert.equal(changed.ok, true, JSON.stringify(changed))
+  const revised = await f.call('task_workflow_state', { task_id: created.task_id })
+  assert.deepEqual(revised.dependencies, [prerequisite.task_id])
+  assert.equal(revised.row_version, state.row_version + 1)
+  assert.equal((await f.call('task_workflow_submit', { task_id: created.task_id, action: 'approve_plan',
+    expected_version: revised.row_version, request_key: 'approve-revised' })).ok, true)
+  const approved = await f.call('task_workflow_state', { task_id: created.task_id })
+  const frozen = await f.call('task_workflow_submit', { ...input, prerequisite_task_ids: [],
+    expected_version: approved.row_version, request_key: 'remove-active-prerequisite' })
+  assert.equal(frozen.ok, false)
+  assert.equal(frozen.code, 'E_WORKFLOW_STAGE')
+  assert.deepEqual((await f.call('task_workflow_state', { task_id: created.task_id })).dependencies, [prerequisite.task_id])
+})

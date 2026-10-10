@@ -64,6 +64,8 @@ const TESTS = [
   'execution-receipts.test.mjs',
   'execution-adoption.test.mjs',
   'tool-recovery.test.mjs',
+  'nextgen-projection.test.mjs',
+  'nextgen-board.test.mjs',
   'nextgen-tool-integration.test.mjs',
   'nextgen-restore-integration.test.mjs',
 ]

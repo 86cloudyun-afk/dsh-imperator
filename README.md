@@ -2,25 +2,42 @@
 
 > ### *He who speaks — and legions march.*
 
-**dsh指挥官** · 主会话统御决策，子代理军团执行 · 版本 `0.3.2`；固定兼容验收目标为官方 DSH `0.2.0-rc.2` / `0.2.1-alpha.2`，Node 22/24。alpha.2 为预发布版。工作目录兼容旧宿主的原生 `cwd` 变量与新宿主的必需目录上下文，覆盖新建及恢复后的子代理。
+**dsh指挥官** · 主会话统御决策，子代理军团执行 · 版本 `0.4.0`；固定兼容验收目标为官方 DSH `0.2.0-rc.2` / `0.2.1-alpha.2`，Node 22/24。alpha.2 为预发布版。工作目录兼容旧宿主的原生 `cwd` 变量与新宿主的必需目录上下文，覆盖新建及恢复后的子代理。
 
-0.3.2 修复 ID-only 代理创建任务的异常，接管未归属任务时保留执行回执与豁免审计，并区分子代理授权、恢复、部署和运行时失败。执行审计归属异常会阻止验收，人工豁免也不能绕过。blocker 部分索引加速候选、成员校验与计数；同进程合成数据的测量与限制见 [0.3.2 研究记录](docs/superpowers/research/2026-10-09-imperator-0.3.2-recovery.md)。
+0.4.0 增加控制操作持久日志、检查点与时间线；编码任务通过计划、实际执行回执、独立审核和主会话验收推进。可信宿主可调用持久调度队列；操作员可使用只读诊断、在线 WAL 备份、迁移预演及新目录恢复。性能改动保留分页与可变历史的完整语义，具体测量和限制见 [性能记录](docs/PERFORMANCE.md)。
 
 一个 DeepSeek Harness 的 **agent preset**（附带 host 插件）：主会话亲自做只读调查、方案比较、决策和验收，子代理负责有边界的执行任务。优先复用已有执行者，不再为每个信息缺口新建代理；写文件、命令执行和宿主变更的限制保持不变。
 
-详见 [研究型编排与思考保护](docs/ORCHESTRATION.md)：当前包含派发前决策、任务合并、复用与独立审查纪律、软预算，以及 STALL 观察模式。0.3 提供独立可信宿主 [durable governor core](docs/GOVERNOR.md)；原生 managed adapter 无条件阻断 H01–H06，预设派发仍没有全树硬额度保证。
+详见 [研究型编排与思考保护](docs/ORCHESTRATION.md)：当前包含派发前决策、任务合并、复用与独立审查纪律、软预算，以及 STALL 观察模式。0.3 提供独立可信宿主 [durable governor core](docs/GOVERNOR.md)；原生 managed adapter 仍无条件关闭：0.4 已验证独立的 H01 创建准备及 H03 严格持久化读回接口，H02/H04/H05/H06 的完整宿主能力仍缺证据，预设派发没有全树硬额度保证。
 
-## 0.3 交付契约
+## 0.4 交付契约
 
 真实 owner 与事实作者取自宿主 session，昵称不授予权限；可信 session/run ID 保留原值，包括首尾空白。旧未绑定任务保留兼容路径并显示警告，历史版本已裁掉的 ID 空白无法自动还原，须管理员核对迁移。
 
-严格执行验收是 opt-in：主会话开任务时设置 `evidence_policy: "execution"`、文件清单与固定命令，当前真实子会话 owner 用 `task_verify` 走原生 bash 与 approval/sandbox/guards。仅最新实际 exit 0、完整日志与当前文件/代数/owner 一致的回执可通过；默认 `legacy` 不升级成已执行验证，人工豁免明确标为非验证通过。见 [事实库与回执](docs/STORE.md)。
+普通 `task_open` 的严格执行验收仍是 opt-in；新增 `task_workflow_create` 编码任务默认强制实际执行验证、版本比较、前置任务就绪与独立子会话审核，不能用 waiver 绕过。主会话在 `task_workflow_submit` 上批准计划、修改未批准计划的依赖或要求返工，owner 记录当前产物回执，独立审核者绑定当前 revision；最终仍由 `task_accept` 决定。见 [工作流](docs/WORKFLOW.md)。
+
+主会话普通开任务时设置 `evidence_policy: "execution"`、文件清单与固定命令，当前真实子会话 owner 用 `task_verify` 走原生 bash 与 approval/sandbox/guards。仅最新实际 exit 0、完整日志与当前文件/代数/owner 一致的回执可通过；默认 `legacy` 不升级成已执行验证，人工豁免明确标为非验证通过。见 [事实库与回执](docs/STORE.md)。
 
 `task_board` 默认25项、最大100项；默认/summary 完整工具 JSON 上限65536 UTF-8 bytes，展示截短显式标记，独立晚到 blocker 游标及详情/历史页可取回原文。详情/原文页只限条数，不承诺同一字节上限；旧宿主 `board` API 保持兼容。
 
-冻结的原生事件追加使用增量 reducer；中段 replacement、可变恢复 seed 与策略变化回到全量重放。前缀检查/复制仍为 O(n)，不承诺整步 O(1)。执行者修改已有文件前须自己 native read；新任务/续作重新读，成功 native write/edit 后不需为连续编辑机械重读；观察缺失/版本变化须 read 并复核，shell cat/grep 不替代原生观察。固定四阶段真实模型回归需显式 opt-in；普通测试不产生付费模型请求。版本与验收状态见 [0.3 验收记录](docs/superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。
+可证明不可变的普通原生事件追加使用增量 reducer，避免复制历史前缀并增量保留 TODO 状态；中段 replacement、可变恢复 seed、Proxy、访问器、非原生迭代器与策略变化回到全量重放。前缀完整性检查仍为 O(n)，不承诺整步 O(1)，可变历史也没有统一加速承诺。执行者修改已有文件前须自己 native read；新任务/续作重新读，成功 native write/edit 后不需为连续编辑机械重读；观察缺失/版本变化须 read 并复核，shell cat/grep 不替代原生观察。固定四阶段真实模型回归需显式 opt-in；普通测试不产生付费模型请求。版本与验收状态见 [0.3 验收记录](docs/superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。
 
-修正候选 `c237ab8` 的精确解压包已通过 Node 22.23.2/24.19.0 全量原生闸和显式四阶段模型验收：58条 native stream 请求、215946ms，1名执行者复用两次、3任务owner匹配且accepted、无waiver，strict回执有效；全部运行/usage/路由错误计数为0。验证器在公开全局stream边界核对8192容量并拒绝辅助调用，生产compaction保持原样。历史55条普通agent样本及六次失败278条（合计333条）保留，旧辅助调用覆盖不完整、发生情况与usage未知；不能用新58条证明历史provider总量完整。最终文档归档、同一修复波唯一范围复核、更新CI与exact HEAD merge仍待controller完成。精确SHA、用量观察范围和非受控比较限制见验收记录。
+修正候选 `c237ab8` 的精确解压包已通过 Node 22.23.2/24.19.0 全量原生闸和显式四阶段模型验收：58条 native stream 请求、215946ms，1名执行者复用两次、3任务owner匹配且accepted、无waiver，strict回执有效；全部运行/usage/路由错误计数为0。验证器在公开全局stream边界核对8192容量并拒绝辅助调用，生产compaction保持原样。历史55条普通agent样本及六次失败278条（合计333条）保留，旧辅助调用覆盖不完整、发生情况与usage未知；不能用新58条证明历史provider总量完整。这属于历史 0.3 验收，不能作为 0.4 真实模型回归证据。精确 SHA、用量观察范围和非受控比较限制见验收记录。0.4 的独立审核、实际 CI 及未验证项见 [升级交付记录](docs/superpowers/research/2026-10-10-imperator-nextgen-ledger.md)。
+
+## 恢复、调度与运维
+
+- [恢复日志](docs/RECOVERY.md)：控制效果前持久化 intent，重复请求返回原操作；结果未知时保留待查状态。检查点与时间线可分页，缺失 agent 不代表已停止，生命周期元数据不证明整棵进程树安静或宿主日志已刷盘。
+- [持久调度](docs/SCHEDULER.md)：持久队列复用 governor 的资源与额度事务，绑定时复查 owner、代数和工作流依赖；[宿主契约](docs/SCHEDULER_HOST_CONTRACT.md)列出实际已验证和仍缺失的能力。
+- [运维工具](docs/OPERATIONS.md)：`imperator doctor` 只读检查，`backup` 包含已提交 WAL，`preflight` 在副本上迁移预演，`restore` 只发布到新目录。恢复保留历史路径审计，严格证据须在新位置重新验证。
+
+```bash
+node tools/imperator.mjs doctor --root /absolute/taskforce --json
+node tools/imperator.mjs backup --root /absolute/taskforce --out /absolute/new-backup --json
+node tools/imperator.mjs preflight --root /absolute/taskforce --json
+node tools/imperator.mjs restore --backup /absolute/backup --out /absolute/new-staging-root --json
+```
+
+0.4 普通验收不发模型请求。当前开发运行环境启动失败，生产部署入口、失败 run/child ID、日志和模型凭据就绪状态未提供；实际生产崩溃复现、升级部署与本版本付费模型长任务验收尚未完成。隔离原生测试和故障压力测试的结论只适用于其记录的范围。
 
 ## 两个正交的问题，一次解决
 
@@ -54,7 +71,7 @@ agent 平面（lib/preset.js 的 29 行）
     subagent_fork(fork)       maxDepth: 2 · continuable · 执行者 persona
     subagent-control / list-agents
   compaction（isolate: compaction+toolResultPruner）
-  taskforce-tools            ← 消费 ctx.taskforceStore，注册 11 个模型可见工具
+  taskforce-tools            ← 消费 ctx.taskforceStore，注册 15 个模型可见工具
   taskforce-working-context  ← 每步钉一行客观状态
   taskforce-guard            ← 运行时退化断路器
   taskforce-orchestrator-scope ← 只收窄主会话，子代理不受影响
@@ -81,7 +98,7 @@ agent 平面（lib/preset.js 的 29 行）
 - 位置：`$DSH_HOME/taskforce/taskforce.db`（`config.root` > `$TASKFORCE_HOME` > `$DSH_HOME/taskforce` > `$HOME/.dsh/taskforce`）
 - 表：`task` / `fact`（kind ∈ fact,artifact,decision,blocker；confidence ∈ CONFIRMED,PLAUSIBLE,REFUTED）/ `handoff` + 视图 `v_task_board`
 - 服务 API（`ctx.taskforceStore`）：`openTask` / `claimTask` / `recordFact` / `recordHandoff` / `closeTask` / `submitTask` / `acceptTask` / `rejectTask` / `taskOf` / `board` / `stats` / `workingState`
-- 模型可见工具（**11 个**）：`task_open` / `task_claim` / `task_fact` / `task_submit` / `task_accept` / `task_reject` / `task_close`（`submit` 的兼容别名）/ `task_board` / **`task_child_send`** / **`task_child_stop`** / **`task_verify`**
+- 模型可见工具（**15 个**）：`task_open` / `task_claim` / `task_fact` / `task_submit` / `task_accept` / `task_reject` / `task_close`（`submit` 的兼容别名）/ `task_board` / **`task_child_send`** / **`task_child_stop`** / **`task_verify`** / **`task_checkpoint`** / **`task_workflow_create`** / **`task_workflow_submit`** / **`task_workflow_state`**
 - DSH 0.2 原生控制工具也支持子代理；本包优先使用带直属归属核对与稳定回执的 `task_child_send` / `task_child_stop`，见 `docs/CONTROL.md`。
 
 **状态机与验收门槛**（`docs/STORE.md` 有完整的状态 × 动作表）
@@ -168,9 +185,9 @@ npm run test:all -- --install-anchor "$ANCHOR"     # 须见 HOST_VERIFIED 与 IS
 
 待办与晚到阻塞的续页须携带上页 `page_token`（晚到区为 `late_page_token`）；成员变化返回 `E_PAGE_CHANGED`，需丢弃该区游标和 token、重读第一页。旧数字游标调用方需同步更新；事实/交接历史游标不变。事实总数在看板、统计和每步工作上下文中采用同一可见性规则，排除错父域和孤儿事实。
 
-读取快照、证据归属与验收约束已保留；默认 STALL 仅观察、不降档。ECHO 统一按调用发起顺序判断，旧成功不能清空新失败；native/PTC 的调用 ID 按所属 turn/step 区分，外层传输成功不代替内层工具成功。已匹配的 11 个任务工具即使通过成功文本传输返回完整 `ok:false/error/code/hint` 回执，也计为 ECHO 失败；外部工具、引用或嵌套错误文本不参与这项语义判定。派发计数保留全部尝试与回执。默认未结算估计按非空 `senderSessionId` 去重抵扣初始派发，同一子代理续作的多次结算仍保留通知总数；缺少发送者的通知和 `TOOL_OUTCOME_UNKNOWN` 不证明派发已结算，确定失败才抵扣。此估计不冒充实际存活代理数。新开的空待办页省掉 3 次 SQL 查询，已有续页仍校验完整成员 token。`node tools/bench-board.mjs 1000 5000` 输出 9 类场景的查询数、返回 JavaScript 的行数、输出大小、执行计划及完整读板 p50/p95；耗时只供比较，不作通过阈值。
+读取快照、证据归属与验收约束已保留；默认 STALL 仅观察、不降档。ECHO 统一按调用发起顺序判断，旧成功不能清空新失败；native/PTC 的调用 ID 按所属 turn/step 区分，外层传输成功不代替内层工具成功。已匹配的 15 个任务工具即使通过成功文本传输返回完整 `ok:false/error/code/hint` 回执，也计为 ECHO 失败；外部工具、引用或嵌套错误文本不参与这项语义判定。派发计数保留全部尝试与回执。默认未结算估计按非空 `senderSessionId` 去重抵扣初始派发，同一子代理续作的多次结算仍保留通知总数；缺少发送者的通知和 `TOOL_OUTCOME_UNKNOWN` 不证明派发已结算，确定失败才抵扣。此估计不冒充实际存活代理数。新开的空待办页省掉 3 次 SQL 查询，已有续页仍校验完整成员 token。`node tools/bench-board.mjs 1000 5000` 输出 9 类场景的查询数、返回 JavaScript 的行数、输出大小、执行计划及完整读板 p50/p95；耗时只供比较，不作通过阈值。
 
-服务层 run 隔离不是文件系统隔离；有文件权限的执行者仍可能直接读取共享 SQLite 文件。模型默认看板有界并可分页；旧宿主完整 `board` 仍随任务数增长。durable governor core 仅由可信宿主显式调用，未接入原生派发；阶段 C 自动化调度器仍未实现。隔离宿主验收不发送模型请求，不能替代真实模型、长期并发、费用或目标生产实例验收。安装包不会自动修改正在运行的 DSH，也不会自动重启它。
+服务层 run 隔离不是文件系统隔离；有文件权限的执行者仍可能直接读取共享 SQLite 文件。模型默认看板有界并可分页；旧宿主完整 `board` 仍随任务数增长。durable governor core 与新增持久 FIFO 调度服务仅由可信宿主显式调用，尚未接入原生自动派发；未知结果保留资源占用，不自动重试或释放。隔离宿主验收不发送模型请求，不能替代真实模型、长期并发、费用或目标生产实例验收。安装包不会自动修改正在运行的 DSH，也不会自动重启它。
 
 ## 借鉴与致谢
 

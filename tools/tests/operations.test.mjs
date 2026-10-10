@@ -7,6 +7,8 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSyn
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { TaskforceGovernor } from '../../lib/governor/index.js'
+import { TaskforceScheduler } from '../../lib/scheduler/index.js'
 import { TaskforceStore } from '../../lib/store/index.js'
 
 let operations
@@ -31,22 +33,22 @@ function fixture(t, options = {}) {
   t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
   return { directory, root, workspace, store }
 }
-function seed(f, withReceipt = false) {
+function seed(f, withReceipt = false, run = 'run') {
   const task = f.store.openTask(withReceipt ? {
     title: SENTINEL, evidence_policy: 'execution',
     verification_files: ['source.js'], verification_command: 'node source.js',
-  } : { title: SENTINEL }, 'run', { isRoot: true, sessionId: 'run', cwd: f.workspace })
+  } : { title: SENTINEL }, run, { isRoot: true, sessionId: run, cwd: f.workspace })
   if (withReceipt) {
-    f.store.claimTask({ task_id: task.task_id, child_id: 'worker' }, 'run',
+    f.store.claimTask({ task_id: task.task_id, child_id: 'worker' }, run,
       { isRoot: false, sessionId: 'worker' }, 'worker')
     const receipt = f.store.recordExecution({ task_id: task.task_id, status: 'pending',
       command: 'node source.js', call_id: 'call', root_call_id: 'call', timeout_ms: 1000 },
-    'run', { isRoot: false, sessionId: 'worker' })
+    run, { isRoot: false, sessionId: 'worker' })
     f.store.recordExecution({ task_id: task.task_id, receipt_id: receipt.receipt_id,
       native_result: { isError: false, value: { kind: 'foreground', exitCode: 0, signal: null,
         timedOut: false, aborted: false, timeoutMs: 1000,
         stdout: { text: SENTINEL, truncated: false }, stderr: { text: '', truncated: false } } } },
-    'run', { isRoot: false, sessionId: 'worker' })
+    run, { isRoot: false, sessionId: 'worker' })
     return { ...task, receipt_id: receipt.receipt_id }
   }
   return task
@@ -400,3 +402,306 @@ for (const operation of ['backup', 'restore']) {
     assert.equal((await ops.doctor({ root: relocated })).ok, true)
   })
 }
+
+// Frozen v0.3.2 schema from e0743f045afa0c4a81c3207c809c56ad49acaa5b.
+// Built independently of the candidate store, including migrated task columns/views.
+const V03_SCHEMA = `
+CREATE TABLE IF NOT EXISTS task (
+  id         INTEGER PRIMARY KEY,
+  title      TEXT NOT NULL,
+  note       TEXT,
+  status     TEXT NOT NULL DEFAULT 'open',
+  owner      TEXT,
+  owner_session TEXT,
+  run_id     TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS fact (
+  id               INTEGER PRIMARY KEY,
+  task_id          INTEGER,
+  kind             TEXT NOT NULL,
+  statement        TEXT NOT NULL,
+  evidence_path    TEXT,
+  evidence_line    INTEGER,
+  confidence       TEXT NOT NULL,
+  created_by       TEXT,
+  actor_session    TEXT,
+  run_id           TEXT,
+  resolves_fact_id INTEGER,
+  created_at       TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_fact_task_id ON fact (task_id, id);
+
+CREATE TABLE IF NOT EXISTS handoff (
+  id         INTEGER PRIMARY KEY,
+  task_id    INTEGER,
+  from_child TEXT,
+  to_child   TEXT,
+  note       TEXT NOT NULL,
+  run_id     TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_handoff_task_id ON handoff (task_id, id);
+
+/* 旧视图：保持 7 列不变（历史读取方按列名取值），**不参与服务 API**。 */
+CREATE VIEW IF NOT EXISTS v_task_board AS
+  SELECT t.id AS id,
+         t.title AS title,
+         t.status AS status,
+         t.owner AS owner,
+         (SELECT COUNT(*) FROM fact f WHERE f.task_id = t.id) AS fact_count,
+         (SELECT MAX(f.created_at) FROM fact f WHERE f.task_id = t.id) AS last_fact_at,
+         (SELECT COUNT(*) FROM fact f WHERE f.task_id = t.id AND f.kind = 'blocker') AS blockers
+    FROM task t;
+
+ALTER TABLE task ADD COLUMN evidence_policy TEXT NOT NULL DEFAULT 'legacy';
+ALTER TABLE task ADD COLUMN verification_files TEXT;
+ALTER TABLE task ADD COLUMN verification_command TEXT;
+ALTER TABLE task ADD COLUMN verification_cwd TEXT;
+ALTER TABLE task ADD COLUMN evidence_generation INTEGER NOT NULL DEFAULT 0;
+
+CREATE INDEX IF NOT EXISTS idx_task_run_status ON task (run_id, status);
+CREATE INDEX IF NOT EXISTS idx_fact_run ON fact (run_id, id);
+CREATE INDEX IF NOT EXISTS idx_fact_blocker_run_id ON fact (run_id, id, task_id) WHERE kind='blocker';
+CREATE INDEX IF NOT EXISTS idx_fact_resolves ON fact (resolves_fact_id);
+CREATE INDEX IF NOT EXISTS idx_handoff_run ON handoff (run_id, id);
+
+/* 带 run 的人工 SQL 投影（服务 API 之外的只读便利视图）。 */
+DROP VIEW IF EXISTS v_run_board;
+CREATE VIEW v_run_board AS
+  SELECT t.run_id AS run_id,
+         t.id AS id,
+         t.title AS title,
+         t.status AS status,
+         t.owner AS owner,
+         (SELECT COUNT(*) FROM fact f WHERE f.task_id = t.id AND f.run_id IS t.run_id) AS fact_count,
+         (SELECT COUNT(*) FROM fact f WHERE f.task_id = t.id AND f.run_id IS t.run_id AND f.kind = 'blocker'
+            AND NOT EXISTS (SELECT 1 FROM fact r WHERE (r.resolves_fact_id = f.id AND r.task_id = f.task_id AND r.run_id IS f.run_id AND r.kind = 'decision' AND r.confidence IN ('CONFIRMED', 'PLAUSIBLE')))) AS blockers_open
+    FROM task t;
+
+
+CREATE TABLE IF NOT EXISTS execution_receipt (
+  id INTEGER PRIMARY KEY,
+  receipt_id TEXT NOT NULL UNIQUE,
+  task_id INTEGER NOT NULL,
+  run_id TEXT,
+  evidence_generation INTEGER NOT NULL,
+  owner_session TEXT NOT NULL,
+  actor_session TEXT NOT NULL,
+  command TEXT NOT NULL,
+  cwd TEXT NOT NULL,
+  verification_files TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT NOT NULL,
+  ended_at TEXT,
+  call_id TEXT NOT NULL,
+  root_call_id TEXT NOT NULL,
+  parent_call_id TEXT,
+  timeout_ms INTEGER NOT NULL,
+  snapshot TEXT NOT NULL,
+  outcome TEXT,
+  logs TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_execution_task_run ON execution_receipt(task_id, run_id, id);
+CREATE TABLE IF NOT EXISTS execution_waiver (
+  id INTEGER PRIMARY KEY,
+  task_id INTEGER NOT NULL,
+  run_id TEXT,
+  evidence_generation INTEGER NOT NULL,
+  actor_session TEXT,
+  reason TEXT NOT NULL,
+  receipt_id TEXT,
+  created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_execution_waiver_task_run ON execution_waiver(task_id, run_id, id);
+`
+
+async function unchangedDoctor(f, expectedCode) {
+  f.store.close()
+  const path = join(f.root, 'taskforce.db'), before = bytes(path), files = readdirSync(f.root)
+  const result = safe(await api().doctor({ root: f.root }))
+  assert.equal(result.ok, false)
+  assert.ok(result.checks.some(check => check.code === expectedCode), JSON.stringify(result))
+  assert.equal(bytes(path), before, 'doctor must not repair/migrate even incomplete v0.4 databases')
+  assert.deepEqual(readdirSync(f.root), files)
+  return result
+}
+test('doctor flags the real v0.3.2 schema while preflight rehearses its required v0.4 migration', async t => {
+  const f = fixture(t)
+  mkdirSync(f.root)
+  const path = join(f.root, 'taskforce.db'), db = new DatabaseSync(path)
+  db.exec(V03_SCHEMA)
+  db.prepare("INSERT INTO task(title,status,run_id,owner_session,created_at,updated_at) VALUES(?,'open','run','owner','then','then')").run(SENTINEL)
+  db.close()
+  const before = bytes(path)
+  const result = await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+  assert.ok(!result.checks.some(check => check.code === 'DATABASE_OK'))
+  const rehearsal = safe(await api().preflight({ root: f.root }))
+  assert.equal(rehearsal.ok, true)
+  assert.equal(rehearsal.migration_required, true)
+  assert.equal(rehearsal.rows_preserved, true)
+  assert.equal(bytes(path), before)
+})
+for (const [type, name] of [["TABLE","workflow"],["INDEX","idx_workflow_run"],["TABLE","task_dependency"],["INDEX","idx_dependency_prerequisite"],["TABLE","task_dependency_fence"],["TABLE","workflow_writer"],["TABLE","workflow_artifact"],["INDEX","idx_workflow_artifact"],["TABLE","workflow_review"],["INDEX","idx_workflow_review"],["TABLE","workflow_decision"],["INDEX","idx_workflow_decision"],["TABLE","lifecycle_event"],["INDEX","idx_lifecycle_run"],["INDEX","idx_lifecycle_caller"],["TABLE","control_operation"],["INDEX","idx_control_run"],["INDEX","idx_control_caller"],["TABLE","task_event"],["INDEX","idx_task_event_run"],["INDEX","idx_task_event_task"],["TABLE","task_checkpoint"],["INDEX","idx_checkpoint_run"],["INDEX","idx_checkpoint_task"],["TRIGGER","recovery_task_insert"],["TRIGGER","recovery_task_update"]]) {
+  test('doctor detects missing required v0.4 ' + type.toLowerCase() + ' ' + name + ' without repair', async t => {
+    const f = fixture(t); seed(f)
+    f.store.handle.exec('DROP ' + type + ' ' + name)
+    await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+  })
+}
+for (const sql of [
+  'ALTER TABLE workflow RENAME COLUMN plan_version TO obsolete_plan_version',
+  'DROP INDEX idx_workflow_run; CREATE INDEX idx_workflow_run ON workflow(task_id)',
+  'DROP TRIGGER recovery_task_insert; CREATE TRIGGER recovery_task_insert AFTER INSERT ON task BEGIN SELECT 1; END',
+]) {
+  test('doctor rejects malformed additive schema ' + sql.split(';')[0], async t => {
+    const f = fixture(t); seed(f)
+    f.store.handle.exec(sql)
+    await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+  })
+}
+function queue(f, task) {
+  const scheduler = new TaskforceScheduler(f.store)
+  const request = scheduler.enqueue({ request_key: 'queue', task_id: task.task_id, generation: 0,
+    mode: 'read', kind: 'new', resources: [] }, 'run', { role: 'lead', sessionId: 'run' })
+  return { scheduler, request }
+}
+for (const [type, name] of [['TABLE', 'scheduler_request'], ['TABLE', 'scheduler_decision'], ['INDEX', 'idx_scheduler_queue']]) {
+  test('doctor detects incomplete initialized scheduler ' + name + ' without creating schema', async t => {
+    const f = fixture(t), task = seed(f); queue(f, task)
+    f.store.handle.exec('DROP ' + type + ' ' + name)
+    await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+  })
+}
+test('doctor accepts unused optional scheduler and initialized healthy queue without migration', async t => {
+  const f = fixture(t), task = seed(f)
+  assert.equal((await api().doctor({ root: f.root })).ok, true)
+  assert.equal(f.store.handle.prepare("SELECT 1 FROM sqlite_schema WHERE name='scheduler_request'").get(), undefined)
+  queue(f, task)
+  assert.equal((await api().doctor({ root: f.root })).ok, true)
+})
+// Supply valid local audit rows, then alter only the identity under test.
+function insertAudit(db, table, values) {
+  const columns = db.prepare('PRAGMA table_info(' + table + ')').all()
+  const row = Object.fromEntries(columns.filter(c => c.notnull && c.dflt_value === null)
+    .map(c => [c.name, c.type === 'INTEGER' ? 1 : SENTINEL]))
+  Object.assign(row, values)
+  const names = Object.keys(row)
+  return db.prepare('INSERT INTO ' + table + '(' + names.join(',') + ') VALUES(' + names.map(() => '?').join(',') + ')').run(...Object.values(row))
+}
+for (const table of ['task_event', 'task_checkpoint', 'control_operation', 'workflow', 'task_dependency',
+  'task_dependency_fence', 'workflow_writer', 'workflow_artifact', 'workflow_review', 'workflow_decision']) {
+  for (const fault of ['foreign-run', 'missing-task']) {
+    test('doctor reports ' + table + ' ' + fault + ' scope corruption without leaking records', async t => {
+      const f = fixture(t), task = seed(f, true)
+      if (table === 'task_event') f.store.handle.exec('DELETE FROM task_event')
+      const values = { task_id: task.task_id, run_id: 'run' }
+      if (table === 'control_operation') Object.assign(values, { action: 'stop', status: 'pending' })
+      if (table === 'workflow_artifact') values.receipt_id = task.receipt_id
+      if (table === 'workflow_review') values.revision_id = artifact(f, task)
+      if (['task_dependency', 'task_dependency_fence'].includes(table)) values.prerequisite_task_id = task.task_id
+      insertAudit(f.store.handle, table, values)
+      assert.equal((await api().doctor({ root: f.root })).ok, true, 'identity-consistent audit is readable')
+      if (fault === 'foreign-run') f.store.handle.prepare('UPDATE ' + table + ' SET run_id=?').run(SENTINEL)
+      else f.store.handle.prepare('UPDATE ' + table + ' SET task_id=?').run(99999)
+      const result = await unchangedDoctor(f, 'SCOPE_INTEGRITY')
+      assert.equal(result.counts.scope_anomalies, 1)
+    })
+  }
+}
+for (const table of ['task_dependency', 'task_dependency_fence']) {
+  for (const fault of ['foreign-run', 'missing-target']) {
+    test('doctor reports ' + table + ' ' + fault + ' prerequisite identity', async t => {
+      const f = fixture(t), task = seed(f)
+      const other = f.store.openTask({ title: SENTINEL }, 'other-run')
+      insertAudit(f.store.handle, table, { task_id: task.task_id, run_id: 'run',
+        prerequisite_task_id: fault === 'foreign-run' ? other.task_id : 99999 })
+      const result = await unchangedDoctor(f, 'SCOPE_INTEGRITY')
+      assert.equal(result.counts.scope_anomalies, 1)
+    })
+  }
+}
+for (const fault of ['foreign-run', 'missing-task', 'missing-reservation', 'foreign-reservation']) {
+  test('doctor reports durable queue ' + fault + ' identity without changing dispatch state', async t => {
+    const f = fixture(t), task = seed(f), { scheduler } = queue(f, task)
+    if (fault === 'foreign-run') f.store.handle.prepare('UPDATE scheduler_request SET run_id=?').run(SENTINEL)
+    if (fault === 'missing-task') f.store.handle.exec('UPDATE scheduler_request SET task_id=99999')
+    if (fault.includes('reservation')) {
+      const admitted = scheduler.admitNext({ request_key: 'admit' }, 'run', { role: 'lead', sessionId: 'run' })
+      assert.equal(admitted.status, 'admitted')
+      assert.equal((await api().doctor({ root: f.root })).ok, true)
+      if (fault === 'missing-reservation') f.store.handle.exec("UPDATE scheduler_request SET reservation_id='missing'")
+      else f.store.handle.prepare('UPDATE governor_reservation SET run_id=?').run(SENTINEL)
+    }
+    const result = await unchangedDoctor(f, 'SCOPE_INTEGRITY')
+    assert.ok(result.counts.scope_anomalies >= 1)
+  })
+}
+test('doctor allows unassigned controls and historical audit generation or owner values', async t => {
+  const f = fixture(t), task = seed(f)
+  insertAudit(f.store.handle, 'control_operation', { task_id: null, run_id: null, action: 'stop', status: 'pending' })
+  insertAudit(f.store.handle, 'task_checkpoint', { task_id: task.task_id, run_id: 'run',
+    evidence_generation: 900, owner_session: 'historical-owner' })
+  const result = safe(await api().doctor({ root: f.root }))
+  assert.equal(result.ok, true)
+  assert.equal(result.counts.scope_anomalies, 0)
+})
+
+test('doctor requires the eager task-first blocker index without repairing it', async t => {
+  const f = fixture(t); seed(f)
+  assert.deepEqual(f.store.handle.prepare("PRAGMA index_info('idx_fact_blocker_task_run_id')").all().map(row => row.name),
+    ['task_id', 'run_id', 'id'])
+  f.store.handle.exec('DROP INDEX idx_fact_blocker_task_run_id')
+  await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+})
+
+for (const [type, name] of [["TABLE","governor_run"],["TABLE","governor_reservation"],["TABLE","governor_retry_charge"],["INDEX","idx_governor_run"],["INDEX","idx_governor_active_task"],["TABLE","governor_hold"],["INDEX","idx_governor_resource"],["TABLE","governor_audit"]]) {
+  test('doctor detects incomplete initialized governor ' + name + ' without creating schema', async t => {
+    const f = fixture(t), task = seed(f)
+    new TaskforceGovernor(f.store).reserve({ operation_key: 'admission', task_id: task.task_id,
+      generation: 0, mode: 'read', kind: 'new', resources: ['workspace'] },
+    'run', { role: 'lead', sessionId: 'run' })
+    assert.equal((await api().doctor({ root: f.root })).ok, true)
+    f.store.handle.exec('DROP ' + type + ' ' + name)
+    await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+  })
+}
+function artifact(f, task) {
+  const receipt = f.store.handle.prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(task.receipt_id)
+  return Number(insertAudit(f.store.handle, 'workflow_artifact', {
+    task_id: task.task_id, run_id: receipt.run_id, plan_version: 1,
+    evidence_generation: receipt.evidence_generation, producer_session: receipt.owner_session,
+    receipt_id: receipt.receipt_id, snapshot: receipt.snapshot, logs: receipt.logs,
+  }).lastInsertRowid)
+}
+for (const reference of ['workflow', 'workflow_review', 'workflow_artifact']) {
+  for (const fault of ['different-task', 'different-run', 'missing-target']) {
+    test('doctor reports ' + reference + ' ' + fault + ' evidence reference without rewriting history', async t => {
+      const f = fixture(t), first = seed(f, true), second = seed(f, true, fault === 'different-run' ? 'other-run' : 'run')
+      const firstArtifact = artifact(f, first), secondArtifact = artifact(f, second)
+      if (reference !== 'workflow_artifact') insertAudit(f.store.handle, reference,
+        { task_id: first.task_id, run_id: 'run', revision_id: firstArtifact })
+      assert.equal((await api().doctor({ root: f.root })).ok, true, 'valid reference identities')
+      if (reference === 'workflow_artifact') f.store.handle.prepare('UPDATE workflow_artifact SET receipt_id=? WHERE id=?')
+        .run(fault === 'missing-target' ? 'missing' : second.receipt_id, firstArtifact)
+      else f.store.handle.prepare('UPDATE ' + reference + ' SET revision_id=? WHERE task_id=?')
+        .run(fault === 'missing-target' ? 99999 : secondArtifact, first.task_id)
+      const result = await unchangedDoctor(f, 'SCOPE_INTEGRITY')
+      assert.equal(result.counts.scope_anomalies, 1)
+    })
+  }
+}
+test('doctor preserves historical workflow receipt/review identity across new owners and generations', async t => {
+  const f = fixture(t), task = seed(f, true), oldRevision = artifact(f, task), currentRevision = artifact(f, task)
+  insertAudit(f.store.handle, 'workflow', { task_id: task.task_id, run_id: 'run', revision_id: currentRevision })
+  insertAudit(f.store.handle, 'workflow_review', { task_id: task.task_id, run_id: 'run', revision_id: oldRevision,
+    evidence_generation: 10, plan_version: 2, reviewer_session: 'historical-reviewer' })
+  f.store.handle.exec("UPDATE workflow_artifact SET producer_session='historical-producer',evidence_generation=9,plan_version=3")
+  const result = safe(await api().doctor({ root: f.root }))
+  assert.equal(result.ok, true)
+  assert.equal(result.counts.scope_anomalies, 0)
+})

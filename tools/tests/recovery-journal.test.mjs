@@ -24,6 +24,8 @@ function available(recovery) {
 function toolsHarness(store, { live, send, stop, parentSession } = {}) {
   const events = [{ type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } }]
   const agent = { id: 'root', session: { events, header: { id: 'root', version: 4, ...(parentSession ? { parentSession, origin: 'subagent', delegationDepth: 2 } : {}) } } }
+  agent.ctx = { preset: 'taskforce' }
+  const hooks = new Map()
   const definitions = new Map()
   let sends = 0, stops = 0
   const subagents = {
@@ -32,7 +34,9 @@ function toolsHarness(store, { live, send, stop, parentSession } = {}) {
     interrupt(...args) { stops++; return stop?.(...args) },
   }
   const ctx = {
-    get(name) { return { taskforceStore: store, subagents, agents: { get(id) { return id === 'worker' ? live : undefined } } }[name] },
+    preset: 'taskforce',
+    on(name, fn) { hooks.set(name, fn); return () => hooks.delete(name) },
+    get(name) { return { taskforceStore: store, subagents, agentPresets: { composedPreset(scope) { return scope?.preset } }, agents: { get(id) { return id === 'worker' ? live : undefined } } }[name] },
     tools: { register(definition) { definitions.set(definition.name, definition); return () => {} } },
     logger: { warn() {} },
   }
@@ -41,7 +45,7 @@ function toolsHarness(store, { live, send, stop, parentSession } = {}) {
     call(name, args, key = 'call-1') {
       return definitions.get(name).execute(args, { agent, callId: key, signal: new AbortController().signal }).then(JSON.parse)
     },
-    events,
+    events, hooks, agent,
     get sends() { return sends }, get stops() { return stops },
   }
 }
@@ -323,4 +327,83 @@ test('unknown replay returns the complete semantic failure envelope', async t =>
   assert.equal(typeof result.error, 'string')
   assert.equal(typeof result.hint, 'string')
   assert.equal(h.sends, 1)
+})
+
+test('scoped lifecycle observer records disposed and durable turn reasons without inferring crash', async t => {
+  const { store, recovery } = fixture(t)
+  const h = toolsHarness(store)
+  const disposed = h.hooks.get('agent/disposed')
+  assert.equal(typeof disposed, 'function', 'mounted tools must attach scoped lifecycle observer')
+  h.events.push({ seq: 2, type: 'turn/end', data: { turn: 1, reason: { kind: 'aborted', reason: { kind: 'user', message: 'SECRET' } } } })
+  await disposed({ agent: h.agent })
+  const state = recovery.inspect({}, 'root')
+  const ended = state.lifecycle.find(e => e.event_type === 'turn/end')
+  assert.equal(ended.reason_kind, 'aborted')
+  assert.equal(ended.session_id, 'root')
+  assert.equal(ended.source, 'session_event')
+  assert.equal(state.lifecycle.some(e => e.event_type === 'agent/disposed'), true)
+  assert.equal(state.tree_quiescent, null)
+  assert.equal(JSON.stringify(state).includes('SECRET'), false)
+  assert.equal(ended.node_version, process.version)
+  assert.equal(typeof ended.package_version, 'string')
+})
+test('lifecycle request middleware preserves host response and records prepared request only', async t => {
+  const { store, recovery } = fixture(t)
+  const h = toolsHarness(store)
+  const request = h.hooks.get('agent/request')
+  assert.equal(typeof request, 'function')
+  const response = { model: 'SECRET', maxTokens: 1 }
+  assert.equal(await request({ agent: h.agent, turn: 1, step: 1 }, async () => response), response)
+  const state = recovery.inspect({}, 'root')
+  assert.equal(state.lifecycle.some(e => e.event_type === 'request/prepared'), true)
+  assert.equal(JSON.stringify(recovery.diagnosticBundle({}, 'root')).includes('SECRET'), false)
+})
+test('lifecycle scope excludes standard and missing preset identity', async t => {
+  const { store, recovery } = fixture(t)
+  const h = toolsHarness(store)
+  const disposed = h.hooks.get('agent/disposed')
+  assert.equal(typeof disposed, 'function')
+  h.agent.ctx.preset = 'standard'
+  await disposed({ agent: h.agent })
+  assert.equal(recovery.inspect({}, 'root').lifecycle.length, 0)
+  h.agent.ctx.preset = undefined
+  await disposed({ agent: h.agent })
+  assert.equal(recovery.inspect({}, 'root').lifecycle.length, 0)
+})
+test('durable lifecycle projection deduplicates coordinates and rejects conflicting history', t => {
+  const { recovery } = fixture(t)
+  assert.equal(typeof recovery.recordLifecycle, 'function')
+  const event = { event_type: 'turn/end', source: 'session_event', event_seq: 5,
+    reason_kind: 'error', error_code: 'UNKNOWN', raw_error: 'SECRET', node_version: process.version, package_version: '0.4.0' }
+  recovery.recordLifecycle(event, authority)
+  assert.equal(recovery.recordLifecycle(event, authority).replayed, true)
+  assert.throws(() => recovery.recordLifecycle({ ...event, reason_kind: 'aborted' }, authority), { code: 'E_RECOVERY_CONFLICT' })
+  assert.equal(recovery.inspect({}, 'root').lifecycle.length, 1)
+  assert.equal(JSON.stringify(recovery.diagnosticBundle({}, 'root')).includes('SECRET'), false)
+})
+test('lifecycle observations are bounded and caller-only when ancestry is unavailable', async t => {
+  const { store, recovery } = fixture(t)
+  const h = toolsHarness(store, { parentSession: 'missing-parent' })
+  const disposed = h.hooks.get('agent/disposed')
+  assert.equal(typeof disposed, 'function')
+  h.events.push(...Array.from({ length: 600 }, (_, i) => ({ seq: i + 3, type: 'turn/end', data: { turn: i + 1, reason: { kind: 'completed' } } })))
+  await disposed({ agent: h.agent })
+  assert.equal(recovery.inspect({}, 'root').lifecycle.length, 0)
+  const state = recovery.inspect({ limit: 100 }, null, { sessionId: 'root' })
+  assert.equal(state.lifecycle.length > 0, true)
+  assert.equal(state.truncated, true)
+  assert.equal(Buffer.byteLength(JSON.stringify(state)) <= 16384, true)
+  assert.equal(state.observation_gaps.includes('lifecycle_window_truncated'), true)
+})
+test('lifecycle persistence failure cannot change host request behavior', async t => {
+  const { store } = fixture(t)
+  const h = toolsHarness(store)
+  const request = h.hooks.get('agent/request')
+  assert.equal(typeof request, 'function')
+  store.open().exec("CREATE TRIGGER deny_lifecycle BEFORE INSERT ON lifecycle_event BEGIN SELECT RAISE(ABORT, 'SECRET disk error'); END")
+  const response = {}
+  assert.equal(await request({ agent: h.agent, turn: 1, step: 1 }, async () => response), response)
+  const state = store.recovery.inspect({}, 'root')
+  assert.equal(state.observation_gaps.includes('lifecycle_write_failed'), true)
+  assert.equal(JSON.stringify(state).includes('SECRET'), false)
 })

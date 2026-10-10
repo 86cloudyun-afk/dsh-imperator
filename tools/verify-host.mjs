@@ -315,7 +315,17 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     assert.equal((await task(parent.agent, 'task_board', { task_id: pagedIds[0] })).task.title,
       `native page 0 ${'标题😀'.repeat(2000)}`)
     pass('registered native task_board defaults are bounded and cursors preserve full task reachability')
+    // Actual mounted observer and real disposal; the seeded terminal record
+    // verifies wire shape, not a model abort or production failure reproduction.
+    const recovery = ctx.get('taskforceStore').recovery
+    assert.equal(typeof recovery.recordLifecycle, 'function', 'native recovery lifecycle observer missing')
+    child.agent.session.append('turn/end', { turn: 100, reason: { kind: 'aborted', reason: { kind: 'user' } } })
     for (const handle of handles.splice(0).reverse()) await handle.dispose()
+    const lifecycle = recovery.inspect({ limit: 100 }, parent.agent.id).lifecycle
+    assert.ok(lifecycle.some(row => row.event_type === 'agent/disposed' && row.session_id === child.agent.id), 'real disposal must reach scoped observer')
+    assert.ok(lifecycle.some(row => row.event_type === 'turn/end' && row.reason_kind === 'aborted'), 'actual session terminal record must survive disposal')
+    assert.ok(lifecycle.every(row => row.node_version === process.version))
+    pass('native scoped lifecycle disposal and durable terminal metadata without model requests')
     assert.equal(agents.get('taskforce-probe-child'), undefined)
     assert.equal(agents.get('taskforce-probe-lead'), undefined)
     pass('agent handle teardown')

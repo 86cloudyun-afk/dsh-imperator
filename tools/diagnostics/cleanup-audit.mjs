@@ -2,7 +2,7 @@
 // Temporary diagnostic evidence, never an acceptance substitute.
 import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -16,15 +16,18 @@ assert.ok(process.env.DSH_INSTALL_ANCHOR, 'exact native install anchor is requir
 mkdirSync(evidence, { recursive: true })
 const records = []
 let strictFailures = 0
-const prefix = 'CLEANUP_DIAGNOSTIC='
-const header = [
-  'const started = performance.now();',
-  "const { writeSync } = await import('node:fs');",
-  "const mark = phase => writeSync(1, 'CLEANUP_DIAGNOSTIC=' + JSON.stringify({phase, elapsed_ms: Math.round(performance.now()-started)}) + '\\n');",
-  "process.on('SIGTERM', () => mark('sigterm_observed'));",
-].join('\n')
+function markerPath(mode, attempt) { return join(evidence, mode + '-' + attempt + '.jsonl') }
+function headerFor(mode, attempt) {
+  return [
+    'const started = performance.now();',
+    "const { appendFileSync, writeSync } = await import('node:fs');",
+    'const mark = phase => appendFileSync(' + JSON.stringify(markerPath(mode, attempt)) + ", JSON.stringify({phase, elapsed_ms: Math.round(performance.now()-started)}) + '\\n');",
+  ].join('\n')
+}
 function capture(mode, attempt, source) {
   const started = performance.now()
+  const markerFile = markerPath(mode, attempt)
+  rmSync(markerFile, { force: true })
   let output = '', stderr = '', wrapper = null
   try {
     output = execFileSync(process.execPath, ['--input-type=module', '-e', source],
@@ -37,8 +40,9 @@ function capture(mode, attempt, source) {
       errno: typeof error.errno === 'number' ? error.errno : null,
       killed: typeof error.killed === 'boolean' ? error.killed : null }
   }
-  const markers = output.split('\n').filter(line => line.startsWith(prefix)).map(line => {
-    const row = JSON.parse(line.slice(prefix.length))
+  const markerText = existsSync(markerFile) ? readFileSync(markerFile, 'utf8') : ''
+  const markers = markerText.split('\n').filter(Boolean).map(line => {
+    const row = JSON.parse(line)
     assert.match(row.phase, /^[a-z_]{1,48}$/)
     assert.ok(Number.isSafeInteger(row.elapsed_ms) && row.elapsed_ms >= 0)
     return { phase: row.phase, elapsed_ms: row.elapsed_ms }
@@ -50,7 +54,7 @@ function capture(mode, attempt, source) {
     code: wrapper?.code ?? null, signal: wrapper?.signal ?? null,
     status: wrapper ? wrapper.status : 0, errno: wrapper?.errno ?? null,
     killed: wrapper?.killed ?? null, stdout_bytes: Buffer.byteLength(output),
-    stderr_bytes: Buffer.byteLength(stderr), markers,
+    stderr_bytes: Buffer.byteLength(stderr), stderr_codes: ['EPIPE', 'ETIMEDOUT'].filter(code => stderr.includes(code)), markers,
     success_marker: /UNEXPECTED_SUCCESS|HOST_VERIFIED/.test(output),
     owned_home_seen: Boolean(ownedHome), home_removed_before_fallback: ownedHome ? !existsSync(ownedHome) : null }
   if (ownedHome) rmSync(ownedHome, { recursive: true, force: true })
@@ -63,11 +67,12 @@ function publish(row) {
 }
 for (let attempt = 1; attempt <= 3; attempt++) {
   for (const mode of ['reject', 'hang']) {
-    const source = [header,
+    const source = [headerFor(mode, attempt),
       'const { verifyHost } = await import(' + JSON.stringify(verifier) + ');',
       'await verifyHost({ configureShutdown(app, root) {',
       "writeSync(1, 'CLEANUP_ROOT=' + root + '\\n');",
-      "mark('host_ready');",
+      "process.prependListener('SIGTERM', () => mark('sigterm_observed'));",
+    "mark('host_ready');",
       'const dispose = app.ctx.fiber.dispose.bind(app.ctx.fiber);',
       'app.ctx.fiber.dispose = async () => {',
       "mark('disposer_entered');",
@@ -93,7 +98,7 @@ for (let attempt = 1; attempt <= 3; attempt++) {
   }
 }
 for (const mode of ['explicit_sigterm_pending_shutdown', 'wrapper_deadline_pending_shutdown']) {
-  const source = [header,
+  const source = [headerFor(mode, 1),
     'const { controlledProfile, resolveInstallAnchor } = await import(' + JSON.stringify(runtime) + ');',
     "const { dirname, join } = await import('node:path');",
     "const { pathToFileURL } = await import('node:url');",
@@ -104,6 +109,7 @@ for (const mode of ['explicit_sigterm_pending_shutdown', 'wrapper_deadline_pendi
     "const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href);",
     "const app = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile:'web',",
     "patchFiles:[fixture.overlay], args:['--host','127.0.0.1','--port','0','--no-open'] });",
+    "process.prependListener('SIGTERM', () => mark('sigterm_observed'));",
     "mark('host_ready');",
     'const dispose = app.ctx.fiber.dispose.bind(app.ctx.fiber);',
     'app.ctx.fiber.dispose = async () => {',

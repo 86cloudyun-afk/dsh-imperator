@@ -1,0 +1,131 @@
+name: Runner deadline diagnostics
+
+on:
+  push:
+    branches: ['codex/audit-runner-deadline-guard-rejected']
+    paths: ['.github/workflows/runner-deadline-diagnostics.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  npm-deadline:
+    name: ${{ matrix.revision }} Node ${{ matrix.node }} ${{ matrix.cpus }} CPU
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.23.2', '24.19.0']
+        cpus: [1]
+        revision: ['aggregate']
+        include:
+          - revision: aggregate
+            source_sha: '8d23c1a28e385714b3b2b05165d15ed59eef1390'
+            source_tree: '6327af19dc5725bc80536947c2ab4a9c3ea579c1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.source_sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Run unmodified npm test under verified CPU affinity
+        shell: bash
+        env:
+          DIAG_SOURCE_SHA: ${{ matrix.source_sha }}
+          DIAG_SOURCE_TREE: ${{ matrix.source_tree }}
+          DIAG_REVISION: ${{ matrix.revision }}
+          DIAG_CPUS: ${{ matrix.cpus }}
+          DIAG_NODE: ${{ matrix.node }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, re, subprocess, sys, time
+          evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'runner-deadline-diagnostics'
+          evidence.mkdir(parents=True, exist_ok=True)
+          def command(*args):
+              return subprocess.check_output(args, text=True).strip()
+          commit = command('git', 'rev-parse', 'HEAD')
+          tree = command('git', 'rev-parse', 'HEAD^{tree}')
+          if commit != os.environ['DIAG_SOURCE_SHA'] or tree != os.environ['DIAG_SOURCE_TREE']:
+              raise RuntimeError('checked-out source SHA/tree differs from frozen matrix input')
+          if command('git', 'status', '--porcelain'):
+              raise RuntimeError('source checkout is not clean')
+          allowed_line = next(line.split(':', 1)[1].strip() for line in pathlib.Path('/proc/self/status').read_text().splitlines() if line.startswith('Cpus_allowed_list:'))
+          allowed = []
+          for segment in allowed_line.split(','):
+              bounds = segment.split('-')
+              start, end = int(bounds[0]), int(bounds[-1])
+              allowed.extend(range(start, end + 1))
+          requested = int(os.environ['DIAG_CPUS'])
+          metadata = {
+              'revision': os.environ['DIAG_REVISION'], 'input_commit': commit, 'input_tree': tree,
+              'requested_node': os.environ['DIAG_NODE'], 'requested_cpus': requested,
+              'original_cpus_allowed_list': allowed_line,
+              'verify_all_blob': command('git', 'rev-parse', 'HEAD:tools/verify-all.mjs'),
+              'host_runtime_test_blob': command('git', 'rev-parse', 'HEAD:tools/tests/host-runtime.test.mjs'),
+              'node_options': os.environ.get('NODE_OPTIONS'),
+              'verify_child_deadline_ms': 60000, 'native_cleanup_test_deadline_ms': 12000,
+              'deadline_policy': 'unmodified source; no timeout override; 10 minute job outer bound',
+          }
+          if len(allowed) < requested:
+              metadata.update({'status': 'unavailable', 'reason': 'fewer allowed CPUs than requested'})
+              (evidence / 'input.json').write_text(json.dumps(metadata, indent=2) + '\n')
+              print('RUNNER_DEADLINE_INPUT ' + json.dumps(metadata), flush=True)
+              sys.exit(78)
+          selected = ','.join(str(cpu) for cpu in allowed[:requested])
+          node_code = "const os=require('node:os');const fs=require('node:fs');console.log(JSON.stringify({node:process.version,availableParallelism:os.availableParallelism(),cpuCount:os.cpus().length,cpusAllowedList:fs.readFileSync('/proc/self/status','utf8').split('\\n').find(x=>x.startsWith('Cpus_allowed_list:')).split(':')[1].trim()}))"
+          runtime = json.loads(command('taskset', '-c', selected, 'node', '-e', node_code))
+          metadata.update({'selected_cpus': selected, 'runtime': runtime,
+                           'default_test_concurrency': max(runtime['availableParallelism'] - 1, 1),
+                           'npm': command('npm', '--version'), 'command': ['taskset', '-c', selected, 'npm', 'test']})
+          if runtime['availableParallelism'] != requested:
+              metadata.update({'status': 'unavailable', 'reason': 'actual availableParallelism differs from requested CPU affinity'})
+              (evidence / 'input.json').write_text(json.dumps(metadata, indent=2) + '\n')
+              print('RUNNER_DEADLINE_INPUT ' + json.dumps(metadata), flush=True)
+              sys.exit(78)
+          metadata['status'] = 'ready'
+          (evidence / 'input.json').write_text(json.dumps(metadata, indent=2) + '\n')
+          (evidence / 'tracked-tree.txt').write_text(command('git', 'ls-tree', '-r', 'HEAD') + '\n')
+          print('RUNNER_DEADLINE_INPUT ' + json.dumps(metadata), flush=True)
+          stdout_path, stderr_path = evidence / 'npm.stdout.log', evidence / 'npm.stderr.log'
+          started = time.perf_counter()
+          with stdout_path.open('wb') as stdout, stderr_path.open('wb') as stderr:
+              process = subprocess.run(['taskset', '-c', selected, 'npm', 'test'], stdout=stdout, stderr=stderr, check=False)
+          elapsed = time.perf_counter() - started
+          out, err = stdout_path.read_bytes(), stderr_path.read_bytes()
+          text = out.decode('utf-8', errors='replace') + '\n' + err.decode('utf-8', errors='replace')
+          result = {
+              'input_commit': commit, 'input_tree': tree, 'node': runtime['node'],
+              'selected_cpus': selected, 'availableParallelism': runtime['availableParallelism'],
+              'elapsed_seconds': round(elapsed, 6), 'npm_exit_code': process.returncode,
+              'aggregate_timed_out': bool(re.search(r'^node:test: FAILED.*\(timeout\)', text, re.MULTILINE)),
+              'verification_summary': [line for line in text.splitlines() if re.match(r'^(verify-|node:test:|host integration:)', line)],
+              'test_summary': [line for line in text.splitlines() if re.match(r'^(?:#|ℹ) (tests|pass|fail|cancelled|skipped|duration_ms) ', line)],
+              'stdout_bytes': len(out), 'stderr_bytes': len(err),
+              'stdout_sha256': hashlib.sha256(out).hexdigest(), 'stderr_sha256': hashlib.sha256(err).hexdigest(),
+          }
+          (evidence / 'result.json').write_text(json.dumps(result, indent=2) + '\n')
+          print('NPM_STDOUT_BEGIN', flush=True)
+          sys.stdout.buffer.write(out)
+          sys.stdout.buffer.flush()
+          print('\nNPM_STDOUT_END', flush=True)
+          print('NPM_STDERR_BEGIN', file=sys.stderr, flush=True)
+          sys.stderr.buffer.write(err)
+          sys.stderr.buffer.flush()
+          print('\nNPM_STDERR_END', file=sys.stderr, flush=True)
+          print('RUNNER_DEADLINE_RESULT ' + json.dumps(result), flush=True)
+          sys.exit(process.returncode if process.returncode >= 0 else 128 - process.returncode)
+          PY
+      - name: Preserve original npm output and deadline metadata
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: runner-deadline-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.revision }}-${{ matrix.node }}-${{ matrix.cpus }}cpu
+          path: ${{ runner.temp }}/runner-deadline-diagnostics/
+          if-no-files-found: error
+          retention-days: 7
+

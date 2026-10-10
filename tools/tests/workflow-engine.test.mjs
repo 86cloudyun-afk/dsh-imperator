@@ -627,7 +627,7 @@ test('historical completed fail-then-pass outcome keeps original acceptance repl
   f.store.open().prepare("INSERT INTO workflow_review(id,task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT 0,task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,'fail','pass','[]',created_at FROM workflow_review WHERE task_id=? LIMIT 1").run(id)
   const before = deliveryRows(f, id)
   assert.deepEqual(f.store.acceptTask(args, run, lead), accepted)
-  assert.throws(() => f.store.acceptTask({ ...args, request_key: f.key() }, run, lead), { code: 'E_TERMINAL' })
+  assert.throws(() => f.store.acceptTask({ ...args, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }, run, lead), { code: 'E_TERMINAL' })
   assert.deepEqual(deliveryRows(f, id), before)
   assert.equal(f.store.taskOf(id, run).task.status, 'accepted')
 })

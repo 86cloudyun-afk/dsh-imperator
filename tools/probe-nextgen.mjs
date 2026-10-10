@@ -14,7 +14,7 @@ import { performance } from 'node:perf_hooks'
 
 const SELF = fileURLToPath(import.meta.url)
 const TASK_INDEX = 'idx_probe_blocker_task_run_id'
-const VARIANTS = ['current', 'rows_run_index', 'rows_task_index']
+const VARIANTS = ['planner_default', 'rows_run_index', 'rows_task_index']
 const MARKER = '.nextgen-synthetic'
 const RUN = 'probe-run'
 let phase = 'startup'
@@ -107,7 +107,7 @@ function rowVariant(sql, variant) {
   if (!sql.startsWith('SELECT b.id AS fact_id,') || !sql.includes("AND b.kind='blocker'")) return sql
   const normalized = sql.replace(/ FROM fact b(?: INDEXED BY [A-Za-z0-9_]+)? JOIN task t/, ' FROM fact b JOIN task t')
   assert.notEqual(normalized.indexOf(' FROM fact b JOIN task t'), -1, 'late row SQL changed; update probe recognition')
-  if (variant === 'current') return normalized
+  if (variant === 'planner_default') return normalized
   const index = variant === 'rows_run_index' ? 'idx_fact_blocker_run_id' : TASK_INDEX
   return normalized.replace(' FROM fact b JOIN task t', ' FROM fact b INDEXED BY ' + index + ' JOIN task t')
 }
@@ -160,12 +160,30 @@ async function pageCases(store, fixture, variant) {
   const terminal = cohortPagination({ limit: 25, next_cursor: last, has_more: true }, state)
   const exhausted = { ...base, cursor: last, page_token: terminal.page_token }
   assert.deepEqual(read(exhausted).late_blockers, [])
+  const unscopedBase = { view: 'late_blockers', limit: 25 }
+  let unscopedPage = read(unscopedBase)
+  const unscopedPages = [{ args: unscopedBase, result: unscopedPage }]
+  while (unscopedPage.pagination.has_more) {
+    assert.ok(unscopedPages.length < 100, 'unbounded unscoped traversal')
+    const args = continuation(unscopedPage, unscopedBase)
+    unscopedPage = read(args); unscopedPages.push({ args, result: unscopedPage })
+  }
+  assert.deepEqual(unscopedPages.flatMap(p => p.result.late_blockers.map(row => row.fact_id)), [...fixture.ids].reverse())
+  const unscopedState = JSON.parse(Buffer.from(unscopedPages[0].result.pagination.page_token, 'base64url').toString('utf8'))
+  delete unscopedState.c
+  const unscopedTerminal = cohortPagination({ limit: 25, next_cursor: last, has_more: true }, unscopedState)
+  const unscopedExhausted = { ...unscopedBase, cursor: last, page_token: unscopedTerminal.page_token }
+  assert.deepEqual(read(unscopedExhausted).late_blockers, [])
   return [
     { name: 'first', args: base },
     { name: 'middle', args: pages[Math.floor(pages.length / 2)].args },
     { name: 'final', args: pages.at(-1).args },
     { name: 'exhausted_continuation', args: exhausted },
     { name: 'exhausted_first', args: { ...base, task_id: fixture.empty } },
+    { name: 'unscoped_first', args: unscopedBase },
+    { name: 'unscoped_middle', args: unscopedPages[Math.floor(unscopedPages.length / 2)].args },
+    { name: 'unscoped_final', args: unscopedPages.at(-1).args },
+    { name: 'unscoped_exhausted_continuation', args: unscopedExhausted },
   ]
 }
 async function writeCosts(store, fixture, rounds) {
@@ -301,6 +319,7 @@ function runtime(plugin, config) {
 export async function hookEvidence(count, rounds) {
   const guard = await import('../lib/plugins/guard.mjs'), context = await import('../lib/plugins/working-context.mjs')
   const results = []
+  for (const containerMode of ['mutable_outer', 'frozen_outer']) {
   for (const repeatedFailure of [false, true]) {
     const guardOptions = { stallAction: 'observe', stepDownRequests: 0 }
     const gh = runtime(guard, guardOptions), ch = runtime(context)
@@ -311,9 +330,11 @@ export async function hookEvidence(count, rounds) {
     const scenario = async (name, mutate) => {
       phase = 'hooks-' + name
       if (mutate) mutate()
+      if (containerMode === 'frozen_outer' && !Object.isFrozen(history)) Object.freeze(history)
       gh.agent.session.events = history; ch.agent.session.events = history
       const before = { guard: gp.processedEvents, flow: fp.processedEvents }
       const at = performance.now(), gd = await gh.pre(), cd = await ch.pre(), hook_ms = elapsed(at)
+      const after_hook_memory = memory()
       // Compare actual hooks with public full-replay rendering, outside timing.
       const expected = context.renderWorkingContext(history)
       const visible = context.contextHistory(ch.agent, history).text
@@ -328,14 +349,18 @@ export async function hookEvidence(count, rounds) {
       }
       const guardMessage = gd.messages.find(m => m.source?.kind === guard.name)
       if (guardMessage) assert.equal(guardMessage.source.signal, guard.foldGuardSignals(history).echo?.signal)
-      results.push({ scenario: name, repeated_failure_tail: repeatedFailure, events: history.length, hook_ms,
+      results.push({ scenario: name, container_mode: containerMode, repeated_failure_tail: repeatedFailure, events: history.length, hook_ms,
         guard_reducer_inputs: gp.processedEvents - before.guard, flow_reducer_inputs: fp.processedEvents - before.flow,
-        ...memory() })
+        ...after_hook_memory })
       return cd
     }
     await scenario('initial_replay')
     for (let i = 0; i < rounds; i++) await scenario('unchanged_reread')
-    await scenario('append', () => history.push(freeze({ seq: history.length, type: 'todo/write', data: { todos: [{ content: 'appended task', status: 'in_progress' }] } })))
+    await scenario('append', () => {
+      const event = freeze({ seq: history.length, type: 'todo/write', data: { todos: [{ content: 'appended task', status: 'in_progress' }] } })
+      if (containerMode === 'frozen_outer') history = [...history, event]
+      else history.push(event)
+    })
     await scenario('replacement', () => { history = [...history]; history[Math.floor(count / 2)] = freeze({ seq: Math.floor(count / 2), type: 'turn/start', data: {} }) })
     await scenario('reorder', () => { history = [...history]; [history[1], history[2]] = [history[2], history[1]] })
     await scenario('mutable_restore', () => { history = JSON.parse(JSON.stringify(history)) })
@@ -354,6 +379,7 @@ export async function hookEvidence(count, rounds) {
       ch.agent.session.surface.nodes = []
       await scenario('compaction_republish')
     }
+  }
   }
   return results
 }
@@ -384,7 +410,8 @@ async function main() {
   emit({ kind: 'nextgen_configuration', ...opts, node: process.version, timing_gate: false,
     cold_os_cache: 'not measured', workload: 'synthetic; no provider calls', variants: VARIANTS,
     counters: 'rows returned to JavaScript and separate projection reducer inputs; not SQLite visits',
-    event_timing: 'complete guard/context pre-step hooks; replay oracles and separate reducer counters outside timing' })
+    event_timing: 'complete guard/context pre-step hooks; replay oracles and separate reducer counters outside timing',
+    memory_scope: 'whole harness process sampled immediately after hooks; includes benchmark projections and retained oracles from previous samples' })
   try {
     const { TaskforceStore } = await import('../lib/store/index.js')
     for (const density of ['sparse', 'dense']) {

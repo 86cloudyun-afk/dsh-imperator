@@ -36,15 +36,15 @@ jobs:
         run: |
           set -euo pipefail
           evidence="$RUNNER_TEMP/taskforce-verification"
-          node tools/probe-nextgen.mjs --facts=10000 --events=10000 --rounds=3 | tee "$evidence/nextgen-current.jsonl"
-          node tools/soak-nextgen.mjs --facts=1000 --events=1000 --rounds=3 | tee "$evidence/nextgen-soak.jsonl"
+          node tools/probe-nextgen.mjs --facts=100000 --events=100000 --rounds=10 | tee "$evidence/nextgen-current.jsonl"
+          node tools/soak-nextgen.mjs --facts=10000 --events=10000 --rounds=5 | tee "$evidence/nextgen-soak.jsonl"
           git fetch --depth=1 origin 68b728ea2bc1958353d8a58bd77d47b0be7853d3
           baseline="$RUNNER_TEMP/nextgen-baseline"
           mkdir "$baseline"
           git archive 68b728ea2bc1958353d8a58bd77d47b0be7853d3 | tar -x -C "$baseline"
           cp tools/probe-nextgen.mjs "$baseline/tools/probe-nextgen.mjs"
           cd "$baseline"
-          node tools/probe-nextgen.mjs --facts=10000 --events=10000 --rounds=3 | tee "$evidence/nextgen-baseline.jsonl"
+          node tools/probe-nextgen.mjs --facts=100000 --events=100000 --rounds=10 | tee "$evidence/nextgen-baseline.jsonl"
       - name: Record board workload measurements
         shell: bash
         run: |

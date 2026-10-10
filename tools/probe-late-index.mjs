@@ -25,7 +25,10 @@ const emit = value => console.log(JSON.stringify(value))
 const nearestRank = (sorted, probability) => sorted[Math.ceil(sorted.length * probability) - 1]
 
 // Recognize only the four late-page statements, including optimized production SQL.
+// Historical variants intentionally remove the production selected-row hint.
+const unforced = sql => sql.replace(' FROM fact b INDEXED BY idx_fact_blocker_run_id JOIN', ' FROM fact b JOIN')
 function lateRole(sql) {
+  sql = unforced(sql)
   if (!(sql.includes(ANCHOR) || sql.includes(REWRITTEN)) || !sql.includes(" AND b.kind='blocker'")) return null
   if (sql.startsWith('SELECT COALESCE(MAX(b.id),0) AS n')) return 'ceiling'
   if (sql.startsWith('SELECT b.id AS id')) return 'members'
@@ -46,7 +49,7 @@ function withVariant(db, variant, work, capture = null) {
   const original = db.prepare, prepare = original.bind(db)
   db.prepare = sql => {
     const role = lateRole(sql)
-    const normalized = role === null ? sql : sql.replace(REWRITTEN, ANCHOR)
+    const normalized = role === null ? sql : unforced(sql).replace(REWRITTEN, ANCHOR)
     const actual = variant.rewrite && role !== null ? normalized.replace(ANCHOR, REWRITTEN) : normalized
     const statement = prepare(actual)
     if (capture !== null) {

@@ -35,7 +35,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 
 ### Task 2: Repair store reporting and submission chronology
 
-**Files:** `lib/store/index.js`, `lib/store/board-page.js`, `tools/tests/submit-audit-attribution.test.mjs`, `tools/tests/store-evidence.test.mjs`, `tools/tests/store-scope-integrity.test.mjs`, `tools/tests/board-pagination.test.mjs`, `tools/tests/submit-status-code.test.mjs`, `docs/STORE.md`
+**Files:** `lib/store/index.js`, `lib/store/board-page.js`, `tools/tests/submit-audit-attribution.test.mjs`, `tools/tests/store-evidence.test.mjs`, `tools/tests/store-scope-integrity.test.mjs`, `tools/tests/board-pagination.test.mjs`, `tools/tests/submit-status-code.test.mjs`, `tools/tests/owner-session.test.mjs`, `tools/tests/sqlite.test.mjs`, `tools/verify-store.mjs`, `docs/STORE.md`
 **Interfaces:** migrate/unassignedSummary/apply boot diagnostics; acceptTask.resolved_blockers; submitTask/closeTask submitted_at; statsAllRuns.blockers_late; scope_integrity_totals.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-2-brief.md
 
@@ -59,7 +59,7 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 
 ### Task 4: Repair execution root resolution and complete operation schema checks
 
-**Files:** `lib/store/execution.js`, `lib/operations/index.js`, `tools/tests/execution-receipts.test.mjs`, `tools/tests/operations.test.mjs`, `docs/OPERATIONS.md`, `docs/STORE.md`
+**Files:** `lib/store/execution.js`, `lib/operations/index.js`, `tools/tests/execution-receipts.test.mjs`, `tools/tests/operations.test.mjs`, `tools/tests/host-boundaries.test.mjs`, `docs/OPERATIONS.md`, `docs/STORE.md`
 **Interfaces:** strictExecutionEvidence physical versus textual paths; doctor/currentSchema/preflight all required core columns including task.submitted_at afterTask2.
 **Task brief:** docs/superpowers/plans/2026-10-10-imperator-audit/task-4-brief.md
 
@@ -113,3 +113,11 @@ Task2 also owns the existing submit-status-code fixture: preserve its no-write a
 Task2 additionally owns only the owner-session additive-migration expected-row hunk: explicitly assert submitted_at:null and preserve every old row value/identity assertion. No identity behavior or other owner-session tests may change.
 
 Task4 owns two native symlink receipt cases in host-boundaries, the actual anchor-enabled stage. Task4 may carry the exact Task2 candidate as a documented dependency before final core-column validation. Task5 covers Task6 E_CONTROL_JOURNAL_UNAVAILABLE as an ambiguous historical outcome; this does not prove the rejected current call executed.
+
+Task2 also owns only sqlite.test exact additive-migration diagnostic expectations and verify-store S04 exact column fixture. Add receipt/waiver zero counts and submitted_at while preserving every existing meaningful row/column/identity/rollback check. These grants followed genuine RED and the first implemented candidate's two obsolete fixture failures.
+
+## Actual PR review follow-up
+
+Initial six modules completed actual six-job GREEN and independent spec/quality review. PR60–66 were created and attached; none merged. Actual PR review then found four further defects requiring discriminating RED: old failed workflow whose active revision was cleared before upgrade; explicit-null recovery misclassified as detached; authoritative ctx.get missing service obscured by reflective Cordis miss; missing task-first index for recovery integrity counts. Tasks1/2/6 are reopened for these findings; original GREEN remains historical evidence only. Final integration, current PR checks, original-base independent review and a fresh extra premerge round remain pending.
+
+Task6 additionally owns only new real-Cordis control cases in host-boundaries.test.mjs; root integrates their hunk with Task4's two independently approved root-alias cases. Task6 tests its own baseline+hunk without copying Task4 production; aggregate verifies the union.

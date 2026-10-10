@@ -39,3 +39,9 @@ Implement independent fixes in isolated branches with explicit owned files. Inte
 ## Durable journal availability interface
 
 `E_CONTROL_JOURNAL_UNAVAILABLE` means the current control dispatch is refused before a native effect, while missing journal state cannot establish the result of earlier requests with the same key. Preserve the original retry key and advise reading its receipt after recovery; never suggest changing the key or repeating an effect. Guard treats this envelope conservatively as an unknown historical outcome, retaining definite-failure controls separately.
+
+## Journal continuity and actual-review follow-up
+
+Bind the original recovery service object per tools activation, including initial mount. Missing/replaced/closed/unreadable durability refuses controls before effects; returning the original object may replay. A replacement object needs controller verification of the original persistent database and a fresh activation; same-object reconnect remains supported. Same-object hostile database replacement is outside this contract. Truly absent recovery service without explicit request key retains detached legacy control; explicit null or malformed mounted service is not absence. A normal authoritative ctx.get undefined must not become failure merely because optional Cordis reflection throws on a missing service.
+
+Legacy failed workflow history may retain its plan/evidence generation while old revalidation cleared the active revision. The upgrade must require bounded root return for such a reachable active failure lineage, while preserving terminal historical outcomes and legitimate new root-approved revisions. Recovery integrity queries require bounded task-key access; pagination alone does not bound whole-run anomaly aggregates.

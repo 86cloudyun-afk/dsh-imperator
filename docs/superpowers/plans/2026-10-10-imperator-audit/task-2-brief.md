@@ -16,6 +16,8 @@ Package `@local/dsh-taskforce`, preset `taskforce`, display `任务部队`, data
 - tools/tests/board-pagination.test.mjs
 - tools/tests/submit-status-code.test.mjs
 - tools/tests/owner-session.test.mjs (only additive-migration expected-row fixture)
+- tools/tests/sqlite.test.mjs (only exact additive-migration diagnostic fixture)
+- tools/verify-store.mjs (only S04 exact additive task column fixture)
 - docs/STORE.md
 
 ## Interfaces
@@ -39,3 +41,7 @@ Preserve submit-status zero-write idempotence assertions; after genuine RED, upd
 5. Write the report at docs/superpowers/research/2026-10-10-imperator-audit/task-2-report.md. Return status/head/tree/owned-file blobs, one-line test evidence and concerns.
 
 Do not spawn subagents or reviewers. Parent assigns independent review, integrates shared hunks, creates PRs and merges. Do not touch other branches/main, weaken assertions, alter workflow gates, or print credentials. Without shell, use structured GitHub tree/commit/ref tools with expected_sha leases and real Actions. Report remote evidence honestly.
+
+## Recorded follow-up
+
+Preserve existing diagnostic zero counts and exact schema expectations while adding receipt/waiver and submitted_at. PR63's actual review found missing task-leading access for control_operation integrity queries. Test production SQL EXPLAIN QUERY PLAN and correct scoped counts with a substantial fixture before the minimal additive index correction; retain all original rows and columns.

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -279,7 +280,7 @@ function controlJournalFixture(t, { detached = false, unreadableStore = false, m
     tools: { register(definition) { definitions.set(definition.name, definition); return () => {} } },
   })
   return {
-    store, effects, events,
+    store, effects, events, agent, subagents,
     publish(value) { published = value },
     async call(action, request_key) {
       const args = { target_id: CHILD, ...(action === 'send' ? { message: 'PRIVATE_CONTROL_MESSAGE' } : {}),
@@ -453,5 +454,255 @@ for (const action of ['send', 'stop']) {
     assert.equal(result.operation.durability, 'unavailable')
     assert.equal(f.effects[action], 1)
     assert.equal(operationRows(f.store).length, 0)
+  })
+}
+
+function envelopeKey(f, mode) {
+  if (mode === 'no coordinates') f.events.length = 0
+  return mode === 'explicit key' ? 'envelope-original-key' : undefined
+}
+function envelopeInput(action, key) {
+  return { request_key: key, action, target_id: CHILD,
+    payload_hash: createHash('sha256').update(JSON.stringify([action, CHILD,
+      action === 'send' ? 'PRIVATE_CONTROL_MESSAGE' : null])).digest('hex') }
+}
+const ENVELOPE_AUTHORITY = { sessionId: RUN, runId: RUN, isRoot: true }
+const BEGIN_REPLY_FAULTS = [
+  ['undefined', () => undefined],
+  ['null', () => null],
+  ['promise', value => Promise.resolve(value)],
+  ['decorated promise', value => Object.assign(Promise.resolve(value), value)],
+  ['thenable', value => ({ ...value, then() { throw new Error('PRIVATE_METHOD_REPLY') } })],
+  ['empty', () => ({})],
+  ['missing operation id', value => ({ ...value, operation_id: undefined })],
+  ['empty operation id', value => ({ ...value, operation_id: '' })],
+  ['missing invoke', value => ({ ...value, invoke: undefined })],
+  ['null invoke', value => ({ ...value, invoke: null })],
+  ['string invoke', value => ({ ...value, invoke: 'true' })],
+  ['numeric invoke', value => ({ ...value, invoke: 1 })],
+  ['missing status', value => ({ ...value, status: undefined })],
+  ['not durable', value => ({ ...value, durable: false })],
+  ['new accepted', value => ({ ...value, status: 'accepted' })],
+  ['new replayed', value => ({ ...value, replayed: true })],
+  ['short replay', value => ({ ...value, invoke: false, replayed: true })],
+]
+const REPLAY_REPLY_FAULTS = [
+  ['wrong caller', value => ({ ...value, caller_session: 'PRIVATE_REPLAY_CALLER' })],
+  ['wrong action', value => ({ ...value, action: value.action === 'send' ? 'stop' : 'send' })],
+  ['wrong target', value => ({ ...value, target_id: 'PRIVATE_REPLAY_TARGET' })],
+  ['wrong run', value => ({ ...value, run_id: 'PRIVATE_REPLAY_RUN' })],
+  ['missing row id', value => ({ ...value, id: undefined })],
+  ['missing process', value => ({ ...value, process_instance: undefined })],
+]
+const FINISH_REPLY_FAULTS = [
+  ['undefined', () => undefined],
+  ['null', () => null],
+  ['promise', value => Promise.resolve(value)],
+  ['decorated promise', value => Object.assign(Promise.resolve(value), value)],
+  ['thenable', value => ({ ...value, then() { throw new Error('PRIVATE_METHOD_REPLY') } })],
+  ['empty', () => ({})],
+  ['short intent', value => ({ operation_id: value.operation_id, invoke: true, replayed: false, durable: true, status: 'pending' })],
+  ['wrong operation', value => ({ ...value, operation_id: 'PRIVATE_OTHER_OPERATION' })],
+  ['wrong status', value => ({ ...value, status: 'unknown' })],
+  ['wrong message', value => ({ ...value, message_id: 'PRIVATE_OTHER_MESSAGE' })],
+  ['not durable', value => ({ ...value, durable: false })],
+  ['missing row identity', value => ({ ...value, id: undefined })],
+  ['wrong caller', value => ({ ...value, caller_session: 'PRIVATE_FINISH_CALLER' })],
+  ['wrong target', value => ({ ...value, target_id: 'PRIVATE_FINISH_TARGET' })],
+]
+function assertUnknownEnvelope(result, key) {
+  assert.equal(result.ok, false, JSON.stringify(result))
+  assert.equal(result.code, 'E_CONTROL_OUTCOME_UNKNOWN', JSON.stringify(result))
+  assert.equal(result.operation.retry_key, key)
+  assert.equal(result.operation.status, 'pending')
+  assert.equal(result.operation.durable, true)
+  assert.equal(typeof result.operation.operation_id, 'string')
+  assert.match(result.hint, /不得换键|禁止.*新.*键/)
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_METHOD_REPLY|PRIVATE_OTHER_|PRIVATE_FINISH_/)
+  for (const field of ['sent', 'stopped', 'delivery', 'execution']) assert.equal(Object.hasOwn(result, field), false)
+}
+function unfinishedReply(f, input) {
+  return { ...f.store.recovery.inspect({}, RUN).operations.at(-1), status: input.status,
+    message_id: input.message_id ?? null, ended_at: new Date().toISOString(),
+    replayed: false, durable: true }
+}
+
+for (const action of ['send', 'stop']) {
+  for (const mode of ['explicit key', 'trusted coordinates', 'no coordinates']) {
+    for (const [fault, corrupt] of BEGIN_REPLY_FAULTS) {
+      test('invalid begin ' + fault + ' blocks ' + action + ' with ' + mode, async t => {
+        const f = controlJournalFixture(t), key = envelopeKey(f, mode), journal = f.store.recovery
+        const begin = journal.beginControl.bind(journal)
+        let actualKey
+        journal.beginControl = (input, authority) => {
+          actualKey = input.request_key
+          return corrupt(begin(input, authority))
+        }
+        const denied = await f.call(action, key)
+        assert.equal(f.effects[action], 0, 'malformed intent must never dispatch: ' + JSON.stringify(denied))
+        assertJournalUnavailable(denied)
+        assert.equal(denied.operation.retry_key, actualKey, 'even generated keys remain recoverable after a bad reply')
+        assert.equal(Object.hasOwn(denied.operation, 'durable'), false, 'invalid reply cannot assert durable intent')
+        assert.equal(Object.hasOwn(denied.operation, 'status'), false)
+        const before = operationRows(f.store)
+        assert.equal(before.length, 1)
+        assert.equal(before[0].status, 'pending')
+        journal.beginControl = begin
+        const replay = await f.call(action, denied.operation.retry_key)
+        assert.equal(replay.operation.replayed, true)
+        assert.equal(replay.operation.status, 'pending')
+        assert.equal(f.effects[action], 0)
+        assert.deepEqual(operationRows(f.store), before)
+      })
+    }
+
+    for (const [fault, corrupt] of FINISH_REPLY_FAULTS) {
+      test('invalid finish ' + fault + ' keeps ' + action + ' unknown with ' + mode, async t => {
+        const f = controlJournalFixture(t), key = envelopeKey(f, mode), journal = f.store.recovery
+        const finish = journal.finishControl.bind(journal)
+        journal.finishControl = input => corrupt(unfinishedReply(f, input))
+        const denied = await f.call(action, key)
+        const before = operationRows(f.store)
+        assert.equal(before.length, 1)
+        assert.equal(before[0].status, 'pending')
+        assert.equal(f.effects[action], 1)
+        assertUnknownEnvelope(denied, before[0].request_key)
+        journal.finishControl = finish
+        const replay = await f.call(action, denied.operation.retry_key)
+        assert.equal(replay.operation.replayed, true)
+        assert.equal(replay.operation.status, 'pending')
+        assert.equal(f.effects[action], 1)
+        assert.deepEqual(operationRows(f.store), before)
+      })
+    }
+
+    test('real short intent and accepted replay remain valid for ' + action + ' with ' + mode, async t => {
+      const f = controlJournalFixture(t), key = envelopeKey(f, mode)
+      const first = await f.call(action, key)
+      assert.equal(first.ok, true, JSON.stringify(first))
+      assert.equal(first.operation.durable, true)
+      assert.equal(first.operation.status, 'accepted')
+      const before = operationRows(f.store)
+      const replay = await f.call(action, first.operation.retry_key)
+      assert.equal(replay.ok, true, JSON.stringify(replay))
+      assert.equal(replay.operation.replayed, true)
+      assert.equal(replay.operation.invoke, false)
+      assert.equal(replay.operation.operation_id, first.operation.operation_id)
+      assert.equal(f.effects[action], 1)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+
+    test('real pending replay remains read-only for ' + action + ' with ' + mode, async t => {
+      const f = controlJournalFixture(t), key = envelopeKey(f, mode)
+      pendingControl(f)
+      const first = await f.call(action, key)
+      assert.equal(first.code, 'E_CONTROL_OUTCOME_UNKNOWN')
+      const before = operationRows(f.store)
+      const replay = await f.call(action, first.operation.retry_key)
+      assert.equal(replay.operation.status, 'pending')
+      assert.equal(replay.operation.replayed, true)
+      assert.equal(replay.operation.invoke, false)
+      assert.equal(f.effects[action], 1)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+  }
+
+  for (const [fault, corrupt] of REPLAY_REPLY_FAULTS) {
+    test('invalid replay ' + fault + ' is refused for ' + action, async t => {
+      const f = controlJournalFixture(t), journal = f.store.recovery, key = 'replay-original-key'
+      journal.beginControl(envelopeInput(action, key), ENVELOPE_AUTHORITY)
+      const before = operationRows(f.store), begin = journal.beginControl.bind(journal)
+      journal.beginControl = (input, authority) => corrupt(begin(input, authority))
+      const denied = await f.call(action, key)
+      assertJournalUnavailable(denied)
+      assert.equal(denied.operation.retry_key, key)
+      assert.doesNotMatch(JSON.stringify(denied), /PRIVATE_REPLAY_/)
+      assert.equal(f.effects[action], 0)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+  }
+
+  for (const status of ['pending', 'accepted', 'rejected', 'unknown']) {
+    test('real ' + status + ' full replay remains valid for ' + action, async t => {
+      const f = controlJournalFixture(t), journal = f.store.recovery, key = 'real-replay-' + status
+      const intent = journal.beginControl(envelopeInput(action, key), ENVELOPE_AUTHORITY)
+      assert.deepEqual(Object.keys(intent).sort(), ['durable', 'invoke', 'operation_id', 'replayed', 'status'])
+      if (status !== 'pending') {
+        journal.finishControl({ operation_id: intent.operation_id, status }, ENVELOPE_AUTHORITY)
+      }
+      const before = operationRows(f.store)
+      const replay = await f.call(action, key)
+      assert.equal(replay.ok, status === 'accepted', JSON.stringify(replay))
+      assert.equal(replay.operation.durable, true)
+      assert.equal(replay.operation.status, status)
+      assert.equal(replay.operation.replayed, true)
+      assert.equal(replay.operation.invoke, false)
+      assert.equal(replay.operation.caller_session, RUN)
+      assert.equal(replay.operation.action, action)
+      assert.equal(replay.operation.target_id, CHILD)
+      assert.equal(f.effects[action], 0)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+  }
+
+  for (const [fault, corrupt] of FINISH_REPLY_FAULTS.filter(([name]) => ['undefined', 'promise'].includes(name))) {
+    test('committed outcome with invalid finish ' + fault + ' retains ' + action + ' original key', async t => {
+      const f = controlJournalFixture(t), journal = f.store.recovery
+      const finish = journal.finishControl.bind(journal)
+      journal.finishControl = (input, authority) => corrupt(finish(input, authority))
+      const result = await f.call(action)
+      const before = operationRows(f.store)
+      assert.equal(before[0].status, 'accepted', 'journal can commit before its malformed reply')
+      assertUnknownEnvelope(result, before[0].request_key)
+      assert.equal(f.effects[action], 1)
+      journal.finishControl = finish
+      const replay = await f.call(action, result.operation.retry_key)
+      assert.equal(replay.ok, true, JSON.stringify(replay))
+      assert.equal(replay.operation.replayed, true)
+      assert.equal(replay.operation.status, 'accepted')
+      assert.equal(f.effects[action], 1)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+    test('host exception and invalid finish ' + fault + ' preserve ' + action + ' unknown intent', async t => {
+      const f = controlJournalFixture(t), journal = f.store.recovery
+      const effect = () => { f.effects[action]++; throw Object.assign(new Error('host ambiguous effect'), { code: 'E_STORE_BUSY' }) }
+      if (action === 'send') f.subagents.sendMessage = effect
+      else f.subagents.interrupt = effect
+      journal.finishControl = input => corrupt(unfinishedReply(f, input))
+      const result = await f.call(action)
+      const before = operationRows(f.store)
+      assertUnknownEnvelope(result, before[0].request_key)
+      assert.equal(f.effects[action], 1)
+      const replay = await f.call(action, result.operation.retry_key)
+      assert.equal(replay.operation.replayed, true)
+      assert.equal(replay.operation.status, 'pending')
+      assert.equal(f.effects[action], 1)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+  }
+
+  test('real immutable finish replay is valid for ' + action, async t => {
+    const f = controlJournalFixture(t), journal = f.store.recovery, finish = journal.finishControl.bind(journal)
+    journal.finishControl = (input, authority) => {
+      finish(input, authority)
+      return finish(input, authority)
+    }
+    const result = await f.call(action, 'finish-replay-key')
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.operation.durable, true)
+    assert.equal(result.operation.replayed, true)
+    assert.equal(f.effects[action], 1)
+  })
+
+  test('real unattributed direct-caller envelope remains valid for ' + action, async t => {
+    const f = controlJournalFixture(t)
+    Object.assign(f.agent.session.header, { origin: 'subagent', delegationDepth: 1, parentSession: 'missing-parent' })
+    const first = await f.call(action, 'unattributed-key')
+    assert.equal(first.ok, true, JSON.stringify(first))
+    assert.equal(first.operation.run_id, null)
+    const replay = await f.call(action, first.operation.retry_key)
+    assert.equal(replay.operation.replayed, true)
+    assert.equal(replay.operation.run_id, null)
+    assert.equal(f.effects[action], 1)
   })
 }

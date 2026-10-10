@@ -648,3 +648,11 @@ test('doctor allows unassigned controls and historical audit generation or owner
   assert.equal(result.ok, true)
   assert.equal(result.counts.scope_anomalies, 0)
 })
+
+test('doctor requires the eager task-first blocker index without repairing it', async t => {
+  const f = fixture(t); seed(f)
+  assert.deepEqual(f.store.handle.prepare("PRAGMA index_info('idx_fact_blocker_task_run_id')").all().map(row => row.name),
+    ['task_id', 'run_id', 'id'])
+  f.store.handle.exec('DROP INDEX idx_fact_blocker_task_run_id')
+  await unchangedDoctor(f, 'SCHEMA_UPGRADE_REQUIRED')
+})

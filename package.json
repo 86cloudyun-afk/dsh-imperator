@@ -20,7 +20,9 @@
     "./tools": "./lib/tools/index.js",
     "./package.json": "./package.json",
     "./workflow": "./lib/workflow/index.js",
-    "./operations": "./lib/operations/index.js"
+    "./operations": "./lib/operations/index.js",
+    "./recovery": "./lib/store/recovery.js",
+    "./scheduler": "./lib/scheduler/index.js"
   },
   "files": [
     "lib",

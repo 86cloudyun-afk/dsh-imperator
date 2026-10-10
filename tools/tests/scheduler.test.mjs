@@ -1,0 +1,385 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { fork } from 'node:child_process'
+import { once } from 'node:events'
+import { TaskforceStore } from '../../lib/store/index.js'
+import { TaskforceGovernor, createNativeGovernorAdapter } from '../../lib/governor/index.js'
+import { withWriteTransaction } from '../../lib/store/sqlite.js'
+import { tempStore } from './helpers.mjs'
+
+const module = await import('../../lib/scheduler/index.js').catch(e => { if (e.code === 'ERR_MODULE_NOT_FOUND') return {}; throw e })
+const host = await import('../../lib/scheduler/dsh-host.js').catch(e => { if (e.code === 'ERR_MODULE_NOT_FOUND') return {}; throw e })
+const lead = { role: 'lead', sessionId: ' root ' }
+const worker = { role: 'worker', sessionId: ' child ' }
+const run = ' run '
+const code = code => ({ code })
+function setup(t) {
+  assert.equal(typeof module.TaskforceScheduler, 'function', 'durable scheduler missing')
+  const store = tempStore(t)
+  return { store, scheduler: new module.TaskforceScheduler(store), governor: new TaskforceGovernor(store) }
+}
+function task(store, owner = worker.sessionId, scope = run) {
+  const id = store.openTask({ title: 'queued' }, scope).task_id
+  store.claimTask({ task_id: id, child_id: 'label' }, scope, { sessionId: owner, isRoot: false }, owner)
+  return id
+}
+function input(id, extra = {}) {
+  return { request_key: 'queue-' + id, task_id: id, generation: 0, mode: 'read', kind: 'reuse', resources: [], ...extra }
+}
+function admit(scheduler, key = 'admit') { return scheduler.admitNext({ request_key: key }, run, lead) }
+function ref(row, extra = {}) { return { request_id: row.request_id, generation: row.generation, ...extra } }
+
+test('queue replay, atomic admission, and dispatch-decision replay never consume the next request', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const a = s.enqueue(input(task(store)), run, worker)
+  assert.deepEqual(s.enqueue(input(a.task_id), run, worker), a)
+  s.enqueue(input(task(store)), run, lead)
+  assert.equal(g.snapshot(run).active_total, 0)
+  const first = admit(s)
+  assert.equal(first.status, 'admitted')
+  assert.equal(first.request.request_id, a.request_id)
+  assert.equal(first.replay, false)
+  const replay = admit(s)
+  assert.equal(replay.replay, true)
+  assert.equal(replay.request.request_id, a.request_id)
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests.filter(x => x.state === 'queued').length, 1)
+  assert.throws(() => s.enqueue(input(a.task_id, { mode: 'write' }), run, lead), code('E_SCHEDULER_CONFLICT'))
+})
+
+test('queue and governor changes roll back together on admission metadata failure', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, lead)
+  store.open().exec("CREATE TRIGGER reject_scheduler_decision BEFORE INSERT ON scheduler_decision BEGIN SELECT RAISE(ABORT, 'injected decision failure'); END")
+  assert.throws(() => admit(s), /injected decision failure/)
+  assert.equal(g.snapshot(run).active_total, 0)
+  assert.equal(g.snapshot(run).holds.length, 0)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'queued')
+  store.open().exec('DROP TRIGGER reject_scheduler_decision')
+  assert.equal(admit(s).status, 'admitted')
+})
+
+test('cross-run resource contention preserves FIFO and blocked decision replay', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const external = task(store, worker.sessionId, 'other')
+  const lock = g.reserve({ operation_key: 'lock', task_id: external, generation: 0, kind: 'reuse', mode: 'write', resources: ['repo'] }, 'other', lead)
+  s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, lead)
+  s.enqueue(input(task(store)), run, lead)
+  assert.equal(admit(s).code, 'E_RESOURCE_BUSY')
+  assert.equal(g.snapshot(run).active_total, 0)
+  g.settle({ reservation_id: lock.reservation_id, generation: lock.generation, proof: { kind: 'never_started' } }, 'other', lead)
+  assert.equal(admit(s).status, 'blocked')
+  assert.equal(admit(s, 'after-release').status, 'admitted')
+})
+
+test('unknown survives reopening and keeps shared locks without dispatch or automatic release', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, lead)
+  const row = admit(s).request
+  s.bind(ref(row, { session_id: worker.sessionId }), run, worker)
+  s.markUnknown(ref(row, { reason: 'DELIVERY_UNKNOWN' }), run, worker)
+  const root = store.root
+  store.close()
+  const reopened = new TaskforceStore(root)
+  t.after(() => reopened.close())
+  const r = new module.TaskforceScheduler(reopened)
+  assert.equal(r.state({}, run, lead).requests[0].state, 'unknown')
+  assert.throws(() => r.bind(ref(row, { session_id: worker.sessionId }), run, worker), code('E_GOVERNOR_CONFLICT'))
+  assert.throws(() => r.settle(ref(row, { proof: { kind: 'never_started' } }), run, lead), code('E_GOVERNOR_CONFLICT'))
+  assert.equal(new TaskforceGovernor(reopened).snapshot(run).holds.length, 1)
+  r.settle(ref(row, { proof: { kind: 'terminal', outcome: 'failed', quiescent: true, evidence: 'trusted-supervisor-record' } }), run, lead)
+  assert.equal(new TaskforceGovernor(reopened).snapshot(run).active_total, 0)
+  assert.equal(r.state({}, run, lead).requests[0].state, 'settled')
+})
+
+test('trusted scope, actor, bounded resources, and exact whitespace identities are enforced', t => {
+  const { store, scheduler: s } = setup(t)
+  const id = task(store)
+  assert.throws(() => s.enqueue(input(id), 'run', lead), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => s.enqueue(input(id), run, { ...worker, sessionId: 'child' }), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => s.enqueue(input(id, { run_id: 'forged' }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => s.enqueue(input(id, { resources: Array(65).fill('x') }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => s.admitNext({ request_key: 'x' }, run, worker), code('E_SCHEDULER_CONFLICT'))
+  const row = s.enqueue(input(id), run, worker)
+  assert.equal(row.run_id, run)
+  assert.equal(s.state({}, run, { role: 'worker', sessionId: 'stranger' }).requests.length, 0)
+})
+
+test('bounded keyset state filters workers and retains stable sequence identifiers', t => {
+  const { store, scheduler: s } = setup(t)
+  for (let i = 0; i < 28; i++) s.enqueue(input(task(store)), run, lead)
+  const page = s.state({}, run, lead)
+  assert.equal(page.requests.length, 25)
+  assert.equal(page.has_more, true)
+  const rest = s.state({ after: page.next_after }, run, lead)
+  assert.equal(rest.requests.length, 3)
+  assert.equal(rest.has_more, false)
+  assert.equal(rest.next_after, null)
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) < 65536)
+  assert.throws(() => s.state({ limit: 101 }, run, lead), code('E_SCHEDULER_CONFLICT'))
+})
+
+test('stale queue intents refuse without charging and subsequent queue work can progress', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  s.enqueue(input(id), run, lead)
+  const direct = g.reserve({ operation_key: 'direct', task_id: id, generation: 0, kind: 'reuse', mode: 'read', resources: [] }, run, lead)
+  g.settle({ reservation_id: direct.reservation_id, generation: direct.generation, proof: { kind: 'never_started' } }, run, lead)
+  s.enqueue(input(task(store)), run, lead)
+  assert.equal(admit(s).status, 'refused')
+  assert.equal(s.state({}, run, lead).requests[0].state, 'refused')
+  assert.equal(admit(s, 'next').status, 'admitted')
+  assert.equal(g.snapshot(run).created_total, 0)
+})
+
+test('outer rollback does not cache absent scheduler tables or split governor state', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  assert.throws(() => withWriteTransaction(store.open(), () => {
+    s.enqueue(input(id), run, lead)
+    admit(s)
+    throw new Error('outer rollback')
+  }), /outer rollback/)
+  assert.equal(s.state({}, run, lead).requests.length, 0)
+  assert.equal(g.snapshot(run).active_total, 0)
+  assert.equal(s.enqueue(input(id), run, lead).state, 'queued')
+})
+
+test('native diagnostics cannot enable official mode from versions flags or callbacks', () => {
+  assert.equal(typeof host.nativeSchedulerCapabilities, 'function', 'native diagnostics missing')
+  for (const version of ['0.2.0-rc.2', '0.2.1-alpha.2', '9.0.0']) {
+    const report = host.nativeSchedulerCapabilities({ version, verified: true, admission: () => true })
+    assert.equal(report.native_enabled, false)
+    assert.equal(report.capabilities.length, 6)
+    assert.ok(report.capabilities.every(c => c.enabled === false))
+    assert.throws(() => createNativeGovernorAdapter(report), code('E_SCHEDULER_CAPABILITY'))
+  }
+})
+
+test('strict checkpoint readback rejects listener-only success, mismatches, and closes raw reader', async () => {
+  assert.equal(typeof host.flushNativeCheckpoint, 'function', 'strict checkpoint helper missing')
+  const session = { snapshotEvents() { return this.events }, header: { id: 'actual' }, events: [{ seq: 0, type: 'test', data: { value: 1 } }] }
+  let closed = 0, durable = { header: session.header, events: session.events }
+  const backend = { async flush() {}, async open(id, mode) { assert.equal(id, 'actual'); assert.equal(mode, 'read'); return { id, access: mode, header: session.header, async read() { return durable }, async close() { closed++ } } } }
+  const sessions = { get: id => id === 'actual' ? session : undefined, async flush() { return true } }
+  const ctx = { get: name => ({ sessions, sessionPersistence: backend })[name] }
+  const args = { version: '0.2.0-rc.2', session, persistence: backend }
+  const result = await host.flushNativeCheckpoint(ctx, args)
+  assert.equal(result.session_id, 'actual')
+  assert.equal(result.last_seq, 0)
+  assert.match(result.digest, /^[a-f0-9]{64}$/)
+  assert.equal(closed, 1)
+  durable = { header: session.header, events: [] }
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), code('E_SCHEDULER_CAPABILITY'))
+  assert.equal(closed, 2)
+  sessions.flush = async () => false
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), code('E_SCHEDULER_CAPABILITY'))
+  sessions.flush = async () => true
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, { ...args, persistence: {} }), code('E_SCHEDULER_CAPABILITY'))
+})
+
+test('prepared identity uses the exact live ancestor chain and never creates or delivers an agent', () => {
+  assert.equal(typeof host.prepareNativeIdentity, 'function', 'prepared identity helper missing')
+  const root = { id: ' root ', session: { header: { id: ' root ', cwd: '/repo' } } }
+  const child = { id: ' child ', session: { header: { id: ' child ', parentSession: root.id, origin: 'subagent', delegationDepth: 1 } } }
+  const agents = { get: id => [root, child].find(a => a.id === id), create() { assert.fail('preparation must not create') } }
+  const ctx = { get: name => name === 'agents' ? agents : undefined }
+  const value = host.prepareNativeIdentity(ctx, { version: '0.2.0-rc.2', parentAgent: child, session_id: ' reserved ' })
+  assert.equal(value.root_run_id, root.id)
+  assert.equal(value.parent_session_id, child.id)
+  assert.equal(value.session_id, ' reserved ')
+  assert.equal(value.delegation_depth, 2)
+  assert.throws(() => host.prepareNativeIdentity(ctx, { version: '0.2.0-rc.2', parentAgent: { ...child }, session_id: 'x' }), code('E_SCHEDULER_CAPABILITY'))
+  child.session.header.parentSession = 'missing'
+  assert.throws(() => host.prepareNativeIdentity(ctx, { version: '0.2.0-rc.2', parentAgent: child, session_id: 'x' }), code('E_SCHEDULER_CAPABILITY'))
+})
+
+test('binding a lead-queued unbound task captures its actual worker for scoped state and replay', t => {
+  const { store, scheduler: s } = setup(t)
+  const id = store.openTask({ title: 'unbound' }, run).task_id
+  s.enqueue(input(id), run, lead)
+  const row = admit(s).request
+  store.claimTask({ task_id: id, child_id: 'display' }, run, { sessionId: worker.sessionId, isRoot: false }, worker.sessionId)
+  s.bind(ref(row, { session_id: worker.sessionId }), run, lead)
+  assert.equal(s.state({}, run, worker).requests.length, 1)
+  assert.equal(s.enqueue(input(id), run, worker).state, 'running')
+})
+
+test('closed stores stay closed and transition failure retains the queue reservation', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  s.enqueue(input(task(store)), run, lead)
+  const row = admit(s).request
+  assert.throws(() => s.bind(ref(row, { session_id: 'impostor' }), run, lead), code('E_GOVERNOR_CONFLICT'))
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'reserved')
+  store.close()
+  assert.throws(() => s.state({}, run, lead), /closed|关闭|卸载/)
+})
+
+test('stale task rework and changed queue owner refuse before governor budget debit', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  s.enqueue(input(id), run, lead)
+  store.open().prepare('UPDATE task SET evidence_generation = evidence_generation + 1 WHERE id = ?').run(id)
+  assert.equal(admit(s).code, 'E_SCHEDULER_STALE')
+  assert.equal(g.snapshot(run).active_total, 0)
+  const id2 = task(store)
+  s.enqueue(input(id2), run, lead)
+  store.open().prepare('UPDATE task SET owner_session = ? WHERE id = ?').run('replacement', id2)
+  assert.equal(admit(s, 'owner').status, 'refused')
+  assert.equal(g.snapshot(run).active_total, 0)
+})
+
+test('checkpoint failures never promote to quiescence and preserve close errors', async () => {
+  assert.equal(typeof host.flushNativeCheckpoint, 'function')
+  const session = { snapshotEvents() { return this.events }, header: { id: 's' }, events: [] }
+  let opened = 0, flushFailure
+  const closeFailure = new Error('reader close failure')
+  const backend = { async flush() { if (flushFailure) throw flushFailure }, async open() {
+    opened++
+    return { id: 's', access: 'read', header: session.header, async read() { return [] }, async close() { throw closeFailure } }
+  } }
+  const sessions = { get: () => session, async flush() { return true } }
+  const ctx = { get: n => ({ sessions, sessionPersistence: backend })[n] }
+  const args = { version: '0.2.1-alpha.2', session, persistence: backend }
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), closeFailure)
+  flushFailure = new Error('durability failure')
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), flushFailure)
+  assert.equal(opened, 1)
+})
+
+test('two processes cannot admit the same request twice or replay into the next queue row', async t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  s.enqueue(input(task(store)), run, lead)
+  s.enqueue(input(task(store)), run, lead)
+  const children = [0, 1].map(() => fork(new URL('./fixtures/scheduler-worker.mjs', import.meta.url), [store.root, run, 'same-decision'], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] }))
+  t.after(() => { for (const child of children) if (child.exitCode === null) child.kill() })
+  await Promise.all(children.map(child => once(child, 'message')))
+  const replies = children.map(child => once(child, 'message'))
+  const exits = children.map(child => once(child, 'exit'))
+  for (const child of children) child.send('go')
+  const results = (await Promise.all(replies)).map(([reply]) => { assert.equal(reply.error, undefined); return reply.result })
+  await Promise.all(exits)
+  assert.equal(results[0].request.request_id, results[1].request.request_id)
+  assert.equal(results.filter(x => x.replay).length, 1)
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests.filter(x => x.state === 'queued').length, 1)
+})
+
+test('state byte budget includes JSON escaping of the exact trusted run identity', t => {
+  const { store, scheduler: s } = setup(t)
+  const escapedRun = String.fromCharCode(1).repeat(194) + 'x'
+  for (let i = 0; i < 100; i++) s.enqueue(input(task(store, worker.sessionId, escapedRun)), escapedRun, lead)
+  const page = s.state({ limit: 100 }, escapedRun, lead)
+  assert.ok(page.requests.length > 0)
+  assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 65536)
+  assert.equal(page.has_more, true)
+})
+
+test('scheduler bind enforces its session identity bound before changing governor state', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const oversized = 's'.repeat(513)
+  s.enqueue(input(task(store, oversized)), run, lead)
+  const row = admit(s).request
+  assert.throws(() => s.bind(ref(row, { session_id: oversized }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'reserved')
+})
+
+test('oversized external governor state fails explicitly without an empty-page cursor crash', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const oversized = 's'.repeat(70000)
+  s.enqueue(input(task(store, oversized)), run, lead)
+  const row = admit(s).request
+  g.bind({ reservation_id: row.reservation_id, generation: row.generation, session_id: oversized }, run, lead)
+  assert.throws(() => s.state({}, run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(g.snapshot(run).active_total, 1)
+})
+
+test('lead bind refuses a replaced captured owner after public rejected-task reassignment', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  const root = { sessionId: lead.sessionId, isRoot: true }
+  const original = { sessionId: worker.sessionId, isRoot: false }
+  const replacement = { role: 'worker', sessionId: 'replacement-owner' }
+  store.submitTask({ task_id: id }, run, original)
+  store.rejectTask({ task_id: id, reason: 'rework before scheduling' }, run, root)
+  s.enqueue(input(id, { mode: 'write', resources: ['repo'] }), run, lead)
+  const row = admit(s).request
+  assert.ok(row)
+  store.claimTask({ task_id: id, child_id: 'replacement' }, run, root, replacement.sessionId)
+  assert.throws(() => s.bind(ref(row, { session_id: replacement.sessionId }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  const current = s.state({}, run, lead).requests[0]
+  assert.equal(current.state, 'reserved')
+  assert.equal(current.session_id, null)
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(g.snapshot(run).holds.length, 1)
+  assert.throws(() => s.bind(ref(row, { session_id: replacement.sessionId }), run, replacement), code('E_SCHEDULER_CONFLICT'))
+  s.settle(ref(row, { proof: { kind: 'never_started' } }), run, lead)
+  assert.equal(g.snapshot(run).active_total, 0)
+})
+
+for (const boundary of ['open', 'read', 'close']) {
+  for (const change of ['dispose', 'replace-session', 'replace-sessions-service', 'replace-backend']) {
+    test('checkpoint rejects ' + change + ' during awaited reader ' + boundary, async () => {
+      const session = { header: { id: 's' }, snapshotEvents: () => [] }
+      let live = session, closed = 0
+      const sessions = { get: () => live, async flush() { return true } }
+      let currentSessions = sessions, currentBackend
+      function mutate() {
+        if (change === 'dispose') live = undefined
+        if (change === 'replace-session') live = { ...session }
+        if (change === 'replace-sessions-service') currentSessions = { get: () => session, async flush() { return true } }
+        if (change === 'replace-backend') currentBackend = { ...backend }
+      }
+      const backend = { async flush() {}, async open() {
+        if (boundary === 'open') mutate()
+        return { id: 's', access: 'read', header: session.header,
+          async read() { if (boundary === 'read') mutate(); return [] },
+          async close() { closed++; if (boundary === 'close') mutate() } }
+      } }
+      currentBackend = backend
+      const ctx = { get: name => name === 'sessions' ? currentSessions : currentBackend }
+      await assert.rejects(() => host.flushNativeCheckpoint(ctx, {
+        version: '0.2.1-alpha.2', session, persistence: backend,
+      }), code('E_SCHEDULER_CAPABILITY'))
+      assert.equal(closed, 1)
+    })
+  }
+}
+
+test('reader close rejection remains the outcome even when cleanup replaces native services', async () => {
+  const session = { header: { id: 's' }, snapshotEvents: () => [] }
+  const closeFailure = new Error('strict reader cleanup failed')
+  const sessions = { get: () => session, async flush() { return true } }
+  let currentSessions = sessions, currentBackend
+  const backend = { async flush() {}, async open() {
+    return { id: 's', access: 'read', header: session.header, async read() { return [] }, async close() {
+      currentSessions = { get: () => undefined }
+      currentBackend = {}
+      throw closeFailure
+    } }
+  } }
+  currentBackend = backend
+  const ctx = { get: name => name === 'sessions' ? currentSessions : currentBackend }
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, {
+    version: '0.2.0-rc.2', session, persistence: backend,
+  }), error => error === closeFailure)
+})
+
+test('checkpoint compares underlying Cordis service identities across fresh contextual proxies', async () => {
+  const original = Symbol.for('cordis.original')
+  const session = { header: { id: 's' }, snapshotEvents: () => [] }
+  const sessions = { get: () => session, async flush() { return true } }
+  let target = sessions, replace = false
+  const backend = { async flush() {}, async open() {
+    return { id: 's', access: 'read', header: session.header, async read() { return [] },
+      async close() { if (replace) target = { ...sessions } } }
+  } }
+  const ctx = { get: name => name === 'sessions'
+    ? new Proxy(target, { get: (object, key) => key === original ? object : object[key] }) : backend }
+  const args = { version: '0.2.0-rc.2', session, persistence: backend }
+  assert.equal((await host.flushNativeCheckpoint(ctx, args)).native_enabled, false)
+  replace = true
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), code('E_SCHEDULER_CAPABILITY'))
+})

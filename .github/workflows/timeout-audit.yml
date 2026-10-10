@@ -1,4 +1,4 @@
-name: Timeout diagnostic (not acceptance)
+name: Cleanup failure diagnostic (not acceptance)
 on:
   push:
     branches: ['codex/nextgen-ci-timeout-audit']
@@ -26,19 +26,19 @@ jobs:
           npm pack --offline --ignore-scripts --json --pack-destination "$RUNNER_TEMP/timeout-audit/packed" > "$RUNNER_TEMP/timeout-audit/pack.json"
           archive=$(node -e 'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8"))[0].filename)' "$RUNNER_TEMP/timeout-audit/pack.json")
           tar -xzf "$RUNNER_TEMP/timeout-audit/packed/$archive" -C "$RUNNER_TEMP/timeout-audit/unpacked"
-      - name: Preserve original sixty-second acceptance
+      - name: Original cleanup acceptance test unchanged
         continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/timeout-audit/unpacked/package"
-          npm run test:all -- --install-anchor "$RUNNER_TEMP/dsh-host/lib/node_modules/@deepseek-ai/dsh/package.json" > "$RUNNER_TEMP/timeout-audit/acceptance.log" 2>&1
-      - name: Three bounded diagnostic repetitions with process metadata
+          DSH_INSTALL_ANCHOR="$RUNNER_TEMP/dsh-host/lib/node_modules/@deepseek-ai/dsh/package.json" node --test tools/tests/host-runtime.test.mjs > "$RUNNER_TEMP/timeout-audit/cleanup-original.log" 2>&1
+      - name: Bounded cleanup observations and intentional signal probes
         shell: bash
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/timeout-audit/unpacked/package"
-          node tools/diagnostics/timeout-audit.mjs "$RUNNER_TEMP/timeout-audit/diagnostic"
+          DSH_INSTALL_ANCHOR="$RUNNER_TEMP/dsh-host/lib/node_modules/@deepseek-ai/dsh/package.json" timeout --kill-after=5s 120s node tools/diagnostics/cleanup-audit.mjs "$RUNNER_TEMP/timeout-audit/cleanup"
       - name: Preserve diagnostic evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f

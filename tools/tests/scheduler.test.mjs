@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { fork } from 'node:child_process'
+import { once } from 'node:events'
 import { TaskforceStore } from '../../lib/store/index.js'
 import { TaskforceGovernor, createNativeGovernorAdapter } from '../../lib/governor/index.js'
 import { withWriteTransaction } from '../../lib/store/sqlite.js'
@@ -156,7 +158,7 @@ test('native diagnostics cannot enable official mode from versions flags or call
 
 test('strict checkpoint readback rejects listener-only success, mismatches, and closes raw reader', async () => {
   assert.equal(typeof host.flushNativeCheckpoint, 'function', 'strict checkpoint helper missing')
-  const session = { header: { id: 'actual' }, events: [{ seq: 0, type: 'test', data: { value: 1 } }] }
+  const session = { snapshotEvents() { return this.events }, header: { id: 'actual' }, events: [{ seq: 0, type: 'test', data: { value: 1 } }] }
   let closed = 0, durable = { header: session.header, events: session.events }
   const backend = { async flush() {}, async open(id, mode) { assert.equal(id, 'actual'); assert.equal(mode, 'read'); return { id, access: mode, header: session.header, async read() { return durable }, async close() { closed++ } } } }
   const sessions = { get: id => id === 'actual' ? session : undefined, async flush() { return true } }
@@ -230,7 +232,7 @@ test('stale task rework and changed queue owner refuse before governor budget de
 
 test('checkpoint failures never promote to quiescence and preserve close errors', async () => {
   assert.equal(typeof host.flushNativeCheckpoint, 'function')
-  const session = { header: { id: 's' }, events: [] }
+  const session = { snapshotEvents() { return this.events }, header: { id: 's' }, events: [] }
   let opened = 0, flushFailure
   const closeFailure = new Error('reader close failure')
   const backend = { async flush() { if (flushFailure) throw flushFailure }, async open() {
@@ -244,4 +246,22 @@ test('checkpoint failures never promote to quiescence and preserve close errors'
   flushFailure = new Error('durability failure')
   await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), flushFailure)
   assert.equal(opened, 1)
+})
+
+test('two processes cannot admit the same request twice or replay into the next queue row', async t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  s.enqueue(input(task(store)), run, lead)
+  s.enqueue(input(task(store)), run, lead)
+  const children = [0, 1].map(() => fork(new URL('./fixtures/scheduler-worker.mjs', import.meta.url), [store.root, run, 'same-decision'], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] }))
+  t.after(() => { for (const child of children) if (child.exitCode === null) child.kill() })
+  await Promise.all(children.map(child => once(child, 'message')))
+  const replies = children.map(child => once(child, 'message'))
+  const exits = children.map(child => once(child, 'exit'))
+  for (const child of children) child.send('go')
+  const results = (await Promise.all(replies)).map(([reply]) => { assert.equal(reply.error, undefined); return reply.result })
+  await Promise.all(exits)
+  assert.equal(results[0].request.request_id, results[1].request.request_id)
+  assert.equal(results.filter(x => x.replay).length, 1)
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests.filter(x => x.state === 'queued').length, 1)
 })

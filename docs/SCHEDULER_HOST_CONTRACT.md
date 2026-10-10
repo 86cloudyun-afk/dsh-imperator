@@ -21,6 +21,17 @@ GitHub source observations are not installed npm-package or deployment proof.
 | H05 | JSONL holds a kernel lock for one session writer. | Scheduler-domain process-held ownership and old execution reconciliation after host death, without TTL takeover. |
 | H06 | Host can generate canonical path/Git resource keys and independent clones. | Enforced filesystem/process isolation over every native/PTC/tool route; aliases and shared Git metadata remain deployment concerns. |
 
+The H03 helper additionally pins Cordis's internal service tracing identity.
+`ctx.get` creates contextual proxies; wrapper equality is not service identity.
+Both reviewed releases expose the exact underlying target under
+`Symbol.for('cordis.original')`. Installed-host tests verify this contract and
+record the Cordis package version and entry hash. A different target refuses;
+this internal dependency does not enable native scheduling.
+
+- [alpha.2 traced lookup, lines 233–234](https://github.com/deepseek-ai/deepseek-harness/blob/d743267388641bc76f17c45ce8b4c231aed1d32c/vendor/cordis/src/reflect.ts#L233).
+- [alpha.2 original-target symbol and proxy, lines 54 and 173–175](https://github.com/deepseek-ai/deepseek-harness/blob/d743267388641bc76f17c45ce8b4c231aed1d32c/vendor/cordis/src/utils.ts#L173).
+- [rc.2 release original-target proxy, lines 173–175](https://github.com/deepseek-ai/deepseek-harness/blob/639ed015397290b3745d163aafe02ffee4aa3f84/vendor/cordis/src/utils.ts#L173).
+
 Exact alpha.2 source anchors:
 
 - [agent creation contract, lines 100–118 and 171–190](https://github.com/deepseek-ai/deepseek-harness/blob/d743267388641bc76f17c45ce8b4c231aed1d32c/packages/core/agent/src/index.ts#L100).

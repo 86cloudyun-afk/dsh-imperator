@@ -81,7 +81,11 @@ live session and expected backend. It captures `snapshotEvents()`, requires
 `sessions.flush(session) === true`, awaits the backend durability barrier,
 opens the same backend in read mode, compares raw header and contiguous prefix,
 and always closes the reader. After cleanup it rechecks the current session
-service, exact live session and backend identity. A reader-close failure remains
+service's underlying identity, exact live session and backend identity. Pinned
+Cordis returns a fresh contextual wrapper on each lookup; the helper compares
+its exact `Symbol.for('cordis.original')` target. This is a tested internal
+contract of the two pinned versions, not a promised public upstream API.
+A reader-close failure remains
 the reported failure. Backend replacement, changed live identity,
 missing/incorrect prefix or any flush/read/close failure rejects. The complete
 captured prefix is limited to 10000 events and 1 MiB. The returned count,

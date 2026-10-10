@@ -35,7 +35,9 @@ new milestone, task label, or arbitrary child root.
   `markUnknown({request_id,generation,reason},runId,authority)`, and
   `settle({request_id,generation,proof},runId,authority)` delegate to the
   governor inside the same transaction. Real ownership, retry accounting,
-  generation checks and settlement requirements remain authoritative.
+  generation checks and settlement requirements remain authoritative. Binding
+  refuses a changed non-null captured queue owner, including lead-driven
+  reassignment; the original reservation and resource holds remain intact.
 - `state({after?,limit?},runId,authority)` returns ordered requests with
   `has_more` and `next_after`. Default 25, maximum 100; follow the returned
   sequence cursor. Worker views require both current and captured owner.
@@ -78,7 +80,9 @@ does not prove exclusive input admission or exactly-once delivery.
 live session and expected backend. It captures `snapshotEvents()`, requires
 `sessions.flush(session) === true`, awaits the backend durability barrier,
 opens the same backend in read mode, compares raw header and contiguous prefix,
-and always closes the reader. Backend replacement, changed live identity,
+and always closes the reader. After cleanup it rechecks the current session
+service, exact live session and backend identity. A reader-close failure remains
+the reported failure. Backend replacement, changed live identity,
 missing/incorrect prefix or any flush/read/close failure rejects. The complete
 captured prefix is limited to 10000 events and 1 MiB. The returned count,
 last sequence and SHA256 contain no log text. They explicitly mark

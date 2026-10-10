@@ -102,7 +102,7 @@ test('operation key is durable idempotent with canonical resource set and reject
   assert.equal(g2.snapshot('run').audit.filter(a => a.action === 'reserve').length, 1)
 })
 
-test('generation fences reserve and all transitions, including stale prior settled generation', t => {
+test('generation fences admission and mutations while settled replay remains row-bound', t => {
   const { store, governor: g } = setup(t)
   const id = task(store)
   const r = g.reserve(input(id), 'run', worker)
@@ -113,7 +113,9 @@ test('generation fences reserve and all transitions, including stale prior settl
   assert.throws(() => g.reserve(input(id, 'second'), 'run', lead), code('E_GOVERNOR_FENCE'))
   const next = g.reserve(input(id, 'second', { generation: 1 }), 'run', lead)
   assert.equal(next.generation, 2)
-  assert.throws(() => never(g, r), code('E_GOVERNOR_FENCE'))
+  const before = JSON.stringify(g.snapshot('run'))
+  assert.equal(never(g, r).state, 'settled')
+  assert.equal(JSON.stringify(g.snapshot('run')), before)
 })
 
 test('cancel and idle cannot release; running settlement needs terminal plus trusted quiescence', t => {

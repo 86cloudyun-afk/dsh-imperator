@@ -136,3 +136,33 @@ test('certified frozen data containers reuse their descriptors while still compa
   assert.equal(descriptors, 0, 'certified frozen slots cannot acquire accessors')
   assert.equal(slots, source.length, 'the entire prefix must still be compared')
 })
+
+test('outer slot validation never invokes getters and rejects inherited or setter-only slots', () => {
+  const event = freeze(call('a'))
+  let reads = 0
+  const accessor = []
+  Object.defineProperty(accessor, '0', { get() { reads++; return event }, configurable: true })
+  const inherited = new Array(1)
+  Object.setPrototypeOf(inherited, Object.assign(Object.create(Array.prototype), { 0: event }))
+  const setterOnly = []
+  Object.defineProperty(setterOnly, '0', { set() {}, configurable: true })
+  for (const events of [accessor, inherited, setterOnly]) {
+    const cursor = createEventCursor()
+    assert.equal(cursor.read(events).reset, true)
+    assert.equal(cursor.read(events).reset, true)
+  }
+  assert.equal(reads, 0)
+})
+
+test('mutable proxies are validated from own data descriptors without invoking their indexed get trap', () => {
+  let reads = 0
+  const event = freeze(call('a'))
+  const events = new Proxy([event], { get(target, key, receiver) {
+    if (key === '0') reads++
+    return Reflect.get(target, key, receiver)
+  } })
+  const cursor = createEventCursor()
+  assert.equal(cursor.read(events).reset, true)
+  assert.deepEqual(cursor.read(events), { reset: false, events: [] })
+  assert.equal(reads, 0)
+})

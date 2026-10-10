@@ -1,0 +1,49 @@
+name: Timeout diagnostic (not acceptance)
+on:
+  push:
+    branches: ['codex/nextgen-ci-timeout-audit']
+permissions:
+  contents: read
+jobs:
+  native22-rc2-diagnostic:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: '22.23.2'
+      - name: Install exact host
+        run: npm install --global --prefix "$RUNNER_TEMP/dsh-host" --no-audit --no-fund "@deepseek-ai/dsh@0.2.0-rc.2"
+      - name: Pack and extract diagnostic deliverable
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/timeout-audit/packed" "$RUNNER_TEMP/timeout-audit/unpacked"
+          git rev-parse HEAD > "$RUNNER_TEMP/timeout-audit/commit.txt"
+          npm pack --offline --ignore-scripts --json --pack-destination "$RUNNER_TEMP/timeout-audit/packed" > "$RUNNER_TEMP/timeout-audit/pack.json"
+          archive=$(node -e 'const fs=require("node:fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8"))[0].filename)' "$RUNNER_TEMP/timeout-audit/pack.json")
+          tar -xzf "$RUNNER_TEMP/timeout-audit/packed/$archive" -C "$RUNNER_TEMP/timeout-audit/unpacked"
+      - name: Preserve original sixty-second acceptance
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/timeout-audit/unpacked/package"
+          npm run test:all -- --install-anchor "$RUNNER_TEMP/dsh-host/lib/node_modules/@deepseek-ai/dsh/package.json" > "$RUNNER_TEMP/timeout-audit/acceptance.log" 2>&1
+      - name: Three bounded diagnostic repetitions with process metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/timeout-audit/unpacked/package"
+          node tools/diagnostics/timeout-audit.mjs "$RUNNER_TEMP/timeout-audit/diagnostic"
+      - name: Preserve diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: timeout-audit-${{ github.run_id }}
+          path: ${{ runner.temp }}/timeout-audit/
+          retention-days: 7
+          if-no-files-found: error

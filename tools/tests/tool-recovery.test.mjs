@@ -252,6 +252,7 @@ function controlJournalFixture(t, { detached = false, unreadableStore = false, m
   initialPublication, reflectedStore = false } = {}) {
   const store = tempStore(t)
   let published = detached ? undefined : malformedJournal ? { recovery: {} } : store
+  let primaryFailure = unreadableStore
   if (initialPublication === 'null-store') published = null
   if (initialPublication === 'null-journal') published = { recovery: null }
   if (initialPublication === 'undefined-journal') published = { recovery: undefined }
@@ -272,7 +273,7 @@ function controlJournalFixture(t, { detached = false, unreadableStore = false, m
     taskforceStore: reflectedStore ? store : undefined,
     get(name) {
       if (name === 'taskforceStore') {
-        if (unreadableStore) throw new Error('PRIVATE_SERVICE_FAILURE')
+        if (primaryFailure) throw new Error('PRIVATE_SERVICE_FAILURE')
         return published
       }
       if (name === 'subagents') return subagents
@@ -283,6 +284,7 @@ function controlJournalFixture(t, { detached = false, unreadableStore = false, m
   return {
     store, effects, events, agent, subagents,
     publish(value) { published = value },
+    failPrimary(value = true) { primaryFailure = value },
     async call(action, request_key) {
       const args = { target_id: CHILD, ...(action === 'send' ? { message: 'PRIVATE_CONTROL_MESSAGE' } : {}),
         ...(request_key === undefined ? {} : { request_key }) }
@@ -747,5 +749,136 @@ for (const action of ['send', 'stop']) {
         assert.doesNotMatch(child.stdout + child.stderr, /PRIVATE_ASYNC_REPLY/)
       })
     }
+  }
+}
+
+const EARLY_KEY_JOURNAL_FAULTS = [
+  ['primary lookup throws', f => f.failPrimary()],
+  ['missing publication', f => f.publish(undefined)],
+  ['null publication', f => f.publish(null)],
+  ['null journal', f => f.publish({ recovery: null })],
+  ['unreadable journal', f => f.publish({ get recovery() { throw new Error('PRIVATE_EARLY_JOURNAL_FAILURE') } })],
+  ['replaced SQLite journal', (f, t) => {
+    const replacement = tempStore(t)
+    f.publish(replacement)
+    return replacement
+  }],
+]
+for (const action of ['send', 'stop']) {
+  for (const mode of ['explicit key', 'trusted coordinates']) {
+    for (const [fault, degrade] of EARLY_KEY_JOURNAL_FAULTS) {
+      test('early unavailable preserves original ' + mode + ' for ' + action + ': ' + fault, async t => {
+        const f = controlJournalFixture(t)
+        pendingControl(f)
+        const supplied = mode === 'explicit key' ? '  early-original-' + action + '  ' : undefined
+        const first = await f.call(action, supplied), key = first.operation.retry_key
+        assert.equal(first.code, 'E_CONTROL_OUTCOME_UNKNOWN', JSON.stringify(first))
+        assert.equal(first.operation.status, 'pending')
+        assert.equal(f.effects[action], 1)
+        const before = operationRows(f.store)
+        const replacement = degrade(f, t)
+        const denied = await f.call(action, supplied)
+        assertJournalUnavailable(denied)
+        assert.equal(f.effects[action], 1, 'unavailable response must have zero second host effects')
+        assert.equal(denied.operation?.retry_key, key, 'latest structured response must retain the exact original lookup key')
+        assert.equal(denied.operation.durable, undefined)
+        assert.equal(denied.operation.status, undefined)
+        assert.doesNotMatch(JSON.stringify(denied), /PRIVATE_EARLY_JOURNAL_FAILURE/)
+        assert.deepEqual(operationRows(f.store), before)
+        if (replacement) assert.equal(operationRows(replacement).length, 0)
+        f.failPrimary(false)
+        f.publish(f.store)
+        const replay = await f.call(action, key)
+        assert.equal(replay.code, 'E_CONTROL_OUTCOME_UNKNOWN', JSON.stringify(replay))
+        assert.equal(replay.operation.retry_key, key)
+        assert.equal(replay.operation.status, 'pending')
+        assert.equal(replay.operation.replayed, true)
+        assert.equal(f.effects[action], 1)
+        assert.deepEqual(operationRows(f.store), before)
+      })
+    }
+    test('closed mounted journal retains original ' + mode + ' for ' + action, async t => {
+      const f = controlJournalFixture(t)
+      pendingControl(f)
+      const supplied = mode === 'explicit key' ? 'closed-key-' + action : undefined
+      const first = await f.call(action, supplied), before = operationRows(f.store)
+      f.store.close()
+      const denied = await f.call(action, supplied)
+      assertJournalUnavailable(denied)
+      assert.equal(denied.operation.retry_key, first.operation.retry_key)
+      assert.equal(f.effects[action], 1)
+      assert.equal(JSON.stringify(denied).includes(f.store.root), false)
+      // close() permanently unloads this owner; independently inspect the original
+      // SQLite file without forging a revival or publishing a replacement journal.
+      const reader = new f.store.constructor(f.store.root)
+      try { assert.deepEqual(operationRows(reader), before) } finally { reader.close() }
+    })
+    test('same journal reconnect retains pending ' + mode + ' for ' + action, async t => {
+      const f = controlJournalFixture(t)
+      pendingControl(f)
+      const supplied = mode === 'explicit key' ? 'reconnect-key-' + action : undefined
+      const first = await f.call(action, supplied), before = operationRows(f.store)
+      f.store.handle.close()
+      const replay = await f.call(action, supplied)
+      assert.equal(replay.operation.retry_key, first.operation.retry_key)
+      assert.equal(replay.operation.replayed, true)
+      assert.equal(replay.operation.status, 'pending')
+      assert.equal(f.effects[action], 1)
+      assert.deepEqual(operationRows(f.store), before)
+    })
+  }
+  test('initial detached explicit original key survives unavailable ' + action, async t => {
+    const f = controlJournalFixture(t, { detached: true })
+    const key = 'initial-original-' + action
+    const denied = await f.call(action, key)
+    assertJournalUnavailable(denied)
+    assert.equal(denied.operation?.retry_key, key)
+    assert.equal(denied.operation.durable, undefined)
+    assert.equal(f.effects[action], 0)
+    assert.equal(operationRows(f.store).length, 0)
+  })
+  test('unavailable ' + action + ' without an explicit key or coordinates invents no history key', async t => {
+    const f = controlJournalFixture(t)
+    f.events.length = 0
+    pendingControl(f)
+    const first = await f.call(action), key = first.operation.retry_key, before = operationRows(f.store)
+    assert.match(key, /^[a-f0-9-]{36}$/)
+    f.publish(undefined)
+    const denied = await f.call(action)
+    assertJournalUnavailable(denied)
+    assert.equal(denied.operation?.retry_key, undefined, 'no fresh UUID may masquerade as the prior unknown key')
+    assert.equal(f.effects[action], 1)
+    f.publish(f.store)
+    const replay = await f.call(action, key)
+    assert.equal(replay.operation.retry_key, key)
+    assert.equal(replay.operation.replayed, true)
+    assert.equal(f.effects[action], 1)
+    assert.deepEqual(operationRows(f.store), before)
+  })
+  test('never-journal detached keyless ' + action + ' with no coordinates keeps legacy effects', async t => {
+    const f = controlJournalFixture(t, { detached: true })
+    f.events.length = 0
+    const result = await f.call(action)
+    assert.equal(result.ok, true)
+    assert.equal(result.operation.durable, false)
+    assert.equal(result.operation.durability, 'unavailable')
+    assert.equal(result.operation.retry_key, undefined)
+    assert.equal(f.effects[action], 1)
+    assert.equal(operationRows(f.store).length, 0)
+  })
+  for (const [kind, key] of [
+    ['empty', ''], ['blank', '  '], ['NUL', 'bad' + String.fromCharCode(0) + 'key'],
+    ['oversize', 'x'.repeat(257)], ['object', { private: 'PRIVATE_INVALID_RETRY_KEY' }],
+    ['number', 0], ['null', null],
+  ]) {
+    test('early unavailable ' + action + ' never treats invalid explicit ' + kind + ' as original key', async t => {
+      const f = controlJournalFixture(t, { detached: true })
+      const denied = await f.call(action, key)
+      assertJournalUnavailable(denied)
+      assert.equal(denied.operation?.retry_key, undefined)
+      assert.doesNotMatch(JSON.stringify(denied), /PRIVATE_INVALID_RETRY_KEY/)
+      assert.equal(f.effects[action], 0)
+      assert.equal(operationRows(f.store).length, 0)
+    })
   }
 }

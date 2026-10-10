@@ -21,3 +21,26 @@ Initial aggregate be24024f / tree641d8c6c passed actual push38034288333 and PR38
 At this assembly commit no audit PR has merged. Whole checkout/actual-unpacked-package six-job acceptance, complete original-base release review and an additional fresh actual-PR premerge round are pending. Final exact-head merges, issue dispositions and main-tree/six-job verification are recorded later in the release PR; this file does not assert its own future merge.
 
 No local/target-production/paid-model test is claimed; failed managed executor and unavailable target run/child logs leave real historical crash causes unverified. Full-tree managed adapter remains closed.
+
+## Third actual-review repair: stable early-refusal keys
+
+The revised7bb25767311fc95e32ec1ca1e7af92519ef42500 / tree683460e5180a54ebf1015b8b92e94d47acb8b2a8 passed push38036532231 and PR38036536357 six jobs: offline1240/1231/0/9, native1240/1225/0/15 and51/51 anchored boundaries plusHOST17/ISOLATION13. Full-original-base source review passed but release remained held for one new actualPR62 finding: early unavailable branches omitted the original structured retry key even though they refused a second effect.
+
+Tests-only a098c56cb970f6bd02fca2dbfb7daacdd0dd32cc / [RED38037162428](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38037162428) reproduced26 missing-key failures in every job, with no fixture failures and zero second host effects. Source 27a39e2b428edd6e5328904bcefb2378c35b3d11 / tree0916cb83c2d8686615b1212ff0c7e9077aad3d26 passed [GREEN38037335341](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38037335341), all six complete logs read by parent and independent reviewer: offline1176/1170/0/6, native1176/1164/0/12 +46/17/13. All52 new negatives/positives and original envelope/Promise/Cordis cases passed. Final report-only 52d54070239257a092b81c8f34ae99febc843274 / tree624a2190692ce60af18db7c857b94963d6907f23, complete manifest and original-base spec/quality received independent PASS. The report preserves the actual RED-reading order and earlier invalid fixture history.
+
+Early failures return only a validated explicit key or the original trusted-coordinate hash. They never allocate a new UUID to represent lost history. Without those inputs the caller must retain a previously returned generated key separately. Genuine detached success and normal mounted new-intent UUID fallback remain. Updated cleanPR62 a283c3b10d975ab8b8b6268bfcb85ca34cf96cd5 / tree81a675d0eb27c79ea1961ad3bcc8790b69613420 retains latestPR66/63 and the verified shared host union. Its actual review thread is answered and resolved. No other module production or shared hunk changes in this round; no audit PR has merged at this source snapshot.
+
+## Actual low-CPU deadline diagnosis
+
+ActualPR67 review5478139871 reported the unchanged60,000ms aggregate deadline killing node:test in its environment. This report was investigated, not dismissed because it had no inline thread. [Diagnostic38037137830](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38037137830) compared frozen original81b7ce67114f96ebcd05b257571ce8a6bc9e68c7 / tree352e615beb3251b60424d4aa81b6929037c51778 with candidate7bb25767311fc95e32ec1ca1e7af92519ef42500 / tree683460e5180a54ebf1015b8b92e94d47acb8b2a8, Node22.23.2/24.19.0 and actual1/2 CPU affinity. Eight complete job logs confirm exact checkout/tree, availableParallelism1/2, inherited npm affinity, original verify-all source, original exit0 and timeout:false. Baseline852/846/0/6; candidate1240/1231/0/9. No failed/cancelled jobs.
+
+|Node / CPUs|baseline primary seconds|candidate primary seconds|
+|---|---:|---:|
+|22.23.2 /1|29.459|50.621|
+|22.23.2 /2|31.710|30.341|
+|24.19.0 /1|30.274|39.919|
+|24.19.0 /2|34.109|40.553|
+
+Each combination is one independent runner sample. This matrix did not reproduce the reported timeout; it cannot rule out that earlier unknown environment. The nominal9.379-second slowest-suite margin excludes spawn/close overhead and is not a guarantee for arbitrary machines. CPU affinity does not model quota/frequency/load. Three candidate offline skips require native SDK anchors; original12-second cleanup source is retained but skipped in this offline diagnostic, while normal packed/native gates execute it. Diagnostic-only branch b879922fa8e9f1a7266e07e663cdc1964ba026a0 / treec93b0d68260f7c021c663cedab292949e816b91d adds only runner-deadline-diagnostics.yml blob6e2e4c527c34e0024bfac326232d6e0b5c941f36 and preserves all174 candidate blobs. Its workflow/artifacts remain outside the release. Parent and independent performance review read all8 complete logs and source: evidence PASS, disposition **not reproduced in this matrix**. No production runner change or60s/12s waiver is justified by this result.
+
+This next assembled source still requires its own exact-head six-job acceptance, complete original-base review, fresh additional actual-PR premerge round, dependency-ordered merges and final-main verification. Actual future results are recorded in PR67; unavailable deployment/run/child logs still prevent attributing historical production crashes.

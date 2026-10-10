@@ -437,3 +437,53 @@ test('registered recovery output budget includes the model-facing success envelo
   const result = await toolsHarness(store).call('task_board', { view: 'recovery' })
   assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 16384, 'model-facing envelope must fit the documented byte budget')
 })
+
+for (const action of ['send', 'stop']) test('post-invocation ' + action + ' errors retain unknown operation and retry key', async t => {
+  const { store, recovery } = fixture(t)
+  const effect = () => { throw Object.assign(new Error('SECRET ambiguous busy'), { code: 'E_STORE_BUSY' }) }
+  const h = toolsHarness(store, { [action]: effect })
+  h.events.length = 0
+  const name = action === 'send' ? 'task_child_send' : 'task_child_stop'
+  const args = { target_id: 'worker', ...(action === 'send' ? { message: 'x' } : {}) }
+  const failed = await h.call(name, args)
+  assert.equal(failed.code, 'E_CONTROL_OUTCOME_UNKNOWN')
+  assert.equal(typeof failed.operation, 'object')
+  assert.equal(failed.operation.status, 'unknown')
+  assert.equal(typeof failed.operation.retry_key, 'string')
+  assert.match(failed.hint, /不得|禁止/)
+  assert.equal(JSON.stringify(failed).includes('SECRET'), false)
+  const retry = await h.call(name, { ...args, request_key: failed.operation.retry_key }, 'another-step')
+  assert.equal(retry.operation.operation_id, failed.operation.operation_id)
+  assert.equal(retry.operation.replayed, true)
+  assert.equal(action === 'send' ? h.sends : h.stops, 1)
+  assert.equal(recovery.inspect({}, 'root').operations.length, 1)
+})
+test('escaped checkpoint context preserves row identity and older-page reachability', t => {
+  const { store, recovery } = fixture(t)
+  const { task_id } = store.openTask({ title: 'work' }, 'root')
+  const older = recovery.checkpoint({ task_id, summary: 'older' }, 'root', root)
+  const large = recovery.checkpoint({ task_id, summary: String.fromCharCode(0).repeat(4095) + 'x' }, 'root', root)
+  const first = recovery.inspect({ limit: 1 }, 'root')
+  assert.equal(first.checkpoints.length, 1, 'oversize context cannot erase the only row')
+  assert.equal(first.checkpoints[0].id, large.checkpoint_id)
+  assert.equal(first.checkpoints[0].context_omitted, true)
+  assert.equal(first.truncated, true)
+  assert.equal(first.continuation.checkpoints, large.checkpoint_id)
+  const next = recovery.inspect({ limit: 1, checkpoint_cursor: first.continuation.checkpoints }, 'root')
+  assert.equal(next.checkpoints[0].id, older.checkpoint_id)
+  assert.ok(Buffer.byteLength(JSON.stringify({ ok: true, ...first })) <= 16384)
+})
+test('oversized existing owner observations retain timeline identity and continuation', t => {
+  const { store, recovery } = fixture(t)
+  const { task_id } = store.openTask({ title: 'work' }, 'root')
+  const prior = recovery.timeline({}, 'root').events[0].id
+  store.claimTask({ task_id, child_id: 'worker' }, 'root', { sessionId: 'owner-' + 'x'.repeat(20000), isRoot: false }, 'owner-' + 'x'.repeat(20000))
+  const first = recovery.timeline({ limit: 1 }, 'root')
+  assert.equal(first.events.length, 1, 'oversize identity cannot erase the only row')
+  assert.ok(first.events[0].id > prior)
+  assert.equal(first.events[0].owner_session, null)
+  assert.ok(first.events[0].omitted_fields.includes('owner_session'))
+  assert.equal(first.next_cursor, first.events[0].id)
+  assert.equal(recovery.timeline({ limit: 1, cursor: first.next_cursor }, 'root').events[0].id, prior)
+  assert.ok(Buffer.byteLength(JSON.stringify({ ok: true, ...first })) <= 16384)
+})

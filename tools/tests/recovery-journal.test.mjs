@@ -420,3 +420,20 @@ test('lifecycle preserves documented core terminal kinds including synthetic his
     reason_kind: 'refusal', raw_error: 'SECRET' }, authority)
   assert.equal(recovery.inspect({}, 'root').lifecycle[0].reason_kind, null)
 })
+
+test('registered recovery output budget includes the model-facing success envelope', async t => {
+  const { store, recovery } = fixture(t)
+  const { task_id } = store.openTask({ title: 'budget' }, 'root')
+  for (let i = 0; i < 4; i++) recovery.checkpoint({ task_id, summary: 'x' }, 'root', root)
+  const initial = recovery.inspect({}, 'root')
+  let remaining = 16384 - Buffer.byteLength(JSON.stringify(initial))
+  assert.equal(initial.checkpoints.length, 4)
+  for (const checkpoint of initial.checkpoints) {
+    const extra = Math.min(4095, remaining)
+    store.open().prepare('UPDATE task_checkpoint SET summary=? WHERE id=?').run('x'.repeat(extra + 1), checkpoint.id)
+    remaining -= extra
+  }
+  assert.equal(remaining, 0, 'fixture must fill the exact data-only boundary')
+  const result = await toolsHarness(store).call('task_board', { view: 'recovery' })
+  assert.ok(Buffer.byteLength(JSON.stringify(result)) <= 16384, 'model-facing envelope must fit the documented byte budget')
+})

@@ -275,3 +275,23 @@ test('state byte budget includes JSON escaping of the exact trusted run identity
   assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 65536)
   assert.equal(page.has_more, true)
 })
+
+test('scheduler bind enforces its session identity bound before changing governor state', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const oversized = 's'.repeat(513)
+  s.enqueue(input(task(store, oversized)), run, lead)
+  const row = admit(s).request
+  assert.throws(() => s.bind(ref(row, { session_id: oversized }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'reserved')
+})
+
+test('oversized external governor state fails explicitly without an empty-page cursor crash', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const oversized = 's'.repeat(70000)
+  s.enqueue(input(task(store, oversized)), run, lead)
+  const row = admit(s).request
+  g.bind({ reservation_id: row.reservation_id, generation: row.generation, session_id: oversized }, run, lead)
+  assert.throws(() => s.state({}, run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(g.snapshot(run).active_total, 1)
+})

@@ -238,6 +238,8 @@ open ──claim──▶ claimed ──submit──▶ submitted ──accept�
 ### 5.3 门槛查的是"有没有有效依据事实"，不是"内容是否正确"
 
 门槛只回答"任务上有没有符合条件的依据事实"；有效的 fact / artifact 无证据路径也可通过，但会提示警告。**依据事实或文件路径不等于内容正确** —— 内容仍需主会话复核。
+
+`legacy` 的路径分支接受任意 kind 的有效置信度记录：已被有效 decision 消解的 blocker 若带非空 `evidence_path`，其调查/失败日志仍可成为依据。这只保留调查证据，不证明交付物正确或执行成功；主会话须读原始记录和日志作裁决。相同的 blocker → 消解 decision → submit 序列不能满足 `execution` 的独立回执闸门，缺少真实成功回执仍报 `E_VERIFICATION_RECEIPT`。
 本层刻意不解析证据内容，也**不**把执行者给的路径自动填进验收记录的 `evidence_path`
 （那会把"别人提供的路径"伪造成"主会话已核对的证据"）；验收记录只列**被采信的依据事实 id**（`#3, #7` 形式）供回读。
 系统写的记录（提交说明 / 打回理由 / 验收记录 / 复核记录）统一是 `kind='decision'` + `confidence='PLAUSIBLE'`：
@@ -412,6 +414,8 @@ v3 覆盖（逐条对应审计缺陷，断言 id 里带 ★）：
 `execution_receipt` 与任务在同一 SQLite 数据库，关联 run、task、generation、真实 owner/执行者、固定命令、可信 cwd、开始结束时间、native 调用关联、清单快照与结构化 outcome。stdout/stderr 由宿主写到 `store.root/receipts/<uuid>.<stream>.log`，回执保存 SHA256、实际字节数及完整性；不跟随 native spillPath，也不把渲染文本当原始日志。合计超过 2 MiB 时最多保存 2 MiB 观察内容并标记不完整。数据库完成写入失败会保留最新 pending intent；可能残留未被采信的 UUID 日志，须重新运行才能产生新回执。
 
 严格 `task_accept` 只检查最新回执，要求同 run、本 owner、本代、同命令/cwd/清单，canonical `kind:'foreground'`、实际 exitCode 0、signal=null、timedOut=false、aborted=false、无 sandbox denial/runnerFailed/stopped、完整输出。缺字段不会被默认补成成功。较新的非零、timeout、abort、promotion、拒绝、unknown 或 pending 覆盖旧成功，artifact 自述不能替代回执。
+
+配置的 store root 及其祖先可以包含 symlink；严格日志校验只解析该可信 root 的物理身份，日志的文本路径仍须逐字属于本 root，物理路径须落在该物理 root 的 `receipts` 目录。receipts 目录或日志文件自身用 symlink 指向别处仍被拒绝。换到另一 root 的归档不会改写历史日志文本路径，也不会因字节与摘要相同而恢复严格执行权限。
 
 验收时重新读取清单文件和实际日志并核对摘要。文件快照保留 SHA256、resolved path、大小、inode/dev 与 mtime/ctime；执行前后这些信息变化也会判失败，哪怕内容被写后还原。日志缺失/篡改、源码更改/替换或外部 symlink 都拒绝。reject 原子递增 `evidence_generation`；换 owner 后须由新真实执行者重新验证。显式 `waiver_reason` 仍能人工收口，返回 `execution_verified:false` 并写独立 `execution_waiver` 审计与带「人工豁免；非验证通过」的 decision，不能绕过跨 run、数据完整性或未解 blocker。
 

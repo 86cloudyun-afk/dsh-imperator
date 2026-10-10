@@ -18,7 +18,7 @@ import { putters, syntheticRoot, sizes, memory, safeDiagnostic } from './probe-n
 
 const SELF = fileURLToPath(import.meta.url), RUN = 'same-run-density'
 const PARTIAL = 'idx_probe_blocker_task_run_id'
-const VARIANTS = ['planner_default', 'rows_run_index', 'rows_existing_task_index', 'rows_task_partial']
+const VARIANTS = ['planner_default', 'rows_run_index', 'rows_existing_task_index', 'rows_task_partial', 'rows_scoped_task_partial']
 const emit = value => console.log(JSON.stringify(value))
 const hash = value => createHash('sha256').update(value).digest('hex')
 let phase = 'configuration'
@@ -67,7 +67,8 @@ function rewrite(sql, variant) {
   assert.ok(plain.includes(' FROM fact b JOIN task t'), 'row SQL recognition changed')
   if (variant === 'planner_default') return plain
   const index = variant === 'rows_run_index' ? 'idx_fact_blocker_run_id'
-    : variant === 'rows_existing_task_index' ? 'idx_fact_task_id' : PARTIAL
+    : variant === 'rows_existing_task_index' ? 'idx_fact_task_id'
+      : variant === 'rows_scoped_task_partial' && !plain.includes(' AND t.id=?') ? 'idx_fact_blocker_run_id' : PARTIAL
   return plain.replace(' FROM fact b JOIN task t', ' FROM fact b INDEXED BY ' + index + ' JOIN task t')
 }
 function variantRead(store, variant, args, capture) {
@@ -157,8 +158,12 @@ function worker(root, variant, config) {
   try {
     db.loadExtension(config.extension)
     db.enableLoadExtension(false)
+    // Production may already own the proposed task-first index. Remove it in
+    // every disposable clone so control variants retain their original schema.
+    db.exec('DROP INDEX IF EXISTS idx_fact_blocker_task_run_id')
+    assert.equal(Number(db.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='index' AND name='idx_fact_blocker_task_run_id'").get().n), 0)
     const createAt = performance.now()
-    if (variant === 'rows_task_partial') db.exec('CREATE INDEX ' + PARTIAL + " ON fact(task_id,run_id,id) WHERE kind='blocker'")
+    if (variant === 'rows_task_partial' || variant === 'rows_scoped_task_partial') db.exec('CREATE INDEX ' + PARTIAL + " ON fact(task_id,run_id,id) WHERE kind='blocker'")
     const candidate_index_create_ms = performance.now() - createAt
     const analysisAt = performance.now()
     if (config.statistics === 'analyzed') db.exec('ANALYZE')

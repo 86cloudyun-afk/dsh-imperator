@@ -383,3 +383,42 @@ test('checkpoint compares underlying Cordis service identities across fresh cont
   replace = true
   await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), code('E_SCHEDULER_CAPABILITY'))
 })
+
+function durableSchedulingRows(store) {
+  return JSON.stringify(['governor_run', 'governor_reservation', 'governor_retry_charge', 'governor_hold', 'governor_audit', 'scheduler_request', 'scheduler_decision']
+    .map(table => ({ table, rows: store.open().prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all() })))
+}
+
+test('scheduler historical settled replay preserves the newer admission through reopening', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  s.enqueue(input(id, { kind: 'new', mode: 'write', resources: ['repo'] }), run, worker)
+  const first = admit(s, 'first-admission').request
+  s.bind(ref(first, { session_id: worker.sessionId }), run, worker)
+  const proof = { kind: 'terminal', outcome: 'succeeded', quiescent: true, evidence: 'trusted scheduler subtree stopped' }
+  const settled = s.settle(ref(first, { proof }), run, worker)
+  s.enqueue(input(id, { request_key: 'second-queue', generation: first.generation, kind: 'retry', mode: 'write', resources: ['repo'] }), run, worker)
+  const second = admit(s, 'second-admission').request
+  const before = JSON.stringify(g.snapshot(run)), queue = JSON.stringify(s.state({}, run, lead)), rows = durableSchedulingRows(store)
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(g.snapshot(run).active_writers, 1)
+  assert.equal(g.snapshot(run).created_total, 1)
+  assert.equal(g.snapshot(run).retries[id], 1)
+  assert.equal(g.snapshot(run).holds[0].reservation_id, second.reservation_id)
+  assert.throws(() => s.bind(ref(first, { session_id: worker.sessionId }), run, worker), code('E_GOVERNOR_FENCE'))
+  assert.throws(() => s.markUnknown(ref(first, { reason: 'late observation' }), run, worker), code('E_GOVERNOR_FENCE'))
+  assert.deepEqual(s.settle(ref(first, { proof }), run, worker), settled)
+  assert.throws(() => s.settle(ref(first, { proof: { ...proof, outcome: 'failed' } }), run, worker),
+    error => error.code === 'E_GOVERNOR_CONFLICT' && error.message === 'settlement conflicts with durable proof')
+  assert.equal(JSON.stringify(g.snapshot(run)), before)
+  assert.equal(JSON.stringify(s.state({}, run, lead)), queue)
+  assert.equal(durableSchedulingRows(store), rows)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  t.after(() => reopened.close())
+  const restored = new module.TaskforceScheduler(reopened), restoredGovernor = new TaskforceGovernor(reopened)
+  assert.deepEqual(restored.settle(ref(first, { proof }), run, worker), settled)
+  assert.equal(JSON.stringify(restoredGovernor.snapshot(run)), before)
+  assert.equal(JSON.stringify(restored.state({}, run, lead)), queue)
+  assert.equal(durableSchedulingRows(reopened), rows)
+})

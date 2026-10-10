@@ -35,3 +35,7 @@ Use shared exact-current-revision failure/frozen-stage admission in artifact/ver
 5. Write the report at docs/superpowers/research/2026-10-10-imperator-audit/task-1-report.md. Return status/head/tree/owned-file blobs, one-line test evidence and concerns.
 
 Do not spawn subagents or reviewers. Parent assigns independent review, integrates shared hunks, creates PRs and merges. Do not touch other branches/main, weaken assertions, alter workflow gates, or print credentials. Without shell, use structured GitHub tree/commit/ref tools with expected_sha leases and real Actions. Report remote evidence honestly.
+
+## Fourth-round ownership and contract amendment
+
+Task1 additionally owns only the workflow strict-evidence helper import and second acceptance strict-call hunk in lib/store/index.js. Parent applies the precise hunk to the latest approved Task2 blob; the author does not own whole-file replacement. Cover legacy unreviewed/passing same-generation ancestry (including same receipt), NULL active revision and replacement stages; retain sole current delivery/zero-budget acceptance, scoped ancestry, root new generation and read-only replay controls. Test real registered-tool JSON hint on frozen source/log drift in review and both acceptance strict reads, with remaining/exhausted budget guidance and ordinary/mutable positive controls. This amendment follows actual PR61 review5478397636, not a speculative global verification-policy change.

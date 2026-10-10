@@ -138,7 +138,7 @@ test('restored lead acceptance requires current-root execution and a new indepen
   assert.equal(store.taskOf(id, run).task.owner_session, worker.sessionId)
   assert.equal((await doctor({ root })).counts.invalid_logs, 0)
 
-  assert.throws(() => resumed.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+  assert.throws(() => resumed.accept(id), error => error.code === 'E_WORKFLOW_EVIDENCE' && /return_for_rework/.test(error.hint))
   assert.deepEqual(resumed.state(id), before, 'refused acceptance must preserve reviewed audit')
   const receiptCount = store.open().prepare('SELECT COUNT(*) AS n FROM execution_receipt WHERE task_id=?').get(id).n
   await assert.rejects(resumed.verify(id), { code: 'E_WORKFLOW_STAGE' })
@@ -239,7 +239,7 @@ test('restored frozen delivery with zero rework budget refuses revalidation with
   assert.equal((await restore({ backup: archive, out: root })).ok, true)
   const store = f.open(root), resumed = workflow(store, f.workspace, 'zero-resumed')
   const before = resumed.state(id), receipts = store.open().prepare('SELECT * FROM execution_receipt WHERE task_id=?').all(id)
-  assert.throws(() => resumed.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+  assert.throws(() => resumed.accept(id), error => error.code === 'E_WORKFLOW_EVIDENCE' && /授权/.test(error.hint) && /task_workflow_create/.test(error.hint))
   assert.throws(() => resumed.change('returnForRework', id, { reason: 'restore revalidation' }), { code: 'E_WORKFLOW_BUDGET' })
   await assert.rejects(resumed.verify(id), { code: 'E_WORKFLOW_STAGE' })
   assert.throws(() => resumed.artifact(id), { code: 'E_WORKFLOW_STAGE' })

@@ -194,7 +194,7 @@ test('failed migration rolls back schema and same store retries cleanly', (t) =>
   try { assert.throws(() => store.open(), /injected migration failure/) }
   finally { DatabaseSync.prototype.exec = original }
   assert.equal(store.handle, null)
-  assert.deepEqual(store.migration, { added_columns: [], unassigned: { task: 0, fact: 0, handoff: 0 } })
+  assert.deepEqual(store.migration, { added_columns: [], unassigned: { task: 0, fact: 0, handoff: 0, execution_receipts: 0, execution_waivers: 0 } })
   const inspect = new DatabaseSync(path)
   assert.equal(inspect.prepare('PRAGMA table_info(task)').all().some(x => x.name === 'run_id'), false)
   assert.equal(inspect.prepare("SELECT COUNT(*) AS n FROM sqlite_master WHERE type='view'").get().n, 0)
@@ -208,7 +208,7 @@ test('failed migration rolls back schema and same store retries cleanly', (t) =>
   inspect.close()
   assert.equal(store.open().prepare('PRAGMA table_info(task)').all().some(x => x.name === 'run_id'), true)
   assert.deepEqual(store.migration.added_columns.sort(),
-    ['fact.actor_session', 'fact.resolves_fact_id', 'fact.run_id', 'handoff.run_id', 'task.evidence_generation', 'task.evidence_policy', 'task.owner_session', 'task.run_id', 'task.verification_command', 'task.verification_cwd', 'task.verification_files'])
+    ['fact.actor_session', 'fact.resolves_fact_id', 'fact.run_id', 'handoff.run_id', 'task.evidence_generation', 'task.evidence_policy', 'task.owner_session', 'task.run_id', 'task.submitted_at', 'task.verification_command', 'task.verification_cwd', 'task.verification_files'])
 })
 
 test('shared fixture creates a submitted task with a plausible artifact', (t) => {

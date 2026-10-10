@@ -149,16 +149,20 @@ run 域的操作也永远碰不到它。默认范围没有任何一路会退化�
 | `board` | `({} \| { task_id }, runId)` | 兼容宿主 API，见下 |
 | `boardPage` | `({view?,task_id?,limit?,cursor?,page_token?,late_cursor?,late_page_token?}, runId)` | 模型分页入口，见下 |
 | `stats` | `(runId)` | `{ run_id, tasks{…}, facts{…}, blockers_open, blockers_late }`；缺省 = 未归属域 |
-| `statsAllRuns` | — | **显式命名的跨 run 视图**（唯一会跨过隔离边界的读方法） |
+| `statsAllRuns` | — | **显式命名的跨 run 视图**；返回 `blockers_open/blockers_late`，与单 run 使用同一待办/消解判据，全部统计在同一只读快照内完成；facts 保留原始全局行计数 |
 | `unassignedSummary` | — | `{ task, fact, handoff, execution_receipts, execution_waivers }` 未归属行计数（只读诊断） |
 | `adoptUnassigned` | `(runId)` | 显式接管未归属任务及匹配记录，返回 tasks/facts/handoffs/execution_receipts/execution_waivers 数量；`runId` 为 `null` 时拒绝 |
+
+`submitted_at` 持久化最近一次实际进入 `submitted` 的时刻。提交后普通事实或消解 decision 只更新 `updated_at`（最近活动时间），幂等 `submitTask` 与 `closeTask(done/partial)` 返回原提交时刻且不写库。reject/claim/终态转移保留上次提交时间；重新实际提交会写入新的时间。只加 nullable TEXT 列，迁移前 submitted 行的未知时刻保持 `null`，不从 `updated_at` 或审计文案推测；`taskOf` 与详情板同样返回该字段。
+
+`acceptTask.resolved_blockers` 是该任务同 run 中已被有效 decision 消解的不同 blocker 数；同一个 blocker 多条有效消解只计一次。REFUTED、错任务或错 run 的 decision 不算有效消解。
 
 `board({}, runId)` 无 `task_id`：`{ scope:'open', run_id, open_tasks, submitted_tasks, tasks[], late_blockers[], late_blocked_tasks, note }`，
 范围 = 本 run 的**待办**任务（`open / claimed / submitted / rejected`），每任务带**最近 5 条**事实摘要
 （`statement` 截断到 160 字符、`evidence` 合成 `path:line`）；**`submitted` 必在列**（主会话的待办来源）。
 库为空返回 `tasks: []`，不报错。
 `late_blockers` = **已收口任务上仍未消解的阻塞**（每项 `{ task_id, title, status, owner, blockers:[{fact_id,statement,by,at}] }`）：
-它们不属于待办集合（结论没被自动改写），但**必须可见** —— 这是"晚到阻塞不会回到待办"的修复点。
+包括收口前遗留及收口后新增的阻塞；`recordFact.late` 则记录该次写入时任务是否已终态，两者口径不同。它们不属于待办集合（结论没被自动改写），但**必须可见** —— 这是"晚到阻塞不会回到待办"的修复点。
 `board({task_id}, runId)`：`{ scope:'task', task（含 `late`）, counts:{by_kind,by_confidence}, facts[]（≤50，最近在前，不截断）, handoffs[]（≤10）, late_blockers[], validation_warnings[] }`。历史 `accepted` 如缺当前有效依据，返回 `{code:'W_EVIDENCE_REVIEW',message}` 提醒人工核对（可能曾人工豁免）；状态不自动回滚，且不解析验收文案猜测豁免。
 
 `boardPage` 是模型 `task_board` 的入口；旧宿主 `board` 的返回形状、最近5条摘要和全待办列表保持不变。无参数 `boardPage` 使用 `view='tasks'`，默认每页25、最大100；`limit`、`cursor`、`late_cursor`、`task_id` 必须为合法整数，非法/超界参数报 `E_INPUT`。各页按 ID 降序、`id < cursor` keyset 读取；`pagination:{limit,next_cursor,has_more,page_token?}` 的 `limit` 是请求上限，受字节预算影响实际页可更短。待办/晚到阻塞是可变集合：续页必须将上页的 `next_cursor` 和 `page_token` 配对传入（默认晚到区为 `late_cursor/late_page_token`），仅数字游标的旧调用会报 `E_INPUT`，需升级调用方。示例：`task_board({cursor:上页.pagination.next_cursor,page_token:上页.pagination.page_token})`。
@@ -173,7 +177,13 @@ token 绑定实际 run、逻辑集合、有效 task 筛选、首轮候选 ID 上
 
 `tasks/summary` 的完整模型工具 JSON（包含 `ok/viewer/can_accept`）上限65536 UTF-8 bytes。数据层预算60000 bytes，展示字段截短会标明 `truncated/truncated_fields`，任务带 `detail:{task_id}` 原文入口。超预算可明确减少页尾，返回 `budget_reduced:true` 并将各区游标置于最后实际输出条目，所有略去记录仍可继续读取。可操作 `owner_session/actor_session/viewer` 过长时省略原值并标明省略，不产生截短的伪身份；任务身份原值可通过详情/历史读取；viewer 省略时另给 `viewer_metadata:{role,omitted:true}`。页数有界的详情和显式原文历史页不受摘要字节上限约束。
 
-分页默认/摘要用 `scope_integrity_totals` 报告全域异常，不随当前页消失；保留 mismatched_facts/mismatched_handoffs，执行审计异常时新增正数 mismatched_receipts/mismatched_waivers（缺省按0）。`scope_integrity_note` 指向 task_id 详情的逐任务异常列表，旧宿主 `board.scope_integrity` 同样报告这些审计异常数量。异域回执/豁免原文隐藏，验收在人工豁免和证据路径之前以 `E_STORE_INTEGRITY` 拒绝。
+分页默认/摘要用 `scope_integrity_totals` 报告全域异常，不随当前页消失；保留 mismatched_facts/mismatched_handoffs，执行/恢复审计异常时新增正数 mismatched_receipts/mismatched_waivers/mismatched_events/mismatched_checkpoints/mismatched_controls（缺省按0）。`scope_integrity_note` 指向 task_id 详情的逐任务异常列表，旧宿主 `board.scope_integrity` 同样报告这些审计异常数量。异域回执/豁免原文隐藏，验收在人工豁免和证据路径之前以 `E_STORE_INTEGRITY` 拒绝。
+
+control 归属异常统计按父任务查找；迁移在恢复表建好后增加覆盖索引 `idx_control_task(task_id,run_id)`，避免分页总计与兼容详情对每个任务全扫 control 日志。旧库重开幂等补索引，原行与列不变。它是查询访问路径，doctor 的数据可读 schema 闸门不因缺此性能索引而拒绝旧库；preflight 会在隔离副本实际迁移并记录 schema 变化。
+
+启动、迁移与 `unassignedSummary` 共用五表未归属诊断。迁移同事务补 `idx_execution_receipt_unassigned(run_id)` 与 `idx_execution_waiver_unassigned(run_id)`，两者仅收录 `run_id IS NULL` 行，让审计计数按 NULL 范围查找，避免遍历已归属回执与豁免历史；不改变五表计数、显式领养或异常隔离规则。旧库首次建立索引仍需读取既有表，后续打开幂等复用。它们同样是可选性能索引，doctor 不将缺索引视为数据不可读；preflight 隔离副本实际补索引并记录 schemaHash。规模回归检查真实 SQL 的查找计划及原行/列保留，不设耗时阈值或承诺任意启动延迟。
+
+迁移诊断 `migration.unassigned`、`unassignedSummary()` 与 boot 警告共用 task/fact/handoff/execution_receipts/execution_waivers 五表口径。已归属父任务上的 NULL-run receipt/waiver 也会告警，但继续隔离，`adoptUnassigned` 不会吸收它们；须管理员人工核对归属。
 
 `adoptUnassigned` 在同一写事务中先按原本 `task.run_id IS NULL` 的父任务迁移 NULL-run 执行回执与豁免，再迁移任务及既有事实/交接。它只改变审计归属，不改变 owner、generation、命令、快照、结果或日志；已归属任务上的 NULL/异域审计保留异常，不自动纳入。原本未归属任务如附有已归属的执行审计，接管在任何迁移前以 `E_STORE_INTEGRITY` 拒绝，避免父任务移动让异常审计重新可见；须管理员核对修复。任一步写入失败回滚全部五张表与迁移诊断。人工豁免仍是非验证通过，旧失败、pending 或旧代回执不会因接管而变成有效依据。
 

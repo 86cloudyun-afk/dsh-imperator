@@ -12,6 +12,11 @@ const SCRIPTS = [
   'verify-p3.mjs', 'verify-scope-guard.mjs', 'verify-child-control.mjs',
 ]
 const TESTS = [
+  'recovery-journal.test.mjs',
+  'scheduler-native.test.mjs',
+  'scheduler.test.mjs',
+  'operations.test.mjs',
+  'workflow-engine.test.mjs',
   'model-regression.test.mjs',
   'governor.test.mjs',
   'sqlite.test.mjs',
@@ -59,6 +64,10 @@ const TESTS = [
   'execution-receipts.test.mjs',
   'execution-adoption.test.mjs',
   'tool-recovery.test.mjs',
+  'nextgen-projection.test.mjs',
+  'nextgen-board.test.mjs',
+  'nextgen-tool-integration.test.mjs',
+  'nextgen-restore-integration.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */
@@ -126,7 +135,7 @@ export async function runVerification({ mode = 'offline', profileDir,
     await run('preset contract', [join(HERE, 'verify-preset.mjs'), '--install-anchor', anchor,
       ...(profileDir === undefined ? [] : ['--profile-dir', resolve(profileDir)])])
     await run('native boundaries', ['--test', join(HERE, 'tests/host-boundaries.test.mjs'), join(HERE, 'tests/host-runtime.test.mjs'),
-      join(HERE, 'tests/host-api-contract.test.mjs')],
+      join(HERE, 'tests/host-api-contract.test.mjs'), join(HERE, 'tests/scheduler-native.test.mjs')],
       { ...process.env, DSH_INSTALL_ANCHOR: anchor })
     await run('host integration', [join(HERE, 'verify-host.mjs'), '--install-anchor', anchor])
     await run('preset isolation', [join(HERE, 'verify-isolation.mjs'), '--install-anchor', anchor])

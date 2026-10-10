@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-taskforce",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "DSH Imperator (dsh指挥官) — 主会话统御决策、子代理军团执行的多 agent 生产工具（DSH agent preset）",
@@ -18,7 +18,11 @@
     "./store": "./lib/store/index.js",
     "./governor": "./lib/governor/index.js",
     "./tools": "./lib/tools/index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./workflow": "./lib/workflow/index.js",
+    "./operations": "./lib/operations/index.js",
+    "./recovery": "./lib/store/recovery.js",
+    "./scheduler": "./lib/scheduler/index.js"
   },
   "files": [
     "lib",
@@ -33,5 +37,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "bin": {
+    "imperator": "./tools/imperator.mjs"
   }
 }

@@ -128,3 +128,5 @@ jobs:
           path: ${{ runner.temp }}/runner-deadline-diagnostics/
           if-no-files-found: error
           retention-days: 7
+
+# One bounded exact-input repeat: prior Node24 primary succeeded at 59.250134379s under the unchanged 60s bound.

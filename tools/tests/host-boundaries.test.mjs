@@ -952,3 +952,64 @@ test('native public message constructors retain continuation and unknown-outcome
     assert.equal(flow.inFlight, 1)
   }
 })
+
+for (const action of ['send', 'stop']) {
+  for (const publication of ['absent', 'failed-primary', 'null-journal']) {
+    test('actual native Cordis ' + publication + ' journal boundary for keyless ' + action, options, async t => {
+      const { ctx, agent } = await fixture(t)
+      const { apply: applyTools } = await import('../../lib/tools/index.js')
+      const main = agent('cordis-control-root')
+      main.session.append('turn/start', { turn: 1 })
+      main.session.append('step/start', { turn: 1, step: 1 })
+      let effects = 0
+      ctx.provide('agents', { get: id => id === main.session.header.id ? main : undefined })
+      ctx.provide('subagents', {
+        async listChildren() { return [{ id: 'cordis-control-child', mode: 'continuable', createdAt: 0 }] },
+        async sendMessage(sender) { assert.equal(sender, main); effects++; return 'cordis-control-message' },
+        interrupt(target, authority) { assert.equal(authority.agent, main); effects++ },
+      })
+      if (publication === 'null-journal') ctx.provide('taskforceStore', { recovery: null })
+      await ctx.plugin({
+        name: 'native-control-journal-probe',
+        inject: ['tools'],
+        apply(pluginCtx) {
+          assert.ok(pluginCtx.fiber.runtime, 'exercise a running Cordis plugin, not the unguarded root context')
+          if (publication !== 'null-journal') {
+            assert.equal(pluginCtx.get('taskforceStore'), undefined)
+            assert.throws(() => pluginCtx.taskforceStore, /without inject/,
+              'the actual proxy reports normal non-injected absence through its reflective exception')
+          } else {
+            assert.equal(pluginCtx.get('taskforceStore').recovery, null)
+          }
+          const toolsCtx = publication === 'failed-primary' ? pluginCtx.extend({
+            get(name) {
+              if (name === 'taskforceStore') throw new Error('PRIVATE_PRIMARY_LOOKUP_FAILURE')
+              return pluginCtx.get(name)
+            },
+          }) : pluginCtx
+          applyTools(toolsCtx)
+        },
+      })
+      const nativeResult = await main.ctx.tools.execute({
+        agent: main, callId: 'cordis-control-call', name: 'task_child_' + action,
+        arguments: { target_id: 'cordis-control-child', ...(action === 'send' ? { message: 'native boundary probe' } : {}) },
+        signal: new AbortController().signal,
+      })
+      assert.equal(nativeResult.isError, false, nativeResult.error?.message)
+      const result = JSON.parse(nativeResult.value)
+      if (publication === 'absent') {
+        assert.equal(result.ok, true, JSON.stringify(result))
+        assert.equal(result.operation.durable, false)
+        assert.equal(result.operation.durability, 'unavailable')
+        assert.equal(effects, 1, 'normal Cordis service absence retains one legacy effect')
+      } else {
+        assert.equal(effects, 0, 'failed or explicitly null journal must deny before native effect')
+        assert.equal(result.code, 'E_CONTROL_JOURNAL_UNAVAILABLE', JSON.stringify(result))
+        assert.match(result.hint, /原.*(?:键|retry_key)|retry_key/)
+        assert.match(result.hint, /不得换键|禁止.*新.*键/)
+        assert.doesNotMatch(JSON.stringify(result), /PRIVATE_PRIMARY_LOOKUP_FAILURE|without inject/)
+        for (const field of ['sent', 'stopped', 'delivery', 'execution']) assert.equal(Object.hasOwn(result, field), false)
+      }
+    })
+  }
+}

@@ -38,6 +38,11 @@ new milestone, task label, or arbitrary child root.
   generation checks and settlement requirements remain authoritative. Binding
   refuses a changed non-null captured queue owner, including lead-driven
   reassignment; the original reservation and resource holds remain intact.
+  Settling an already-settled historical request with identical normalized proof
+  returns its stored state after a newer admission without changing queue rows,
+  governor holds, budgets or audit. Its own generation, run and current/captured
+  worker ownership must still match; conflicting proof refuses. Binding, unknown
+  marking and first settlement retain the latest admission fence.
 - `state({after?,limit?},runId,authority)` returns ordered requests with
   `has_more` and `next_after`. Default 25, maximum 100; follow the returned
   sequence cursor. Worker views require both current and captured owner.

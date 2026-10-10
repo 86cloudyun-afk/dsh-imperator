@@ -22,8 +22,8 @@ jobs:
         revision: ['aggregate']
         include:
           - revision: aggregate
-            source_sha: '61cffb0ef602b62d191a4f6c6e61d722b4e8fb1f'
-            source_tree: 'b4bc5b757edf498f97cd89a0cd1e1f91a38a0284'
+            source_sha: 'e9f16f3f5f0028391246b5eda30c95fbb359089b'
+            source_tree: 'b0a55654a82c18f8764844bb47f842a76385ae71'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

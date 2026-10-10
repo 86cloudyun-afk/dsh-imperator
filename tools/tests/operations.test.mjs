@@ -706,33 +706,62 @@ test('doctor preserves historical workflow receipt/review identity across new ow
   assert.equal(result.counts.scope_anomalies, 0)
 })
 
-for (const [table, field] of [['task', 'note'], ['fact', 'statement'], ['fact', 'evidence_path'],
-  ['handoff', 'note'], ['execution_receipt', 'command'], ['execution_waiver', 'reason']]) {
-  test('doctor and preflight reject missing runtime core column ' + table + '.' + field + ' without source changes', async t => {
-    const f = fixture(t); seed(f)
-    f.store.handle.exec('ALTER TABLE ' + table + ' DROP COLUMN ' + field)
-    const before = bytes(f.store.dbPath), listing = readdirSync(f.root)
+async function unchangedCoreCheck(f, operation) {
+  const before = bytes(f.store.dbPath), listing = readdirSync(f.root)
+  if (operation === 'doctor') {
     const diagnosis = safe(await api().doctor({ root: f.root }))
-    assert.equal(diagnosis.ok, false, 'missing runtime core column must not report DATABASE_OK')
+    assert.equal(diagnosis.ok, false, 'incompatible runtime core schema must not report DATABASE_OK')
     assert.ok(diagnosis.checks.some(check => check.code === 'SCHEMA_UPGRADE_REQUIRED'), JSON.stringify(diagnosis))
-    assert.equal(bytes(f.store.dbPath), before)
-    assert.deepEqual(readdirSync(f.root), listing)
-    await assert.rejects(api().preflight({ root: f.root }), { code: 'E_OPERATIONS_SCHEMA' })
-    assert.equal(bytes(f.store.dbPath), before, 'preflight must refuse an incompatible snapshot without repairing source')
-    assert.deepEqual(readdirSync(f.root), listing)
-  })
+  } else {
+    await assert.rejects(api().preflight({ root: f.root }), { code: 'E_OPERATIONS_SCHEMA' },
+      'preflight must refuse an incompatible runtime core schema')
+  }
+  assert.equal(bytes(f.store.dbPath), before, operation + ' must not repair the original database')
+  assert.deepEqual(readdirSync(f.root), listing)
 }
 
-test('doctor and preflight reject a core view with table-shaped columns without repairing source', async t => {
-  const f = fixture(t); seed(f)
-  f.store.handle.exec('ALTER TABLE handoff RENAME TO handoff_rows; CREATE VIEW handoff AS SELECT * FROM handoff_rows')
-  const before = bytes(f.store.dbPath), listing = readdirSync(f.root)
+for (const [table, field] of [['task', 'note'], ['fact', 'statement'], ['fact', 'evidence_path'],
+  ['handoff', 'note'], ['execution_receipt', 'command'], ['execution_waiver', 'reason']]) {
+  for (const operation of ['doctor', 'preflight']) {
+    test(operation + ' rejects missing runtime core column ' + table + '.' + field + ' without source changes', async t => {
+      const f = fixture(t); seed(f)
+      f.store.handle.exec('ALTER TABLE ' + table + ' DROP COLUMN ' + field)
+      await unchangedCoreCheck(f, operation)
+    })
+  }
+}
+
+for (const operation of ['doctor', 'preflight']) {
+  test(operation + ' rejects a core view with table-shaped columns without repairing source', async t => {
+    const f = fixture(t); seed(f)
+    f.store.handle.exec('ALTER TABLE handoff RENAME TO handoff_rows; CREATE VIEW handoff AS SELECT * FROM handoff_rows')
+    await unchangedCoreCheck(f, operation)
+  })
+  for (const declaration of ['INTEGER', "TEXT NOT NULL DEFAULT ''"]) {
+    test(operation + ' rejects malformed submitted_at ' + declaration + ' without repairing source', async t => {
+      const f = fixture(t); seed(f)
+      assert.ok(f.store.handle.prepare('PRAGMA table_info(task)').all().some(column => column.name === 'submitted_at'),
+        'submitted_at fault requires the actual Task2 schema dependency')
+      f.store.handle.exec('ALTER TABLE task DROP COLUMN submitted_at; ALTER TABLE task ADD COLUMN submitted_at ' + declaration)
+      await unchangedCoreCheck(f, operation)
+    })
+  }
+}
+
+test('missing additive submitted_at requires doctor upgrade and preflight adds only an isolated nullable TEXT column', async t => {
+  const f = fixture(t), task = seed(f)
+  f.store.handle.exec('ALTER TABLE task DROP COLUMN submitted_at')
+  const before = bytes(f.store.dbPath), original = tableRows(f.store.handle), listing = readdirSync(f.root)
   const diagnosis = safe(await api().doctor({ root: f.root }))
-  assert.equal(diagnosis.ok, false, 'runtime core objects must be real tables')
+  assert.equal(diagnosis.ok, false)
   assert.ok(diagnosis.checks.some(check => check.code === 'SCHEMA_UPGRADE_REQUIRED'), JSON.stringify(diagnosis))
+  const rehearsal = safe(await api().preflight({ root: f.root }))
+  assert.equal(rehearsal.ok, true)
+  assert.equal(rehearsal.migration_required, true)
+  assert.equal(rehearsal.rows_preserved, true)
   assert.equal(bytes(f.store.dbPath), before)
+  assert.deepEqual(tableRows(f.store.handle), original)
   assert.deepEqual(readdirSync(f.root), listing)
-  await assert.rejects(api().preflight({ root: f.root }), { code: 'E_OPERATIONS_SCHEMA' })
-  assert.equal(bytes(f.store.dbPath), before)
-  assert.deepEqual(readdirSync(f.root), listing)
+  assert.ok(!f.store.handle.prepare('PRAGMA table_info(task)').all().some(column => column.name === 'submitted_at'))
+  assert.equal(original.task[0].id, task.task_id)
 })

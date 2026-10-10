@@ -59,6 +59,7 @@ const TESTS = [
   'execution-receipts.test.mjs',
   'execution-adoption.test.mjs',
   'tool-recovery.test.mjs',
+  'nextgen-tool-integration.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */

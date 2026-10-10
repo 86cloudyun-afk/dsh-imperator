@@ -34,7 +34,7 @@ function fixture(t) {
   return { store, cwd, lead, worker, foreign, call }
 }
 function coding(extra = {}) {
-  return { title: 'bounded coding workflow', objective: 'verify source', scope: 'source.js',
+  return { title: 'bounded coding workflow', objective: 'verify source', scope: ['source.js'],
     deliverables: ['source.js'], non_goals: ['deployment'], dependencies: [],
     verification_files: ['source.js'], verification_command: 'node source.js',
     request_key: 'create-coding', ...extra }

@@ -1,0 +1,65 @@
+name: Same-run density probe
+
+on:
+  push:
+    branches: ['codex/nextgen-density-probe']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  density:
+    name: Density Node ${{ matrix.node }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.23.2', '24.19.0']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Build local statement-counter extension and record source
+        shell: bash
+        run: |
+          set -euo pipefail
+          density_evidence="$RUNNER_TEMP/density-evidence"
+          mkdir -p "$density_evidence"
+          git rev-parse HEAD > "$density_evidence/commit.txt"
+          git rev-parse 'HEAD^{tree}' > "$density_evidence/tree.txt"
+          git ls-tree -r HEAD > "$density_evidence/tracked-tree.txt"
+          git diff --exit-code 5a98f5b93c9e83743e8c0432d8ea177378d5154f HEAD -- lib/
+          git archive --format=tar.gz --output="$density_evidence/source.tar.gz" HEAD
+          if ! test -f /usr/include/sqlite3ext.h; then
+            sudo apt-get update -qq
+            sudo apt-get install -y libsqlite3-dev
+          fi
+          cc -Wall -Wextra -Werror -O2 -fPIC -shared tools/probe-sqlite-status.c -o "$density_evidence/probe_status.so"
+          node --version > "$density_evidence/node.txt"
+          node --check tools/probe-run-density.mjs
+      - name: Measure same-run blocker density
+        shell: bash
+        run: |
+          set -euo pipefail
+          density_evidence="$RUNNER_TEMP/density-evidence"
+          for density_count in 100000 1000000; do
+            for density_statistics in none analyzed; do
+              node tools/probe-run-density.mjs --blockers="$density_count" --rounds=10 --statistics="$density_statistics" --others=terminal --extension="$density_evidence/probe_status.so" | tee "$density_evidence/terminal-$density_count-$density_statistics.jsonl"
+            done
+          done
+          node tools/probe-run-density.mjs --blockers=100000 --rounds=10 --statistics=none --others=active --extension="$density_evidence/probe_status.so" | tee "$density_evidence/active-100000-none.jsonl"
+          sha256sum "$density_evidence/source.tar.gz" "$density_evidence/probe_status.so" "$density_evidence/"*.jsonl > "$density_evidence/SHA256SUMS"
+      - name: Archive exact probe evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: density-${{ github.run_id }}-${{ matrix.node }}
+          path: ${{ runner.temp }}/density-evidence/
+          if-no-files-found: error
+          retention-days: 14

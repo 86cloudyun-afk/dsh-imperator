@@ -1,5 +1,9 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
+import { createHash } from 'node:crypto'
+import { performance } from 'node:perf_hooks'
+import { withWriteTransaction } from '../../lib/store/sqlite.js'
 import { apply as applyStore, TaskforceStore } from '../../lib/store/index.js'
 import { tempStore, seedSubmitted } from './helpers.mjs'
 
@@ -199,4 +203,115 @@ test('reopening a legacy control journal preserves every row and column while re
   t.diagnostic('CONTROL_JOURNAL_MIGRATION ' + JSON.stringify({ before: oldPlan, after: plan }))
   assert.match(plan, /SEARCH o USING .*\(task_id=\?/, 'reopening must restore a task-key lookup')
   assert.equal(reopened.board({ task_id: id }, run).scope_integrity[0].mismatched_controls, 1)
+})
+
+
+test('unassigned audit diagnostics use selective run-key searches with 100k assigned rows', t => {
+  const store = tempStore(t)
+  const scoped = seedSubmitted(store, run), unassigned = seedSubmitted(store), other = seedSubmitted(store, 'scope-b')
+  const insertReceipt = store.handle.prepare('INSERT INTO execution_receipt(receipt_id,task_id,run_id,evidence_generation,owner_session,actor_session,command,cwd,verification_files,status,started_at,call_id,root_call_id,timeout_ms,snapshot,logs) VALUES(?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?)')
+  const insertWaiver = store.handle.prepare('INSERT INTO execution_waiver(task_id,run_id,evidence_generation,actor_session,reason,created_at) VALUES(?,?,0,?,?,?)')
+  const add = (key, task, scope) => {
+    insertReceipt.run(key, task, scope, 'worker', 'worker', 'true', '/tmp', '[]', 'completed', 'now', 'call', 'root', 1000, '{}', null)
+    insertWaiver.run(task, scope, 'lead', 'historical waiver', 'now')
+  }
+  const bulk = (start, end) => withWriteTransaction(store.handle, () => {
+    for (let i = start; i < end; i++) add('assigned-' + i, i % 2 ? scoped : other, i % 2 ? run : 'scope-b')
+  })
+  const auditTables = ['execution_receipt', 'execution_waiver']
+  const fingerprint = db => auditTables.map(table => {
+    const hash = createHash('sha256')
+    let rows = 0
+    for (const row of db.prepare('SELECT * FROM ' + table + ' ORDER BY id').iterate()) {
+      hash.update(JSON.stringify(row) + '\n')
+      rows++
+    }
+    return { table, rows, sha256: hash.digest('hex') }
+  })
+  const columns = db => auditTables.map(table => db.prepare('PRAGMA table_info(' + table + ')').all())
+  const original = DatabaseSync.prototype.prepare, queries = [], totals = []
+  let stage = '', reopened, published
+  const disposers = []
+  const measure = (name, work) => {
+    stage = name
+    const start = performance.now(), result = work()
+    totals.push({ stage, milliseconds: +(performance.now() - start).toFixed(3) })
+    return result
+  }
+  DatabaseSync.prototype.prepare = function (sql) {
+    const statement = original.call(this, sql)
+    if (sql.startsWith('SELECT ') && sql.includes(') AS execution_receipts') && sql.includes(') AS execution_waivers')) {
+      const get = statement.get.bind(statement), db = this
+      statement.get = (...params) => {
+        const start = performance.now(), row = get(...params)
+        const milliseconds = +(performance.now() - start).toFixed(3)
+        const plan = original.call(db, 'EXPLAIN QUERY PLAN ' + sql).all(...params).map(item => item.detail)
+        queries.push({ stage, milliseconds, counts: { ...row }, plan })
+        return row
+      }
+    }
+    return statement
+  }
+  try {
+    bulk(0, 1000)
+    assert.equal(measure('summary-1k-healthy', () => store.unassignedSummary()).execution_receipts, 0)
+    bulk(1000, 100000)
+    const healthy = measure('summary-100k-healthy', () => store.unassignedSummary())
+    assert.equal(healthy.execution_receipts, 0)
+    assert.equal(healthy.execution_waivers, 0)
+    for (const [i, task] of [scoped, unassigned, 999999].entries()) add('null-' + i, task, null)
+    store.handle.prepare("UPDATE execution_receipt SET verification_files='{broken', snapshot='{broken', logs='{broken', status='HISTORICAL_UNKNOWN' WHERE receipt_id='null-2'").run()
+    const expected = { task: 1, fact: 2, handoff: 0, execution_receipts: 3, execution_waivers: 3 }
+    // Exercise migration of an already populated supported journal, not only a fresh index.
+    for (const table of auditTables) for (const index of store.handle.prepare('PRAGMA index_list(' + table + ')').all()) {
+      const escaped = index.name.replaceAll('"', '""')
+      const keys = store.handle.prepare('PRAGMA index_info("' + escaped + '")').all()
+      if (index.partial && keys[0]?.name === 'run_id') store.handle.exec('DROP INDEX "' + escaped + '"')
+    }
+    const before = fingerprint(store.handle), beforeColumns = columns(store.handle)
+    assert.deepEqual(before.map(item => item.rows), [100003, 100003])
+    const migration = measure('migrate-100k', () => store.migrate(store.handle, false))
+    assert.deepEqual(migration.unassigned, expected)
+    assert.deepEqual(migration.added_columns, [])
+    assert.deepEqual(fingerprint(store.handle), before)
+    store.close()
+    reopened = new TaskforceStore(store.root)
+    measure('open-100k', () => reopened.open())
+    assert.deepEqual(reopened.migration.unassigned, expected)
+    assert.deepEqual(reopened.migration.added_columns, [])
+    assert.deepEqual(columns(reopened.handle), beforeColumns)
+    assert.deepEqual(fingerprint(reopened.handle), before, 'open preserves all serialized audit row bytes')
+    assert.deepEqual(reopened.handle.prepare("PRAGMA index_info('idx_control_task')").all().map(row => row.name), ['task_id', 'run_id'])
+    reopened.close()
+    const warnings = []
+    measure('apply-boot-100k', () => applyStore({
+      logger: { info() {}, warn(message) { warnings.push(message) } },
+      effect(callback) { disposers.push(callback()) },
+      provide(name, value) { if (name === 'taskforceStore') published = value },
+    }, { root: store.root }))
+    assert.ok(published)
+    assert.equal(warnings.length, 1)
+    assert.match(warnings[0], /execution_receipts=3/)
+    assert.match(warnings[0], /execution_waivers=3/)
+    assert.deepEqual(fingerprint(published.handle), before)
+    assert.throws(() => published.acceptTask({ task_id: scoped, waiver_reason: 'manual' }, run, 'lead'), { code: 'E_STORE_INTEGRITY' })
+    const adopted = measure('adopt-100k', () => published.adoptUnassigned('adopted'))
+    assert.equal(adopted.execution_receipts, 1)
+    assert.equal(adopted.execution_waivers, 1)
+    assert.equal(published.unassignedSummary().execution_receipts, 2)
+    assert.equal(published.unassignedSummary().execution_waivers, 2)
+    assert.equal(published.handle.prepare("SELECT run_id FROM execution_receipt WHERE receipt_id='null-0'").get().run_id, null)
+    assert.equal(published.handle.prepare("SELECT snapshot FROM execution_receipt WHERE receipt_id='null-2'").get().snapshot, '{broken')
+  } finally {
+    DatabaseSync.prototype.prepare = original
+    for (const dispose of disposers) dispose?.()
+    reopened?.close()
+  }
+  t.diagnostic('UNASSIGNED_AUDIT_SCALE ' + JSON.stringify({ assignedRowsPerTable: 100000, nullRowsPerTable: 3, totals, queries }))
+  assert.ok(queries.some(query => query.stage === 'open-100k'))
+  assert.ok(queries.some(query => query.stage === 'apply-boot-100k'))
+  for (const query of queries) for (const table of auditTables) {
+    assert.match(query.plan.join('\n'), new RegExp('SEARCH ' + table + ' USING .*\\(run_id=\\?'),
+      'each audit count must select its NULL run range instead of visiting assigned history')
+  }
 })

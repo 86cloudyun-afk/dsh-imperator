@@ -1,6 +1,6 @@
 # Task 6: Control journal degradation fence
 
-Status: implemented and revised after actual PR 62 review on isolated branch `codex/audit-control-journal-fence`; no PR, merge or main/other-branch mutation.
+Status: latest Task6 source candidate b3dc0d7d7d10e5fdc3dd983c9fd632cadd79b146 has six exact-head GREEN jobs with full logs read, after actual PR62 boundary reviews. Work remains isolated on `codex/audit-control-journal-fence`; this implementer created no PR and performed no merge or main/other-branch mutation. Root owns final integration and release review.
 
 Requirements: [task-6 brief](../../plans/2026-10-10-imperator-audit/task-6-brief.md) and [linked audit design](../../specs/2026-10-10-imperator-comprehensive-audit-design.md), read at `234a7896e44b8d4e19608e3c80ef44a982ddc6ff`. Production baseline: `81b7ce67114f96ebcd05b257571ce8a6bc9e68c7`. The environment failed before exposing shell; all edits used structured GitHub tree/commit/ref operations with expected-SHA leases, and all runtime evidence is real GitHub Actions. The repository tree has no AGENTS.md.
 
@@ -232,3 +232,298 @@ for (const action of ['send', 'stop']) {
 ```
 
 Only the report is changed after the revised source GREEN commit. Its final candidate head/tree/report blob are returned separately; under root's existing handoff rule the repeated report-only matrix and aggregate/PR/main checks are owned by root. The conservative journal-object binding and genuinely detached lack of replay protection remain the documented limitations. Preserve the direct control reader when integrating tools/index; do not reintroduce the obsolete shared-resolver failure callback.
+
+## Actual PR 62 revision: synchronous durable reply validation
+
+The new actual-PR thread [discussion 4236848441](https://github.com/86cloudyun-afk/dsh-imperator/pull/62#discussion_r4236848441), thread ID `PRRT_kwDOU4Tz5s6rCD5x`, identified another mounted-journal boundary. At the previous candidate `1a6bf2d8f0873cfbde7f4d40c2cfaef61b96ad6e`, callable beginControl returning undefined/null/Promise/incomplete data was blindly spread. The resulting operation had only retry_key and the default `invoke !== false` path called sendMessage/interrupt without a validated durable intent. FinishControl also blindly spread invalid results after a host effect, reporting success with no confirmed outcome. This revision addresses both phases through their shared control boundary. Child send is the resume path; there is no separate task_child_resume API.
+
+The real API was inspected at recovery source blob `f835b2efa38ad23a9988f0570fda6ed3c65633d9` and fixed tools baseline blob `80fa5f11a65c6f8451e1d46fac4b4c3fc41889e7`. beginControl new results are exactly the legal short envelope `{operation_id, invoke:true, replayed:false, durable:true, status:"pending"}` (recovery.js:199). Replay returns publicOperation's full row plus invoke:false/replayed:true/durable:true (line194). Finish returns the full row plus replayed boolean/durable:true, including an immutable matching settled replay (lines202–220). New-intent validation therefore does not require action/caller/target/run/id/process fields absent from the actual new API.
+
+### Distinguishing runtime tests and accurate RED history
+
+Added 238 cases in the existing tool-recovery file: 214 negative regressions and 24 legitimate API controls. All use the actual production tools dispatcher and temporary real SQLite, with only context/service publication and native effect endpoints as counted fixtures. The malformed reply is deliberately injected at the mounted recovery method boundary; this is not a claim that the unmodified TaskforceRecovery or pinned SDK emits those malformed values. Existing actual pinned-native Cordis tests continue to run unchanged.
+
+Before production changes:
+
+- Tests-only `fd6e9e29792434e04670fc389693813fc87d293d`, tree `9233b8eccbf0f46dda1e7fc2938cbed0a5ceb136`, [run38035048257](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38035048257): 230 new cases. All six full logs read. Offline1116 total /902 pass /208 fail /6 skip; native1116 /896 pass /208 fail /12 skip. There were206 intended negative failures and two fixture errors, so this round is **not accepted RED**.
+- Tests-only `21e95db757b73248618a82d594750af02163e2eb`, tree `707a4a34b5eb904a1f4242524fc599f49b7e3c70`, [run38035219502](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38035219502): added8 isolated rejected-Promise child regressions. All six full logs read. Offline1124 /902 pass /216 fail /6 skip; native1124 /896 pass /216 fail /12 skip. There were214 intended negative failures plus the same two fixture errors; also **not accepted RED**.
+- The fixture's depth1 missing-parent control still correctly derives the root run from its trusted parent's ID. The two failed positive names were `real unattributed direct-caller envelope remains valid for send` and `real unattributed direct-caller envelope remains valid for stop`. Corrected only this fixture to depth2, where ancestry is genuinely unattributed.
+- Effective tests-only `04aacf36b54ecb4e3ebe0855158178c5170c683d`, tree `79aff28c629afe3f0b60e73fbe244e0cc92534ca`, [run38035485460](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38035485460): all six full logs read; identical214 failures in each matrix and all24 new legal controls passed. Offline1124 /904 pass /214 fail /6 skip; native1124 /898 pass /214 fail /12 skip. Native boundaries46/46, HOST17/17 and isolation13/13 passed. Cancelled0 everywhere. All four native jobs and their full valid RED logs were observed before the production patch; the two slower offline jobs completed and were read after that source push. The production tools blob remained80fa5f11… throughout all three tests-only heads.
+
+| Effective RED matrix | job ID |
+|---|---:|
+| offline22.23.2 |114164921082|
+| offline24.19.0 |114164921255|
+| native22.23.2 /rc.2 |114164921257|
+| native22.23.2 /alpha.2 |114164921239|
+| native24.19.0 /rc.2 |114164921212|
+| native24.19.0 /alpha.2 |114164921323|
+
+Begin-negative variants cover undefined, null, Promise.resolve, a promise decorated with apparently valid fields, an ordinary thenable, empty/short/incomplete data, non-boolean invoke, missing durability/status, and inconsistent new/replay flags. Both actions cross explicit key, trusted coordinates and unavailable coordinates. A real begin first commits pending before its reply is corrupted, ensuring the computed key must be preserved even if no key was supplied. Assertions require zero host effects, stable unavailable diagnostics with only the original retry_key (no claimed durable/status), one actual pending row, and a read-only original-key pending replay after restoring the same journal. Full replay mutations independently test caller/action/target/run/row/process binding.
+
+Finish-negative variants require exactly one host effect followed by E_CONTROL_OUTCOME_UNKNOWN with the original validated pending intent/key and no acceptance receipt. Restoring the method and reusing that key returns pending read-only. Additional cases commit the real accepted outcome *before* corrupting the response; the first response must remain unknown while the original-key follow-up correctly reads accepted, still with one host effect. Thus an invalid return cannot establish that SQLite persistence failed. Host-exception plus malformed-finish cases likewise preserve the original intent/key and prohibit new-key repetition.
+
+Eight independent Node subprocesses run `--unhandled-rejections=strict` for send/stop ×begin/finish ×native/cross-realm Promise.reject(privateError). Cross-realm uses node:vm's runInNewContext. Each child executes the actual dispatcher and real SQLite, yields one event-loop turn and checks the row/key. Effective RED exits1 with the intentional PRIVATE_ASYNC_REPLY sentinel; GREEN must exit0, expose no private sentinel, retain actual pending and preserve zero begin effects or one finish effect. No rejection handler is installed by the test to mask the process failure, and no acceptance/cleanup or CI timeout is changed.
+
+The24 positive controls cover legal five-field new intent plus accepted replay for both actions/all three key modes, actual SQLite failed-outcome-write pending replay, all four real full replay statuses, real immutable finish replay and broken depth2 ancestry producing caller-scoped run_id:null. Existing accepted/pending/rejected/unknown behavior remains intact.
+
+### Minimal phase-specific fix
+
+The source patch snapshots only known control fields once inside a guarded boundary. It validates synchronous non-array object replies; durable:true, strict boolean invoke/replayed and pending new status are required. Replay additionally validates the full public operation and trusted caller/run/action/target tuple. Only a mounted ticket with invoke===true reaches an external effect. Task/evidence fields are null because these tools never pass task_id. Text validation matches the actual API's nonempty/NUL-free/256-UTF8-byte rule; finish error-code normalization matches its actual four-code allowlist.
+
+Native promises are detected with the built-in node:util/types.isPromise, which recognizes cross-realm promises. Promise.prototype.then.call installs fulfillment/rejection consumption on an already-started promise, then the protocol is immediately rejected. Its eventual value is never awaited or used to authorize effects. Ordinary thenables are rejected without invoking their then method. This keeps the real synchronous API intact and prevents unhandled rejection from the invalid return.
+
+Finish validation requires the full bound public operation, the original operation_id, the requested status and normalized message/error fields. Invalid return, getter failure or write failure yields E_CONTROL_OUTCOME_UNKNOWN with the last confirmed intent and original retry key, dropping arbitrary adapter fields/private diagnostics and all effect receipts. Since a committed outcome can precede a lost/bad reply, the final error says “结算写入或回包无法确认”, and its hint explicitly describes the returned intent as the last confirmed state rather than an assertion that the database remains pending. Restore/read the original key; never replace it.
+
+Existing readControlJournal authoritative get/normal-undefined behavior, explicit-null refusal, journal object continuity, exact key hashing, legitimate detached keyless controls and fixed unknown-effect/no-new-key hints remain. Ordinary service resolution and other modules are untouched. No native shared-file change was needed in this round; the prior six-case appended hunk and Task4 integration boundary above still apply unchanged.
+
+### Exact latest source verification
+
+First production patch `107907881633875981dedb2053af9c44226b80b2`, tree `87803b3d8a2dd232035a8c6be725bc2f5d6265ef`, [run38035739123](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38035739123). All six full logs from that first patch were read: offline1124/1118 pass/0 fail/6 skip; native1124/1112 pass/0 fail/12 skip plus native boundaries46/46, cancelled0 throughout. Root's source review requested the more precise settlement error text above. Latest source `b3dc0d7d7d10e5fdc3dd983c9fd632cadd79b146`, tree `078175262458a9c9173bf70c715cc1750db680c2`, parent107907… changes only that error string; the following results are from the **latest source**, not inferred from the preceding run.
+
+Latest source [run38035848255](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38035848255) completed all six jobs successfully; every full exact-head log was read. Offline unit1124 total /1118 pass /0 fail /6 skip; native unit1124 /1112 pass /0 fail /12 skip plus native boundaries46/46, HOST17/17 and isolation13/13. Cancelled0 in every suite. All214 accepted RED negatives now pass, all24 real API controls still pass, and all8 strict rejected-Promise children exit0 without the private sentinel. Both Node versions run; the two native host pins are actual installed rc.2/alpha.2. Packed/native and checkout/offline acceptance remain; paid/model requests0, containment adapter remains closed.
+
+| Latest GREEN matrix | job ID | unit total/pass/fail/skip | native boundaries |
+|---|---:|---|---|
+|offline (24.19.0)|114165978767|1124/1118/0/6|—|
+|native-host (22.23.2, 0.2.1-alpha.2)|114165978916|1124/1112/0/12|46/46|
+|native-host (22.23.2, 0.2.0-rc.2)|114165978933|1124/1112/0/12|46/46|
+|offline (22.23.2)|114165978942|1124/1118/0/6|—|
+|native-host (24.19.0, 0.2.1-alpha.2)|114165979038|1124/1112/0/12|46/46|
+|native-host (24.19.0, 0.2.0-rc.2)|114165979048|1124/1112/0/12|46/46|
+
+
+Current source owned-file manifest (the report-only final blob/head/tree are returned separately):
+
+| File | blob |
+|---|---|
+| `docs/CONTROL.md` | `199ed9904292765fa4148a9bb0bcba9b776588e2` |
+| `docs/RECOVERY.md` | `22de4f569357de8df9fc28c20081963796820b8c` |
+| `lib/tools/index.js` | `c38e833c1567e9ea63befec406a193eabaf6c0a1` |
+| `tools/tests/host-boundaries.test.mjs` | `f795eb5359e9a4abb1623d37d174887544b6d7c9` |
+| `tools/tests/nextgen-tool-integration.test.mjs` | `41c13c88396a37ef8c2c124bacaf1f641ce3a408` |
+| `tools/tests/tool-recovery.test.mjs` | `8770574e655daf4a0034d6d317fef892e3678869` |
+| `tools/verify-child-control.mjs` | `99d8e14e71b03653719e91dacba0043a120d4f77` |
+
+The complete191-entry source tree was inspected (truncated:false). Relative to1a6bf2d8…, only tools/index, existing tool-recovery tests and CONTROL/RECOVERY changed. No shared host file mutation, Task4 source copy, store/workflow/governor/guard/package/workflow/version/main/PR mutation occurred. The workflow blob remains31b60b2e6372e518bc8e80c99f4e19634e580fda and the original60s acceptance/12s cleanup remain. No cloud shell, production deployment, paid model request or incident/crash cause is claimed. Replacing a journal still requires controller verification/reactivation; genuinely detached controls still lack replay protection. Same-UID edits and a shape-valid adapter lying about its database are outside this API-boundary guarantee.
+
+### All214 effective RED failure names
+
+These names were read from each of the six full effective RED logs and their deduplicated sets are identical. The206 original malformed-envelope negatives are included here; the two fixture-positive failures above separately record the earlier208/216 rounds.
+
+- invalid begin undefined blocks send with explicit key
+- invalid begin null blocks send with explicit key
+- invalid begin promise blocks send with explicit key
+- invalid begin decorated promise blocks send with explicit key
+- invalid begin thenable blocks send with explicit key
+- invalid begin empty blocks send with explicit key
+- invalid begin missing operation id blocks send with explicit key
+- invalid begin empty operation id blocks send with explicit key
+- invalid begin missing invoke blocks send with explicit key
+- invalid begin null invoke blocks send with explicit key
+- invalid begin string invoke blocks send with explicit key
+- invalid begin numeric invoke blocks send with explicit key
+- invalid begin missing status blocks send with explicit key
+- invalid begin not durable blocks send with explicit key
+- invalid begin new accepted blocks send with explicit key
+- invalid begin new replayed blocks send with explicit key
+- invalid begin short replay blocks send with explicit key
+- invalid finish undefined keeps send unknown with explicit key
+- invalid finish null keeps send unknown with explicit key
+- invalid finish promise keeps send unknown with explicit key
+- invalid finish decorated promise keeps send unknown with explicit key
+- invalid finish thenable keeps send unknown with explicit key
+- invalid finish empty keeps send unknown with explicit key
+- invalid finish short intent keeps send unknown with explicit key
+- invalid finish wrong operation keeps send unknown with explicit key
+- invalid finish wrong status keeps send unknown with explicit key
+- invalid finish wrong message keeps send unknown with explicit key
+- invalid finish not durable keeps send unknown with explicit key
+- invalid finish missing row identity keeps send unknown with explicit key
+- invalid finish wrong caller keeps send unknown with explicit key
+- invalid finish wrong target keeps send unknown with explicit key
+- invalid begin undefined blocks send with trusted coordinates
+- invalid begin null blocks send with trusted coordinates
+- invalid begin promise blocks send with trusted coordinates
+- invalid begin decorated promise blocks send with trusted coordinates
+- invalid begin thenable blocks send with trusted coordinates
+- invalid begin empty blocks send with trusted coordinates
+- invalid begin missing operation id blocks send with trusted coordinates
+- invalid begin empty operation id blocks send with trusted coordinates
+- invalid begin missing invoke blocks send with trusted coordinates
+- invalid begin null invoke blocks send with trusted coordinates
+- invalid begin string invoke blocks send with trusted coordinates
+- invalid begin numeric invoke blocks send with trusted coordinates
+- invalid begin missing status blocks send with trusted coordinates
+- invalid begin not durable blocks send with trusted coordinates
+- invalid begin new accepted blocks send with trusted coordinates
+- invalid begin new replayed blocks send with trusted coordinates
+- invalid begin short replay blocks send with trusted coordinates
+- invalid finish undefined keeps send unknown with trusted coordinates
+- invalid finish null keeps send unknown with trusted coordinates
+- invalid finish promise keeps send unknown with trusted coordinates
+- invalid finish decorated promise keeps send unknown with trusted coordinates
+- invalid finish thenable keeps send unknown with trusted coordinates
+- invalid finish empty keeps send unknown with trusted coordinates
+- invalid finish short intent keeps send unknown with trusted coordinates
+- invalid finish wrong operation keeps send unknown with trusted coordinates
+- invalid finish wrong status keeps send unknown with trusted coordinates
+- invalid finish wrong message keeps send unknown with trusted coordinates
+- invalid finish not durable keeps send unknown with trusted coordinates
+- invalid finish missing row identity keeps send unknown with trusted coordinates
+- invalid finish wrong caller keeps send unknown with trusted coordinates
+- invalid finish wrong target keeps send unknown with trusted coordinates
+- invalid begin undefined blocks send with no coordinates
+- invalid begin null blocks send with no coordinates
+- invalid begin promise blocks send with no coordinates
+- invalid begin decorated promise blocks send with no coordinates
+- invalid begin thenable blocks send with no coordinates
+- invalid begin empty blocks send with no coordinates
+- invalid begin missing operation id blocks send with no coordinates
+- invalid begin empty operation id blocks send with no coordinates
+- invalid begin missing invoke blocks send with no coordinates
+- invalid begin null invoke blocks send with no coordinates
+- invalid begin string invoke blocks send with no coordinates
+- invalid begin numeric invoke blocks send with no coordinates
+- invalid begin missing status blocks send with no coordinates
+- invalid begin not durable blocks send with no coordinates
+- invalid begin new accepted blocks send with no coordinates
+- invalid begin new replayed blocks send with no coordinates
+- invalid begin short replay blocks send with no coordinates
+- invalid finish undefined keeps send unknown with no coordinates
+- invalid finish null keeps send unknown with no coordinates
+- invalid finish promise keeps send unknown with no coordinates
+- invalid finish decorated promise keeps send unknown with no coordinates
+- invalid finish thenable keeps send unknown with no coordinates
+- invalid finish empty keeps send unknown with no coordinates
+- invalid finish short intent keeps send unknown with no coordinates
+- invalid finish wrong operation keeps send unknown with no coordinates
+- invalid finish wrong status keeps send unknown with no coordinates
+- invalid finish wrong message keeps send unknown with no coordinates
+- invalid finish not durable keeps send unknown with no coordinates
+- invalid finish missing row identity keeps send unknown with no coordinates
+- invalid finish wrong caller keeps send unknown with no coordinates
+- invalid finish wrong target keeps send unknown with no coordinates
+- invalid replay wrong caller is refused for send
+- invalid replay wrong action is refused for send
+- invalid replay wrong target is refused for send
+- invalid replay wrong run is refused for send
+- invalid replay missing row id is refused for send
+- invalid replay missing process is refused for send
+- committed outcome with invalid finish undefined retains send original key
+- host exception and invalid finish undefined preserve send unknown intent
+- committed outcome with invalid finish promise retains send original key
+- host exception and invalid finish promise preserve send unknown intent
+- invalid begin undefined blocks stop with explicit key
+- invalid begin null blocks stop with explicit key
+- invalid begin promise blocks stop with explicit key
+- invalid begin decorated promise blocks stop with explicit key
+- invalid begin thenable blocks stop with explicit key
+- invalid begin empty blocks stop with explicit key
+- invalid begin missing operation id blocks stop with explicit key
+- invalid begin empty operation id blocks stop with explicit key
+- invalid begin missing invoke blocks stop with explicit key
+- invalid begin null invoke blocks stop with explicit key
+- invalid begin string invoke blocks stop with explicit key
+- invalid begin numeric invoke blocks stop with explicit key
+- invalid begin missing status blocks stop with explicit key
+- invalid begin not durable blocks stop with explicit key
+- invalid begin new accepted blocks stop with explicit key
+- invalid begin new replayed blocks stop with explicit key
+- invalid begin short replay blocks stop with explicit key
+- invalid finish undefined keeps stop unknown with explicit key
+- invalid finish null keeps stop unknown with explicit key
+- invalid finish promise keeps stop unknown with explicit key
+- invalid finish decorated promise keeps stop unknown with explicit key
+- invalid finish thenable keeps stop unknown with explicit key
+- invalid finish empty keeps stop unknown with explicit key
+- invalid finish short intent keeps stop unknown with explicit key
+- invalid finish wrong operation keeps stop unknown with explicit key
+- invalid finish wrong status keeps stop unknown with explicit key
+- invalid finish wrong message keeps stop unknown with explicit key
+- invalid finish not durable keeps stop unknown with explicit key
+- invalid finish missing row identity keeps stop unknown with explicit key
+- invalid finish wrong caller keeps stop unknown with explicit key
+- invalid finish wrong target keeps stop unknown with explicit key
+- invalid begin undefined blocks stop with trusted coordinates
+- invalid begin null blocks stop with trusted coordinates
+- invalid begin promise blocks stop with trusted coordinates
+- invalid begin decorated promise blocks stop with trusted coordinates
+- invalid begin thenable blocks stop with trusted coordinates
+- invalid begin empty blocks stop with trusted coordinates
+- invalid begin missing operation id blocks stop with trusted coordinates
+- invalid begin empty operation id blocks stop with trusted coordinates
+- invalid begin missing invoke blocks stop with trusted coordinates
+- invalid begin null invoke blocks stop with trusted coordinates
+- invalid begin string invoke blocks stop with trusted coordinates
+- invalid begin numeric invoke blocks stop with trusted coordinates
+- invalid begin missing status blocks stop with trusted coordinates
+- invalid begin not durable blocks stop with trusted coordinates
+- invalid begin new accepted blocks stop with trusted coordinates
+- invalid begin new replayed blocks stop with trusted coordinates
+- invalid begin short replay blocks stop with trusted coordinates
+- invalid finish undefined keeps stop unknown with trusted coordinates
+- invalid finish null keeps stop unknown with trusted coordinates
+- invalid finish promise keeps stop unknown with trusted coordinates
+- invalid finish decorated promise keeps stop unknown with trusted coordinates
+- invalid finish thenable keeps stop unknown with trusted coordinates
+- invalid finish empty keeps stop unknown with trusted coordinates
+- invalid finish short intent keeps stop unknown with trusted coordinates
+- invalid finish wrong operation keeps stop unknown with trusted coordinates
+- invalid finish wrong status keeps stop unknown with trusted coordinates
+- invalid finish wrong message keeps stop unknown with trusted coordinates
+- invalid finish not durable keeps stop unknown with trusted coordinates
+- invalid finish missing row identity keeps stop unknown with trusted coordinates
+- invalid finish wrong caller keeps stop unknown with trusted coordinates
+- invalid finish wrong target keeps stop unknown with trusted coordinates
+- invalid begin undefined blocks stop with no coordinates
+- invalid begin null blocks stop with no coordinates
+- invalid begin promise blocks stop with no coordinates
+- invalid begin decorated promise blocks stop with no coordinates
+- invalid begin thenable blocks stop with no coordinates
+- invalid begin empty blocks stop with no coordinates
+- invalid begin missing operation id blocks stop with no coordinates
+- invalid begin empty operation id blocks stop with no coordinates
+- invalid begin missing invoke blocks stop with no coordinates
+- invalid begin null invoke blocks stop with no coordinates
+- invalid begin string invoke blocks stop with no coordinates
+- invalid begin numeric invoke blocks stop with no coordinates
+- invalid begin missing status blocks stop with no coordinates
+- invalid begin not durable blocks stop with no coordinates
+- invalid begin new accepted blocks stop with no coordinates
+- invalid begin new replayed blocks stop with no coordinates
+- invalid begin short replay blocks stop with no coordinates
+- invalid finish undefined keeps stop unknown with no coordinates
+- invalid finish null keeps stop unknown with no coordinates
+- invalid finish promise keeps stop unknown with no coordinates
+- invalid finish decorated promise keeps stop unknown with no coordinates
+- invalid finish thenable keeps stop unknown with no coordinates
+- invalid finish empty keeps stop unknown with no coordinates
+- invalid finish short intent keeps stop unknown with no coordinates
+- invalid finish wrong operation keeps stop unknown with no coordinates
+- invalid finish wrong status keeps stop unknown with no coordinates
+- invalid finish wrong message keeps stop unknown with no coordinates
+- invalid finish not durable keeps stop unknown with no coordinates
+- invalid finish missing row identity keeps stop unknown with no coordinates
+- invalid finish wrong caller keeps stop unknown with no coordinates
+- invalid finish wrong target keeps stop unknown with no coordinates
+- invalid replay wrong caller is refused for stop
+- invalid replay wrong action is refused for stop
+- invalid replay wrong target is refused for stop
+- invalid replay wrong run is refused for stop
+- invalid replay missing row id is refused for stop
+- invalid replay missing process is refused for stop
+- committed outcome with invalid finish undefined retains stop original key
+- host exception and invalid finish undefined preserve stop unknown intent
+- committed outcome with invalid finish promise retains stop original key
+- host exception and invalid finish promise preserve stop unknown intent
+- rejected native promise from begin does not crash send
+- rejected cross realm promise from begin does not crash send
+- rejected native promise from finish does not crash send
+- rejected cross realm promise from finish does not crash send
+- rejected native promise from begin does not crash stop
+- rejected cross realm promise from begin does not crash stop
+- rejected native promise from finish does not crash stop
+- rejected cross realm promise from finish does not crash stop
+
+After latest source verification only this report is committed. Root owns independent source/diff review, shared-hunk integration, repeated report-only matrix if desired, final aggregate/actual-PR audits and expected-head merge; this implementer does not merge or create PRs.

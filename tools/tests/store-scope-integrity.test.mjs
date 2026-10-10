@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { apply as applyStore } from '../../lib/store/index.js'
+import { apply as applyStore, TaskforceStore } from '../../lib/store/index.js'
 import { tempStore, seedSubmitted } from './helpers.mjs'
 
 const run = 'scope-a'
@@ -165,4 +165,38 @@ test('healthy recovery integrity keeps the existing compact total shape', t => {
   const store = tempStore(t)
   seedSubmitted(store, run)
   assert.deepEqual({ ...store.boardPage({}, run).scope_integrity_totals }, { mismatched_facts: 0, mismatched_handoffs: 0 })
+})
+
+
+test('reopening a legacy control journal preserves every row and column while restoring task lookup', t => {
+  const store = tempStore(t), id = seedSubmitted(store, run)
+  const insert = store.handle.prepare('INSERT INTO control_operation(operation_id,caller_session,request_key,run_id,task_id,evidence_generation,action,target_id,payload_hash,process_instance,status,created_at) VALUES(?,?,?,?,?,0,?,?,?,?,?,?)')
+  for (const [key, scope, task] of [['matched', run, id], ['foreign', null, id], ['detached', null, null]]) {
+    insert.run(key, ' 真实 caller ', key, scope, task, 'send', ' child ', '0'.repeat(64), 'test', 'unknown', '2025-01-01')
+  }
+  // Simulate an existing supported journal created before task lookup was indexed.
+  for (const index of store.handle.prepare("PRAGMA index_list('control_operation')").all()) {
+    const escaped = index.name.replaceAll('"', '""')
+    const columns = store.handle.prepare('PRAGMA index_info("' + escaped + '")').all()
+    if (columns[0]?.name === 'task_id') store.handle.exec('DROP INDEX "' + escaped + '"')
+  }
+  const tables = ['task', 'fact', 'handoff', 'control_operation', 'task_event', 'task_checkpoint']
+  const rows = db => tables.map(table => JSON.stringify(db.prepare('SELECT * FROM ' + table + ' ORDER BY id').all()))
+  const columns = db => tables.map(table => db.prepare('PRAGMA table_info(' + table + ')').all())
+  const beforeRows = rows(store.handle), beforeColumns = columns(store.handle)
+  const oldPlan = store.handle.prepare('EXPLAIN QUERY PLAN SELECT COUNT(*) FROM control_operation o WHERE o.task_id=? AND o.run_id IS NOT ?')
+    .all(id, run).map(row => row.detail).join('\n')
+  assert.match(oldPlan, /\bSCAN o\b/, 'fixture must have the former unindexed access path')
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  t.after(() => reopened.close())
+  reopened.open()
+  assert.deepEqual(rows(reopened.handle), beforeRows, 'migration preserves all serialized row bytes')
+  assert.deepEqual(columns(reopened.handle), beforeColumns, 'adding an access path changes no physical columns')
+  assert.deepEqual(reopened.migration.added_columns, [])
+  const plan = reopened.handle.prepare('EXPLAIN QUERY PLAN SELECT COUNT(*) FROM control_operation o WHERE o.task_id=? AND o.run_id IS NOT ?')
+    .all(id, run).map(row => row.detail).join('\n')
+  t.diagnostic('CONTROL_JOURNAL_MIGRATION ' + JSON.stringify({ before: oldPlan, after: plan }))
+  assert.match(plan, /SEARCH o USING .*\(task_id=\?/, 'reopening must restore a task-key lookup')
+  assert.equal(reopened.board({ task_id: id }, run).scope_integrity[0].mismatched_controls, 1)
 })

@@ -179,6 +179,8 @@ token 绑定实际 run、逻辑集合、有效 task 筛选、首轮候选 ID 上
 
 分页默认/摘要用 `scope_integrity_totals` 报告全域异常，不随当前页消失；保留 mismatched_facts/mismatched_handoffs，执行/恢复审计异常时新增正数 mismatched_receipts/mismatched_waivers/mismatched_events/mismatched_checkpoints/mismatched_controls（缺省按0）。`scope_integrity_note` 指向 task_id 详情的逐任务异常列表，旧宿主 `board.scope_integrity` 同样报告这些审计异常数量。异域回执/豁免原文隐藏，验收在人工豁免和证据路径之前以 `E_STORE_INTEGRITY` 拒绝。
 
+control 归属异常统计按父任务查找；迁移在恢复表建好后增加覆盖索引 `idx_control_task(task_id,run_id)`，避免分页总计与兼容详情对每个任务全扫 control 日志。旧库重开幂等补索引，原行与列不变。它是查询访问路径，doctor 的数据可读 schema 闸门不因缺此性能索引而拒绝旧库；preflight 会在隔离副本实际迁移并记录 schema 变化。
+
 迁移诊断 `migration.unassigned`、`unassignedSummary()` 与 boot 警告共用 task/fact/handoff/execution_receipts/execution_waivers 五表口径。已归属父任务上的 NULL-run receipt/waiver 也会告警，但继续隔离，`adoptUnassigned` 不会吸收它们；须管理员人工核对归属。
 
 `adoptUnassigned` 在同一写事务中先按原本 `task.run_id IS NULL` 的父任务迁移 NULL-run 执行回执与豁免，再迁移任务及既有事实/交接。它只改变审计归属，不改变 owner、generation、命令、快照、结果或日志；已归属任务上的 NULL/异域审计保留异常，不自动纳入。原本未归属任务如附有已归属的执行审计，接管在任何迁移前以 `E_STORE_INTEGRITY` 拒绝，避免父任务移动让异常审计重新可见；须管理员核对修复。任一步写入失败回滚全部五张表与迁移诊断。人工豁免仍是非验证通过，旧失败、pending 或旧代回执不会因接管而变成有效依据。

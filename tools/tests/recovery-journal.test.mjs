@@ -21,7 +21,8 @@ function available(recovery) {
   return recovery
 }
 function toolsHarness(store, { live, send, stop, parentSession } = {}) {
-  const agent = { id: 'root', session: { header: { id: 'root', version: 4, ...(parentSession ? { parentSession, origin: 'subagent', delegationDepth: 2 } : {}) } } }
+  const events = [{ type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } }]
+  const agent = { id: 'root', session: { events, header: { id: 'root', version: 4, ...(parentSession ? { parentSession, origin: 'subagent', delegationDepth: 2 } : {}) } } }
   const definitions = new Map()
   let sends = 0, stops = 0
   const subagents = {
@@ -39,6 +40,7 @@ function toolsHarness(store, { live, send, stop, parentSession } = {}) {
     call(name, args, key = 'call-1') {
       return definitions.get(name).execute(args, { agent, callId: key, signal: new AbortController().signal }).then(JSON.parse)
     },
+    events,
     get sends() { return sends }, get stops() { return stops },
   }
 }
@@ -268,4 +270,36 @@ test('control task attribution requires matching run and actor ownership', t => 
   const operation = recovery.beginControl({ ...intent, task_id }, { ...authority, isRoot: true })
   assert.equal(operation.invoke, true)
   assert.equal(recovery.inspect({ task_id }, 'root').operations[0].task_id, task_id)
+})
+
+test('reused provider callId in another durable step is a new action', async t => {
+  const { store } = fixture(t)
+  const h = toolsHarness(store)
+  await h.call('task_child_send', { target_id: 'worker', message: 'first' })
+  h.events.push({ type: 'step/start', data: { turn: 1, step: 2 } })
+  const result = await h.call('task_child_send', { target_id: 'worker', message: 'second' })
+  assert.equal(result.ok, true)
+  assert.equal(h.sends, 2)
+})
+test('missing durable call coordinates use new explicit retry keys', async t => {
+  const { store } = fixture(t)
+  const h = toolsHarness(store)
+  h.events.length = 0
+  const first = await h.call('task_child_send', { target_id: 'worker', message: 'repeat deliberately' })
+  const second = await h.call('task_child_send', { target_id: 'worker', message: 'repeat deliberately' })
+  assert.equal(h.sends, 2)
+  assert.equal(typeof first.operation.retry_key, 'string')
+  assert.notEqual(first.operation.retry_key, second.operation.retry_key)
+  const replay = await h.call('task_child_send', { target_id: 'worker', message: 'repeat deliberately', request_key: first.operation.retry_key })
+  assert.equal(replay.operation.replayed, true)
+  assert.equal(h.sends, 2)
+})
+test('failed outcome persistence returns safe operation identity for reconciliation', async t => {
+  const { store } = fixture(t)
+  store.open().exec("CREATE TRIGGER failed_receipt BEFORE UPDATE ON control_operation BEGIN SELECT RAISE(ABORT, 'SECRET error'); END")
+  const h = toolsHarness(store)
+  const result = await h.call('task_child_send', { target_id: 'worker', message: 'SECRET' })
+  assert.equal(typeof result.operation.operation_id, 'string')
+  assert.equal(typeof result.operation.retry_key, 'string')
+  assert.equal(JSON.stringify(result).includes('SECRET'), false)
 })

@@ -425,15 +425,15 @@ emptyStore.close()
 const toolNames = main.state.tools.map((t) => t.name).sort()
 // 2026-09-29 定向更新（非放宽）：本包新增两个子代理控制工具
 // `task_child_send` / `task_child_stop`（见 docs/CONTROL.md）。
-// 它们是**新增注册**，既不改名也不删除既有 8 个工具；因此这里把期望集合扩到 11 个，
+// 它们是**新增注册**，既不改名也不删除既有 8 个工具；因此这里把期望集合扩到 12 个，
 // 并保留对既有 8 个工具逐个显式列名 —— 漏注册任何一个仍会 FAIL。
 const expectedNames = [
-  'task_accept', 'task_board', 'task_child_send', 'task_child_stop', 'task_claim',
+  'task_accept', 'task_board', 'task_checkpoint', 'task_child_send', 'task_child_stop', 'task_claim',
   'task_close', 'task_fact', 'task_open', 'task_reject', 'task_submit', 'task_verify',
 ]
 check(
   'S25',
-  'agent 平面注册 11 个模型可见工具（既有 10 个 + 新增 task_verify）',
+  'agent 平面注册 12 个模型可见工具（既有 11 个 + 新增 task_checkpoint）',
   same(toolNames, expectedNames),
   `实际=${toolNames.join(',')}`,
 )
@@ -526,7 +526,7 @@ const orphanDef = orphan.state.tools.find((t) => t.name === 'task_board')
 const orphanResult = JSON.parse(await orphanDef.execute({}, { agent: LEAD_AGENT }))
 check(
   'S31',
-  '服务未挂载时：工具仍注册（11 个）、调用返回 ok:false 且 logger.warn 有告警（不静默）',
+  '服务未挂载时：工具仍注册（12 个）、调用返回 ok:false 且 logger.warn 有告警（不静默）',
   // 口径与 S25 一致：10 = 既有 8 个 + 新增两个子代理控制工具；仍要求逐个名字都在
   // （只比数量会漏掉「注册了但换了名字」这类破坏）。
   orphan.state.tools.length === toolNames.length

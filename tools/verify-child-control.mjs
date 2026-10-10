@@ -560,8 +560,8 @@ section('6. 服务不可用：可读错误而非崩溃（不静默降级到 team
   )
   check(
     'C28',
-    '同上：注册期已告警（不静默），且工具仍保持注册（11 个）',
-    noService.state.warnings.some((w) => w.includes('subagents')) && noService.state.tools.length === 11,
+    '同上：注册期已告警（不静默），且工具仍保持注册（12 个）',
+    noService.state.warnings.some((w) => w.includes('subagents')) && noService.state.tools.length === 12,
     JSON.stringify({ warnings: noService.state.warnings, tools: noService.state.tools.length }),
   )
 
@@ -983,7 +983,7 @@ section('11d. 缺陷 R 回归：投递路径不由「投递后的活动态」推
   //
   // 反例 1：空闲目标被**本次投递**唤醒 ⇒ 投递后 running。旧实现报 steer，
   // 但这条消息走的其实是"起新一轮"。
-  const agentsWake = makeAgents({})
+  const agentsWake = makeAgents({ statusById: { [CHILD_1]: 'idle' } })
   const wakeFake = makeSubagents({
     children: [entry(CHILD_1)],
     onSend: () => agentsWake.setStatus(CHILD_1, 'running'),
@@ -1005,7 +1005,7 @@ section('11d. 缺陷 R 回归：投递路径不由「投递后的活动态」推
   const agentsEnd = makeAgents({ statusById: { [CHILD_1]: 'running' } })
   const endFake = makeSubagents({
     children: [entry(CHILD_1)],
-    onSend: () => agentsEnd.clear(CHILD_1),
+    onSend: () => agentsEnd.setStatus(CHILD_1, 'idle'),
   })
   const hEnd = harness({ subagents: endFake.service, agentsFake: agentsEnd })
   const ended = await hEnd.call('task_child_send', { target_id: CHILD_1, message: '接着做' }, { agent: LEAD_AGENT_A })
@@ -1027,7 +1027,7 @@ section('11d. 缺陷 R 回归：投递路径不由「投递后的活动态」推
   const hRun = harness({ subagents: makeSubagents({ children: [entry(CHILD_1)] }).service, agentsFake: agentsRun })
   const runSend = await hRun.call('task_child_send', { target_id: CHILD_1, message: 'x' }, { agent: LEAD_AGENT_A })
 
-  const hIdle = harness({ subagents: makeSubagents({ children: [entry(CHILD_1)] }).service })
+  const hIdle = harness({ subagents: makeSubagents({ children: [entry(CHILD_1)] }).service, agentsStatus: { [CHILD_1]: 'idle' } })
   const inactiveSend = await hIdle.call('task_child_send', { target_id: CHILD_1, message: 'x' }, { agent: LEAD_AGENT_A })
 
   const hNoAgents = harness({

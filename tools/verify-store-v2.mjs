@@ -492,10 +492,10 @@ const main = makeCtx()
   // 2026-09-29 定向更新（非放宽）：本包新增两个子代理控制工具 task_child_send / task_child_stop。
   // 既有 8 个工具一个都没改名/删除，所以期望集合由 8 扩到 10；下方对 submit/accept/reject
   // 仍是逐个显式点名，漏注册任何一个照样 FAIL。
-  check('C01', 'agent 平面注册 11 个模型可见工具（含 task_submit / task_accept / task_reject）',
-    ctxWithAgents.state.tools.length === 11
+  check('C01', 'agent 平面注册 12 个模型可见工具（含 task_submit / task_accept / task_reject）',
+    ctxWithAgents.state.tools.length === 12
       && ['task_submit', 'task_accept', 'task_reject'].every((n) => toolOf(n) !== undefined)
-      && ['task_child_send', 'task_child_stop', 'task_verify'].every((n) => toolOf(n) !== undefined),
+      && ['task_child_send', 'task_child_stop', 'task_verify', 'task_checkpoint'].every((n) => toolOf(n) !== undefined),
     `实际=${ctxWithAgents.state.tools.map((t) => t.name).sort().join(',')}`)
 
   const leadOpen = await call('task_open', { title: '主会话 A 的任务' }, LEAD_AGENT)

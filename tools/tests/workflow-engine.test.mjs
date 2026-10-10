@@ -472,3 +472,38 @@ test('detached workflow gates remain usable without optional recovery tables', a
   assert.equal(f.flow.state({ task_id: id }, run).blocked, false)
   assert.doesNotThrow(() => workflowAdmission(db, db.prepare('SELECT * FROM task WHERE id=?').get(id)))
 })
+
+test('zero-rework coding tasks reject premature submission without stranding the workflow', async t => {
+  const f = fixture(t), id = f.create({ max_reworks: 0 }).task_id
+  for (const stage of ['plan', 'implement']) {
+    const before = f.flow.state({ task_id: id }, run)
+    assert.equal(before.stage, stage)
+    const events = f.store.open().prepare('SELECT COUNT(*) AS n FROM task_event WHERE task_id=?').get(id).n
+    for (const actor of [worker, lead]) {
+      assert.throws(() => f.store.submitTask({ task_id: id, note: 'out of order' }, run, actor), { code: 'E_WORKFLOW_STAGE' })
+      assert.deepEqual(f.flow.state({ task_id: id }, run), before)
+      assert.equal(f.store.taskOf(id, run).task.status, 'open')
+      assert.equal(f.store.open().prepare('SELECT COUNT(*) AS n FROM task_event WHERE task_id=?').get(id).n, events)
+    }
+    if (stage === 'plan') f.change('approvePlan', id)
+  }
+  assert.equal(f.claim(id).status, 'claimed')
+  await f.artifact(id); f.review(id)
+  assert.equal(f.accept(id).status, 'accepted')
+  assert.equal(f.flow.state({ task_id: id }, run).rework_count, 0)
+})
+
+test('workflow submission preserves bound ownership, submitted replay and completed acceptance replay', async t => {
+  const f = fixture(t), id = f.open()
+  assert.throws(() => f.store.submitTask({ task_id: id }, run, reviewer), { code: 'E_TASK_CONFLICT' })
+  assert.equal(f.store.taskOf(id, run).task.status, 'claimed')
+  assert.equal(f.store.submitTask({ task_id: id }, run, lead).status, 'submitted')
+  assert.equal(f.store.submitTask({ task_id: id }, run, worker).already, true)
+  await f.artifact(id); f.review(id)
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  const accepted = f.store.acceptTask(args, run, lead)
+  assert.deepEqual(f.store.acceptTask(args, run, lead), accepted)
+  assert.throws(() => f.store.submitTask({ task_id: id }, run, worker), { code: 'E_TERMINAL' })
+  const legacy = f.store.openTask({ title: 'unowned legacy submission' }, run).task_id
+  assert.equal(f.store.submitTask({ task_id: legacy }, run).status, 'submitted')
+})

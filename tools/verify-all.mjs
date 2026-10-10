@@ -15,6 +15,7 @@ const TESTS = [
   'model-regression.test.mjs',
   'governor.test.mjs',
   'scheduler.test.mjs',
+  'scheduler-native.test.mjs',
   'sqlite.test.mjs',
   'store-atomicity.test.mjs',
   'store-evidence.test.mjs',

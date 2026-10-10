@@ -191,3 +191,57 @@ test('prepared identity uses the exact live ancestor chain and never creates or 
   child.session.header.parentSession = 'missing'
   assert.throws(() => host.prepareNativeIdentity(ctx, { version: '0.2.0-rc.2', parentAgent: child, session_id: 'x' }), code('E_SCHEDULER_CAPABILITY'))
 })
+
+test('binding a lead-queued unbound task captures its actual worker for scoped state and replay', t => {
+  const { store, scheduler: s } = setup(t)
+  const id = store.openTask({ title: 'unbound' }, run).task_id
+  s.enqueue(input(id), run, lead)
+  const row = admit(s).request
+  store.claimTask({ task_id: id, child_id: 'display' }, run, { sessionId: worker.sessionId, isRoot: false }, worker.sessionId)
+  s.bind(ref(row, { session_id: worker.sessionId }), run, lead)
+  assert.equal(s.state({}, run, worker).requests.length, 1)
+  assert.equal(s.enqueue(input(id), run, worker).state, 'running')
+})
+
+test('closed stores stay closed and transition failure retains the queue reservation', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  s.enqueue(input(task(store)), run, lead)
+  const row = admit(s).request
+  assert.throws(() => s.bind(ref(row, { session_id: 'impostor' }), run, lead), code('E_GOVERNOR_CONFLICT'))
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'reserved')
+  store.close()
+  assert.throws(() => s.state({}, run, lead), /closed|关闭|卸载/)
+})
+
+test('stale task rework and changed queue owner refuse before governor budget debit', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  s.enqueue(input(id), run, lead)
+  store.open().prepare('UPDATE task SET evidence_generation = evidence_generation + 1 WHERE id = ?').run(id)
+  assert.equal(admit(s).code, 'E_SCHEDULER_STALE')
+  assert.equal(g.snapshot(run).active_total, 0)
+  const id2 = task(store)
+  s.enqueue(input(id2), run, lead)
+  store.open().prepare('UPDATE task SET owner_session = ? WHERE id = ?').run('replacement', id2)
+  assert.equal(admit(s, 'owner').status, 'refused')
+  assert.equal(g.snapshot(run).active_total, 0)
+})
+
+test('checkpoint failures never promote to quiescence and preserve close errors', async () => {
+  assert.equal(typeof host.flushNativeCheckpoint, 'function')
+  const session = { header: { id: 's' }, events: [] }
+  let opened = 0, flushFailure
+  const closeFailure = new Error('reader close failure')
+  const backend = { async flush() { if (flushFailure) throw flushFailure }, async open() {
+    opened++
+    return { id: 's', access: 'read', header: session.header, async read() { return [] }, async close() { throw closeFailure } }
+  } }
+  const sessions = { get: () => session, async flush() { return true } }
+  const ctx = { get: n => ({ sessions, sessionPersistence: backend })[n] }
+  const args = { version: '0.2.1-alpha.2', session, persistence: backend }
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), closeFailure)
+  flushFailure = new Error('durability failure')
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, args), flushFailure)
+  assert.equal(opened, 1)
+})

@@ -347,3 +347,21 @@ test('unknown controls cannot inject change-arguments guidance or arm effort dem
   assert.equal(await h.request(request), request)
 })
 
+
+test('missing durable journal leaves prior effects ambiguous and cannot advise a replacement retry', async () => {
+  const unavailable = JSON.stringify({
+    ok: false, error: 'durable control journal is unavailable', code: 'E_CONTROL_JOURNAL_UNAVAILABLE',
+    hint: 'retain the original retry key and inspect receipts when the journal returns; do not replay',
+  })
+  assert.equal(guardModuleSignal(unavailable), undefined)
+  const h = harness({ stepDownRequests: 3 })
+  h.agent.session.events = semanticEvents('task_child_send', unavailable)
+  assert.deepEqual((await h.pre()).messages, [])
+  const request = { reasoningEffort: 'max' }
+  assert.equal(await h.request(request), request)
+})
+
+function guardModuleSignal(text) {
+  return guard.foldGuardSignal(semanticEvents('task_child_send', text),
+    { echoFailures: 6, detectStall: false }).signal
+}

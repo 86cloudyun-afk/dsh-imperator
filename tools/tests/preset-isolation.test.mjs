@@ -241,6 +241,8 @@ for (const [missing, exportsSource] of [
   ['scopeChainOf', 'exports.scopeOf = ctx => ctx.nativeScope;'],
   ['scopeOf', 'exports.scopeChainOf = key => key?.chain ?? [];'],
   ['both native functions', 'module.exports = {};'],
+  ['both native functions (null exports)', 'module.exports = null;'],
+  ['both native functions (undefined exports)', 'module.exports = undefined;'],
 ]) {
   test('direct native scope resolution refuses missing ' + missing, async t => {
     const { createScopeMembership } = await directlyResolvedScope(t, exportsSource)

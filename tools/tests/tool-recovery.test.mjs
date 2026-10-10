@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
+import { spawnSync } from 'node:child_process'
 import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -705,4 +706,46 @@ for (const action of ['send', 'stop']) {
     assert.equal(replay.operation.run_id, null)
     assert.equal(f.effects[action], 1)
   })
+}
+
+for (const action of ['send', 'stop']) {
+  for (const phase of ['begin', 'finish']) {
+    for (const realm of ['native', 'cross realm']) {
+      test('rejected ' + realm + ' promise from ' + phase + ' does not crash ' + action, () => {
+        const source = [
+          'import { apply as applyTools } from ' + JSON.stringify(new URL('../../lib/tools/index.js', import.meta.url).href),
+          'import { tempStore } from ' + JSON.stringify(new URL('./helpers.mjs', import.meta.url).href),
+          "import { runInNewContext } from 'node:vm'",
+          'const action = ' + JSON.stringify(action),
+          'const phase = ' + JSON.stringify(phase),
+          'const realm = ' + JSON.stringify(realm),
+          'const cleanups = []; const store = tempStore({ after(fn) { cleanups.push(fn) } })',
+          "const agent = { id: 'async-root', session: { header: { id: 'async-root' }, events: [{ type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } }] } }",
+          'const definitions = new Map(); let effects = 0',
+          "const subagents = { async listChildren() { return [{ id: 'async-child', mode: 'continuable', createdAt: 0 }] }, async sendMessage() { effects++; return 'async-message' }, interrupt() { effects++ } }",
+          "applyTools({ logger: { warn() {} }, get(name) { if (name === 'taskforceStore') return store; if (name === 'agents') return { get: id => id === agent.id ? agent : undefined }; if (name === 'subagents') return subagents }, tools: { register(definition) { definitions.set(definition.name, definition); return () => {} } } })",
+          "const rejected = () => realm === 'cross realm' ? runInNewContext(\"Promise.reject(new Error('PRIVATE_ASYNC_REPLY'))\") : Promise.reject(new Error('PRIVATE_ASYNC_REPLY'))",
+          "if (phase === 'begin') { const begin = store.recovery.beginControl.bind(store.recovery); store.recovery.beginControl = (input, authority) => { begin(input, authority); return rejected() } } else { store.recovery.finishControl = () => rejected() }",
+          "const result = JSON.parse(await definitions.get('task_child_' + action).execute({ target_id: 'async-child', ...(action === 'send' ? { message: 'async probe' } : {}) }, { agent, callId: 'async-call', rootCallId: 'async-root-call', signal: new AbortController().signal }))",
+          'await new Promise(resolve => setImmediate(resolve))',
+          "const row = store.open().prepare('SELECT * FROM control_operation').get()",
+          "process.stdout.write(JSON.stringify({ result, effects, status: row.status, key: row.request_key }))",
+          'for (const cleanup of cleanups.reverse()) await cleanup()',
+        ].join('\n')
+        const child = spawnSync(process.execPath, ['--unhandled-rejections=strict', '--input-type=module', '--eval', source],
+          { encoding: 'utf8', timeout: 10000, maxBuffer: 1024 * 1024 })
+        assert.equal(child.status, 0, 'a rejected journal promise must be consumed without process failure: ' + child.stderr)
+        assert.equal(child.signal, null)
+        const { result, effects, status, key } = JSON.parse(child.stdout)
+        assert.equal(effects, phase === 'begin' ? 0 : 1)
+        assert.equal(status, 'pending')
+        assert.equal(result.operation.retry_key, key)
+        if (phase === 'begin') {
+          assertJournalUnavailable(result)
+          assert.equal(Object.hasOwn(result.operation, 'durable'), false)
+        } else assertUnknownEnvelope(result, key)
+        assert.doesNotMatch(child.stdout + child.stderr, /PRIVATE_ASYNC_REPLY/)
+      })
+    }
+  }
 }

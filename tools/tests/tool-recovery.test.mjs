@@ -697,7 +697,7 @@ for (const action of ['send', 'stop']) {
 
   test('real unattributed direct-caller envelope remains valid for ' + action, async t => {
     const f = controlJournalFixture(t)
-    Object.assign(f.agent.session.header, { origin: 'subagent', delegationDepth: 1, parentSession: 'missing-parent' })
+    Object.assign(f.agent.session.header, { origin: 'subagent', delegationDepth: 2, parentSession: 'missing-parent' })
     const first = await f.call(action, 'unattributed-key')
     assert.equal(first.ok, true, JSON.stringify(first))
     assert.equal(first.operation.run_id, null)

@@ -55,3 +55,7 @@ The shared five-table NULL diagnostic runs on open/migrate, boot and adoption. E
 ## Stable keys on early journal refusal
 
 A pre-dispatch journal lookup/unavailability refusal returns a validated explicit original key or the original trusted-coordinate-derived key when reconstructable. It must not generate a new UUID that could be mistaken for earlier history. Without either source, historical-key reconstruction is unavailable and the caller retains its previously returned generated key separately. Normal mounted new intents keep their existing UUID fallback; successful never-journal detached controls do not acquire new coordinate reads. No durable outcome is fabricated by this metadata.
+
+## Definite rejected control replays
+
+The stop API can persist a definite rejected receipt after an explicit accepted:false response. Its validated, complete, consistent durable replay is a definite rejection for ECHO even though the compatibility error code remains E_CONTROL_OUTCOME_UNKNOWN. Count distinct matched invocations, not duplicate results; replay must invoke no second host effect. Missing or conflicting metadata, pending/unknown, journal unavailability and native TOOL_OUTCOME_UNKNOWN remain ambiguous and must not arm ECHO or reasoning demotion. Demonstrate the real registry→SQLite→replay→guard path with native/PTC histories, not a handcrafted status-only exception. Do not change the merged tools protocol, runner deadlines, runtime dependencies or host pins.

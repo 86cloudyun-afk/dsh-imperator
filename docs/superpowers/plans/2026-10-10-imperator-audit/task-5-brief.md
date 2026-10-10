@@ -37,3 +37,7 @@ Place actual native guard parity in the existing host-api-contract anchor-enable
 5. Write the report at docs/superpowers/research/2026-10-10-imperator-audit/task-5-report.md. Return status/head/tree/owned-file blobs, one-line test evidence and concerns.
 
 Do not spawn subagents or reviewers. Parent assigns independent review, integrates shared hunks, creates PRs and merges. Do not touch other branches/main, weaken assertions, alter workflow gates, or print credentials. Without shell, use structured GitHub tree/commit/ref tools with expected_sha leases and real Actions. Report remote evidence honestly.
+
+## Additional actual premerge finding
+
+PR65 discussion_r4237238079: a real stop accepted:false persists rejected; its complete replay retains E_CONTROL_OUTCOME_UNKNOWN. Treat that consistent durable rejection as definite failure while preserving pending/unknown, malformed or contradictory metadata, native TOOL_OUTCOME_UNKNOWN and journal-unavailable protection. Prove real SQLite/registry replay persistence and zero second effects, then matched distinct native/PTC invocation histories and actual guard plugin behavior. Tests-only six complete behavioral RED logs must precede production; independently read source GREEN and final owned manifest before clean integration. Preserve the already merged scope report and append evidence. Prior aggregate/source approvals become historical after this change.

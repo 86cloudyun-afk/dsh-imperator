@@ -106,3 +106,62 @@ Node engines, package/preset/display/database names, pins, runtime dependencies,
 Native acceptance logs contain MaxListenersExceededWarning for 11 process listeners. All gates still passed; these logs do not establish a production shutdown cause or long-run stability. No listener limit, deadline or assertion was changed to suppress them. The earlier cleanup/SIGTERM race is not claimed as a proven production root cause.
 
 Applicable systematic-debugging, TDD and verification guidance was read. The referenced TDD supporting resource writing-good-tests.md failed to load through the skill provider; that was reported and did not replace the required actual discriminating RED/GREEN checks. No shell, local execution or production/paid-provider validation is claimed. Independent review, component PR creation/integration and final merge are assigned to the parent.
+
+## PR #65 follow-up: definite durable stop rejection hidden by the compatible unknown code
+
+This section records the later premerge finding [review comment 4237238079](https://github.com/86cloudyun-afk/dsh-imperator/pull/65#discussion_r4237238079). It supplements the historical scope and unknown-effect evidence above; the already merged scope component and its original report text are preserved.
+
+Follow-up base: PR #65 head `7a293aa679c428a4945d104af753a90b6e509c3e`, tree `73b9714db8142a6694e52646d973033cdf321bb0`, with actual main `89b6271d451447261c453b628e6783d6f2b42d53` already included. All work was isolated on `codex/audit-guard-rejected-replay`; this implementer did not mutate main, PR #65's branch, the release branch or any other component.
+
+The registered real `task_child_stop` handler receives an explicit `{ accepted: false }` from the external interrupt boundary and settles the actual SQLite control row as `rejected`. The first envelope has `ok:true` and `stopped.accepted:false`: transport success does not mean the stop was accepted. Subsequent same-key replay envelopes have `ok:false`, the existing compatible `E_CONTROL_OUTCOME_UNKNOWN` code, and a complete durable `operation.status:rejected` row. The prior guard classified this code before inspecting the completed refusal, so six independent replay attempts could never trigger ECHO.
+
+The minimal repair preserves the tools protocol. Only a matched `task_child_stop` error envelope with that compatible code and a complete, coherent durable rejected replay can count as definite failure. The row must be settled, non-invoking and replayed, have its positive row ID and public identities/timestamps, unbound task/generation, and null message/error metadata appropriate to the explicit stop refusal. Its target and original retry key must match the invocation. The call cache retains only a SHA-256 binding and an explicit-key boolean: it adds no raw argument/key cache or warning payload. Target whitespace is trimmed as the real handler does; request-key whitespace is preserved exactly; JSON encoded and object arguments are supported; run_id may be null.
+
+Native `TOOL_OUTCOME_UNKNOWN` still takes precedence. Pending/unknown operations, missing journals, bare rejected status, incomplete rows, mismatched targets/keys, contradictory receipt metadata and `E_CONTROL_JOURNAL_UNAVAILABLE` retain the uncertainty barrier and cannot inject ECHO/change-argument guidance or arm effort demotion. These tests do not authorize changing the key of an ambiguous external effect.
+
+### Follow-up discriminating tests and actual RED before production
+
+Tests-only head `da0fe0fd3b62d725efd71b2f8aae8ecd3d577b22`, tree `9e8360860397a9f9cc747ec0ff5ec96bfb5e64c7`, changes only the two existing test files. The complete tree contains the same 163 blobs; all production blobs are unchanged. The test commit was created at 10:04:26 UTC. [RED Verify 38043630241](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241) completed at 10:07:07 UTC; every one of its six full job logs was read and its exact failure set checked by 10:08:33 UTC. Production commit `009462fb6002a6224c5428669c2fffd3590fcbe6` was created only afterwards, at 10:09:43 UTC.
+
+The ordinary tests exercise real temporary SQLite and the actual registered tool handlers; only the external subagent interrupt receipt is a fixture. Each history performs exactly one initial interrupt, then six independent calls with the identical target/key and distinct call IDs/steps. Every replay retains the operation ID and original key, dispatches zero further interrupts and preserves the complete database row. Native and PTC histories separately test full fold, incremental projection and plugin ECHO. The plugin test keeps TaskForce effort unchanged, omits target/key from warning text, and suppresses repeated warning injection. Seventeen uncertainty variants share one fixture to avoid unnecessary database overhead. Native-unknown precedence and one-result replay deduplication are separate controls.
+
+Two additional anchored tests use the installed public SDK Session and createToolResultMessage constructors with that same real SQLite/registry path, native/PTC transports, and reused provider IDs scoped by six distinct steps. Their initial package-wide unanchored execution is truthfully skipped; they actually execute in the anchor-enabled native boundary stage with zero skips.
+
+| RED job | Main tests/pass/fail/skip | Anchored boundaries |
+| --- | --- | --- |
+| [offline 22.23.2](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241/job/114188659833) | 1326/1309/6/11 | not applicable |
+| [offline 24.19.0](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241/job/114188659861) | 1326/1309/6/11 | not applicable |
+| [native 24.19.0 / rc.2](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241/job/114188659881) | 1326/1303/6/17 | 53/51/2/0 |
+| [native 22.23.2 / alpha.2](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241/job/114188659901) | 1326/1303/6/17 | 53/51/2/0 |
+| [native 22.23.2 / rc.2](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241/job/114188659916) | 1326/1303/6/17 | 53/51/2/0 |
+| [native 24.19.0 / alpha.2](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043630241/job/114188659919) | 1326/1303/6/17 | 53/51/2/0 |
+
+The only ordinary failing names were `durable rejected stop replay triggers {fold|projection|plugin} ECHO through {native|PTC}` (six exact combinations). The only additional anchored failing names were `native SDK durable rejected stop replay triggers ECHO through native` and its `PTC` counterpart. Every failure was ERR_ASSERTION for missing ECHO (undefined instead of echo, or zero instead of one warning), after real receipt/persistence/single-effect assertions passed. Uncertainty, deduplication and existing guard positive controls passed. No fixture exception, deadline failure or cancellation was present; all six legacy scripts and native host/isolation stages passed.
+
+### Follow-up exact-source GREEN and final owned manifest
+
+Production/docs head: `009462fb6002a6224c5428669c2fffd3590fcbe6`, tree `b665bc47698f945b3b9f33465a888188346ea193`. Relative to tests-only RED, only guard and RELIABILITY changed; both test blobs are byte-identical. Relative to the follow-up base, there are four changed files, 163 preserved blobs and 159 unchanged blobs.
+
+[Verify 38043938948](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948) completed successfully at the exact source head.
+
+| GREEN job | Result | Main tests/pass/fail/skip | Anchored boundaries |
+| --- | --- | --- | --- |
+| [native-host (24.19.0, 0.2.1-alpha.2)](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948/job/114189561644) | success | 1326/1309/0/17 | 53/53/0/0 |
+| [offline (22.23.2)](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948/job/114189561763) | success | 1326/1315/0/11 | not applicable |
+| [native-host (24.19.0, 0.2.0-rc.2)](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948/job/114189561772) | success | 1326/1309/0/17 | 53/53/0/0 |
+| [native-host (22.23.2, 0.2.1-alpha.2)](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948/job/114189561790) | success | 1326/1309/0/17 | 53/53/0/0 |
+| [offline (24.19.0)](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948/job/114189561824) | success | 1326/1315/0/11 | not applicable |
+| [native-host (22.23.2, 0.2.0-rc.2)](https://github.com/86cloudyun-afk/dsh-imperator/actions/runs/38043938948/job/114189561883) | success | 1326/1309/0/17 | 53/53/0/0 |
+
+All six exact-source full logs were read. Both offline jobs retain truthful UNVERIFIED host status. All four native jobs accept the actual packed/unpacked `@local/dsh-taskforce@0.4.0` deliverable, pass all eleven acceptance phases, PASSED preset contract with 29 rows, HOST_VERIFIED with 17 checks and ISOLATION_VERIFIED with 13 checks. All main-suite and boundary cancelled counts are zero. The two new SDK tests add two truthful unanchored skips, resulting in 11 checkout skips and 17 packed regular-pass skips; all 53 anchored boundary tests actually pass with zero skips.
+
+| Follow-up owned source path | Blob at verified code head |
+| --- | --- |
+| `lib/plugins/guard.mjs` | `d40f1059b5f38c9f974b72773957efa9a8bca1f8` |
+| `tools/tests/guard-causality.test.mjs` | `b1b07bb374cd574c26f47ad1263708ae493fb377` |
+| `tools/tests/host-api-contract.test.mjs` | `a36c0b138cf6064fc657e953817a17761de657f9` |
+| `docs/RELIABILITY.md` | `fce42b20d20496f8ada7880058e4dc46b661eed2` |
+
+The final follow-up commit appends only this report to the preserved scope/guard report; the four verified source/test/docs blobs and all other source-tree paths remain unchanged. Its five-file final manifest includes this report and is handed to the parent after a recursive-tree identity check. No GREEN claim is made for an unawaited report-only matrix. Independent module review, refreshed PR/component CI, whole-change review, the extra fresh premerge review and actual main verification remain the parent's gates.
+
+Node engines, DSH pins, dependencies, identifiers, database path, acceptance 60s and cleanup 12s remain unchanged, with no waiver. The full-tree adapter remains closed. This repair restores repeated-failure detection for a completed explicit refusal; it does not stop a child itself or prove the cause of a historical production crash. There was no local executor, deployed runtime log inspection, paid model request or long-duration real-provider run.

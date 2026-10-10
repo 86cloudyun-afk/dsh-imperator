@@ -187,7 +187,7 @@ npm run test:all -- --install-anchor "$ANCHOR"     # 须见 HOST_VERIFIED 与 IS
 
 待办与晚到阻塞的续页须携带上页 `page_token`（晚到区为 `late_page_token`）；成员变化返回 `E_PAGE_CHANGED`，需丢弃该区游标和 token、重读第一页。旧数字游标调用方需同步更新；事实/交接历史游标不变。事实总数在看板、统计和每步工作上下文中采用同一可见性规则，排除错父域和孤儿事实。
 
-读取快照、证据归属与验收约束已保留；默认 STALL 仅观察、不降档。ECHO 统一按调用发起顺序判断，旧成功不能清空新失败；native/PTC 的调用 ID 按所属 turn/step 区分，外层传输成功不代替内层工具成功。已匹配的 15 个任务工具通过成功文本传输返回完整 `ok:false/error/code/hint` 回执时，确定失败计入 ECHO；`TOOL_OUTCOME_UNKNOWN`、持久控制的 pending/unknown、`E_CONTROL_OUTCOME_UNKNOWN` 与 `E_CONTROL_JOURNAL_UNAVAILABLE` 保留未知结果并截断连续失败，不能据此建议换参数重复执行。外部工具、引用或嵌套错误文本不参与这项语义判定。派发计数保留全部尝试与回执。默认未结算估计按非空 `senderSessionId` 去重抵扣初始派发，同一子代理续作的多次结算仍保留通知总数；缺少发送者的通知和 `TOOL_OUTCOME_UNKNOWN` 不证明派发已结算，确定失败才抵扣。此估计不冒充实际存活代理数。新开的空待办页省掉 3 次 SQL 查询，已有续页仍校验完整成员 token。`node tools/bench-board.mjs 1000 5000` 输出 9 类场景的查询数、返回 JavaScript 的行数、输出大小、执行计划及完整读板 p50/p95；耗时只供比较，不作通过阈值。
+读取快照、证据归属与验收约束已保留；默认 STALL 仅观察、不降档。ECHO 统一按调用发起顺序判断，旧成功不能清空新失败；native/PTC 的调用 ID 按所属 turn/step 区分，外层传输成功不代替内层工具成功。已匹配的 15 个任务工具通过成功文本传输返回完整 `ok:false/error/code/hint` 回执时，确定失败计入 ECHO；完整且一致的持久 `rejected` 停止回执重放计入确定拒绝，即使兼容回包仍带 `E_CONTROL_OUTCOME_UNKNOWN`。`TOOL_OUTCOME_UNKNOWN`、持久控制的 pending/unknown、日志不可用及缺失或矛盾的结果元数据保留未知结果并截断连续失败，不能据此建议换参数重复执行。外部工具、引用或嵌套错误文本不参与这项语义判定。派发计数保留全部尝试与回执。默认未结算估计按非空 `senderSessionId` 去重抵扣初始派发，同一子代理续作的多次结算仍保留通知总数；缺少发送者的通知和 `TOOL_OUTCOME_UNKNOWN` 不证明派发已结算，确定失败才抵扣。此估计不冒充实际存活代理数。新开的空待办页省掉 3 次 SQL 查询，已有续页仍校验完整成员 token。`node tools/bench-board.mjs 1000 5000` 输出 9 类场景的查询数、返回 JavaScript 的行数、输出大小、执行计划及完整读板 p50/p95；耗时只供比较，不作通过阈值。
 
 服务层 run 隔离不是文件系统隔离；有文件权限的执行者仍可能直接读取共享 SQLite 文件。模型默认看板有界并可分页；旧宿主完整 `board` 仍随任务数增长。durable governor core 与新增持久 FIFO 调度服务仅由可信宿主显式调用，尚未接入原生自动派发；未知结果保留资源占用，不自动重试或释放。隔离宿主验收不发送模型请求，不能替代真实模型、长期并发、费用或目标生产实例验收。安装包不会自动修改正在运行的 DSH，也不会自动重启它。
 

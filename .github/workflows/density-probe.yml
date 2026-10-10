@@ -10,18 +10,19 @@ permissions:
 
 jobs:
   density:
-    name: Density Node ${{ matrix.node }}
+    name: Density Node ${{ matrix.node }} blockers ${{ matrix.blockers }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         node: ['22.23.2', '24.19.0']
+        blockers: [100000, 1000000]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-          fetch-depth: 2
+          fetch-depth: 3
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
           node-version: ${{ matrix.node }}
@@ -48,18 +49,16 @@ jobs:
         run: |
           set -euo pipefail
           density_evidence="$RUNNER_TEMP/density-evidence"
-          for density_count in 100000 1000000; do
-            for density_statistics in none analyzed; do
-              node tools/probe-run-density.mjs --blockers="$density_count" --rounds=10 --statistics="$density_statistics" --others=terminal --extension="$density_evidence/probe_status.so" | tee "$density_evidence/terminal-$density_count-$density_statistics.jsonl"
-            done
-          done
-          node tools/probe-run-density.mjs --blockers=100000 --rounds=10 --statistics=none --others=active --extension="$density_evidence/probe_status.so" | tee "$density_evidence/active-100000-none.jsonl"
+          node tools/probe-run-density.mjs --blockers=${{ matrix.blockers }} --rounds=10 --statistics=none --others=terminal --extension="$density_evidence/probe_status.so" | tee "$density_evidence/terminal-${{ matrix.blockers }}-none.jsonl"
+          if test "${{ matrix.blockers }}" = 100000; then
+            node tools/probe-run-density.mjs --blockers=100000 --rounds=10 --statistics=none --others=active --extension="$density_evidence/probe_status.so" | tee "$density_evidence/active-100000-none.jsonl"
+          fi
           sha256sum "$density_evidence/source.tar.gz" "$density_evidence/probe_status.so" "$density_evidence/"*.jsonl > "$density_evidence/SHA256SUMS"
       - name: Archive exact probe evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: density-${{ github.run_id }}-${{ matrix.node }}
+          name: density-${{ github.run_id }}-${{ matrix.node }}-${{ matrix.blockers }}
           path: ${{ runner.temp }}/density-evidence/
           if-no-files-found: error
           retention-days: 14

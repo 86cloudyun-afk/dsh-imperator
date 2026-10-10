@@ -295,3 +295,74 @@ test('oversized external governor state fails explicitly without an empty-page c
   assert.throws(() => s.state({}, run, lead), code('E_SCHEDULER_CONFLICT'))
   assert.equal(g.snapshot(run).active_total, 1)
 })
+
+test('lead bind refuses a replaced captured owner after public rejected-task reassignment', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = task(store)
+  const root = { sessionId: lead.sessionId, isRoot: true }
+  const original = { sessionId: worker.sessionId, isRoot: false }
+  const replacement = { role: 'worker', sessionId: 'replacement-owner' }
+  store.submitTask({ task_id: id }, run, original)
+  store.rejectTask({ task_id: id, reason: 'rework before scheduling' }, run, root)
+  s.enqueue(input(id, { mode: 'write', resources: ['repo'] }), run, lead)
+  const row = admit(s).request
+  assert.ok(row)
+  store.claimTask({ task_id: id, child_id: 'replacement' }, run, root, replacement.sessionId)
+  assert.throws(() => s.bind(ref(row, { session_id: replacement.sessionId }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  const current = s.state({}, run, lead).requests[0]
+  assert.equal(current.state, 'reserved')
+  assert.equal(current.session_id, null)
+  assert.equal(g.snapshot(run).active_total, 1)
+  assert.equal(g.snapshot(run).holds.length, 1)
+  assert.throws(() => s.bind(ref(row, { session_id: replacement.sessionId }), run, replacement), code('E_SCHEDULER_CONFLICT'))
+  s.settle(ref(row, { proof: { kind: 'never_started' } }), run, lead)
+  assert.equal(g.snapshot(run).active_total, 0)
+})
+
+for (const boundary of ['open', 'read', 'close']) {
+  for (const change of ['dispose', 'replace-session', 'replace-sessions-service', 'replace-backend']) {
+    test('checkpoint rejects ' + change + ' during awaited reader ' + boundary, async () => {
+      const session = { header: { id: 's' }, snapshotEvents: () => [] }
+      let live = session, closed = 0
+      const sessions = { get: () => live, async flush() { return true } }
+      let currentSessions = sessions, currentBackend
+      function mutate() {
+        if (change === 'dispose') live = undefined
+        if (change === 'replace-session') live = { ...session }
+        if (change === 'replace-sessions-service') currentSessions = { get: () => session, async flush() { return true } }
+        if (change === 'replace-backend') currentBackend = { ...backend }
+      }
+      const backend = { async flush() {}, async open() {
+        if (boundary === 'open') mutate()
+        return { id: 's', access: 'read', header: session.header,
+          async read() { if (boundary === 'read') mutate(); return [] },
+          async close() { closed++; if (boundary === 'close') mutate() } }
+      } }
+      currentBackend = backend
+      const ctx = { get: name => name === 'sessions' ? currentSessions : currentBackend }
+      await assert.rejects(() => host.flushNativeCheckpoint(ctx, {
+        version: '0.2.1-alpha.2', session, persistence: backend,
+      }), code('E_SCHEDULER_CAPABILITY'))
+      assert.equal(closed, 1)
+    })
+  }
+}
+
+test('reader close rejection remains the outcome even when cleanup replaces native services', async () => {
+  const session = { header: { id: 's' }, snapshotEvents: () => [] }
+  const closeFailure = new Error('strict reader cleanup failed')
+  const sessions = { get: () => session, async flush() { return true } }
+  let currentSessions = sessions, currentBackend
+  const backend = { async flush() {}, async open() {
+    return { id: 's', access: 'read', header: session.header, async read() { return [] }, async close() {
+      currentSessions = { get: () => undefined }
+      currentBackend = {}
+      throw closeFailure
+    } }
+  } }
+  currentBackend = backend
+  const ctx = { get: name => name === 'sessions' ? currentSessions : currentBackend }
+  await assert.rejects(() => host.flushNativeCheckpoint(ctx, {
+    version: '0.2.0-rc.2', session, persistence: backend,
+  }), error => error === closeFailure)
+})

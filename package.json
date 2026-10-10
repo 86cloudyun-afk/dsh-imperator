@@ -18,7 +18,8 @@
     "./store": "./lib/store/index.js",
     "./governor": "./lib/governor/index.js",
     "./tools": "./lib/tools/index.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./operations": "./lib/operations/index.js"
   },
   "files": [
     "lib",
@@ -33,5 +34,8 @@
     "bundle": {
       "patch": "./cordis.patch.yml"
     }
+  },
+  "bin": {
+    "imperator": "./tools/imperator.mjs"
   }
 }

@@ -463,7 +463,16 @@ test('escaped checkpoint context preserves row identity and older-page reachabil
   const { task_id } = store.openTask({ title: 'work' }, 'root')
   const older = recovery.checkpoint({ task_id, summary: 'older' }, 'root', root)
   const large = recovery.checkpoint({ task_id, summary: String.fromCharCode(0).repeat(4095) + 'x' }, 'root', root)
+  for (let i = 0; i < 2; i++) {
+    recovery.beginControl({ ...intent, request_key: 'mixed-' + i }, authority)
+    recovery.recordLifecycle({ event_type: 'turn/end', source: 'session_event', event_seq: i,
+      reason_kind: 'completed' }, authority)
+  }
   const first = recovery.inspect({ limit: 1 }, 'root')
+  assert.equal(first.operations.length, 1)
+  assert.equal(first.lifecycle.length, 1)
+  assert.equal(typeof first.continuation.operations, 'number')
+  assert.equal(typeof first.continuation.lifecycle, 'number')
   assert.equal(first.checkpoints.length, 1, 'oversize context cannot erase the only row')
   assert.equal(first.checkpoints[0].id, large.checkpoint_id)
   assert.equal(first.checkpoints[0].context_omitted, true)

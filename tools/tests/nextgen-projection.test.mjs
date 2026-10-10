@@ -246,3 +246,22 @@ test('frozen ordinary containers recheck inherited iterator semantics after cert
     assert.deepEqual(projection.read(events), context.foldSubagentFlow(events))
   } finally { Object.defineProperty(Array.prototype, Symbol.iterator, descriptor) }
 })
+
+test('own native history iteration cannot certify inherited iteration used by internal tails', () => {
+  const events = [freeze(call('a'))], extra = freeze(call('extra'))
+  Object.defineProperty(events, Symbol.iterator, { value: Array.prototype.values })
+  Object.freeze(events)
+  const projection = context.createFlowProjection()
+  assert.deepEqual(projection.read(events), context.foldSubagentFlow(events))
+  const descriptor = Object.getOwnPropertyDescriptor(Array.prototype, Symbol.iterator)
+  let actual, expected
+  try {
+    Object.defineProperty(Array.prototype, Symbol.iterator, { ...descriptor, value: function* () {
+      yield* descriptor.value.call(this)
+      if (this.length === 0) yield extra
+    } })
+    actual = projection.read(events)
+    expected = context.foldSubagentFlow(events)
+  } finally { Object.defineProperty(Array.prototype, Symbol.iterator, descriptor) }
+  assert.deepEqual(actual, expected)
+})

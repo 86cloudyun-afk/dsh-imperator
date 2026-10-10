@@ -476,3 +476,47 @@ test('late cohort queries filter blocker history through an index without sortin
     assert.doesNotMatch(plan, /TEMP B-TREE FOR ORDER BY/, 'membership IDs stream in index order')
   }
 })
+
+
+test('all-runs statistics share one snapshot across a concurrent WAL insert', t => {
+  const store = tempStore(t, { journalMode: 'wal' })
+  const id = store.openTask({ title: 'initial task' }, 'run-a').task_id
+  store.recordFact({ task_id: id, kind: 'blocker', statement: 'initial blocker' }, 'run-a')
+  const writer = new DatabaseSync(store.dbPath)
+  t.after(() => writer.close())
+  const original = store.handle.prepare, prepare = original.bind(store.handle)
+  let inserted = false
+  store.handle.prepare = sql => {
+    const statement = prepare(sql)
+    if (sql === 'SELECT status, COUNT(*) AS n FROM task GROUP BY status') {
+      const all = statement.all.bind(statement)
+      statement.all = (...params) => {
+        const result = all(...params)
+        if (!inserted) {
+          inserted = true
+          writer.exec('BEGIN IMMEDIATE')
+          try {
+            const task = writer.prepare("INSERT INTO task(title,status,run_id,created_at,updated_at) VALUES('concurrent task','open','run-b','now','now')").run().lastInsertRowid
+            writer.prepare("INSERT INTO fact(task_id,run_id,kind,statement,confidence,created_at) VALUES(?,'run-b','blocker','concurrent blocker','PLAUSIBLE','now')").run(task)
+            writer.exec('COMMIT')
+          } catch (error) { writer.exec('ROLLBACK'); throw error }
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  let first
+  try { first = store.statsAllRuns() } finally { store.handle.prepare = original }
+  assert.equal(inserted, true)
+  assert.equal(first.tasks.total, 1)
+  assert.equal(first.facts.total, 1)
+  assert.equal(first.runs, 1)
+  assert.equal(first.blockers_open, 1)
+  assert.equal(store.handle.isTransaction, false)
+  const next = store.statsAllRuns()
+  assert.equal(next.tasks.total, 2)
+  assert.equal(next.facts.total, 2)
+  assert.equal(next.runs, 2)
+  assert.equal(next.blockers_open, 2)
+})

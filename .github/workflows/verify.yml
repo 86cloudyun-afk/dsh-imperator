@@ -31,6 +31,20 @@ jobs:
           git ls-tree -r HEAD > "$evidence/tracked-tree.txt"
           git archive --format=tar.gz --output="$evidence/source.tar.gz" HEAD
           { node --version; npm --version; } > "$evidence/runtime.txt"
+      - name: Measure next-generation histories and exercise bounded faults
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/taskforce-verification"
+          node tools/probe-nextgen.mjs --facts=10000 --events=10000 --rounds=3 | tee "$evidence/nextgen-current.jsonl"
+          node tools/soak-nextgen.mjs --facts=1000 --events=1000 --rounds=3 | tee "$evidence/nextgen-soak.jsonl"
+          git fetch --depth=1 origin 68b728ea2bc1958353d8a58bd77d47b0be7853d3
+          baseline="$RUNNER_TEMP/nextgen-baseline"
+          mkdir "$baseline"
+          git archive 68b728ea2bc1958353d8a58bd77d47b0be7853d3 | tar -x -C "$baseline"
+          cp tools/probe-nextgen.mjs "$baseline/tools/probe-nextgen.mjs"
+          cd "$baseline"
+          node tools/probe-nextgen.mjs --facts=10000 --events=10000 --rounds=3 | tee "$evidence/nextgen-baseline.jsonl"
       - name: Record board workload measurements
         shell: bash
         run: |

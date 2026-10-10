@@ -105,3 +105,13 @@ test('runtime TODO output matches replay through every prefix and unsafe restore
   agent.session.events.length = 2
   assert.equal(text(await h.pre(agent)), context.renderWorkingContext(agent.session.events))
 })
+
+test('overwritten restored TODO payloads are not interpreted before the final replay state', async () => {
+  const discarded = { type: 'todo/write', data: { todos: [{ status: 'in_progress',
+    get content() { throw new Error('overwritten TODO content must remain unread') },
+  }] } }
+  const h = runtime(), agent = { session: { header: { id: 'root' }, events: [discarded, todo('current')] } }
+  assert.equal(text(await h.pre(agent)), context.renderWorkingContext(agent.session.events))
+  agent.session.events = [discarded, { type: 'turn/start', data: { turn: 2 } }]
+  assert.equal(text(await h.pre(agent)), context.renderWorkingContext(agent.session.events))
+})

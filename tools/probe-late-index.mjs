@@ -26,7 +26,7 @@ const nearestRank = (sorted, probability) => sorted[Math.ceil(sorted.length * pr
 
 // Recognize only the four late-page statements, including optimized production SQL.
 // Historical variants intentionally remove the production selected-row hint.
-const unforced = sql => sql.replace(' FROM fact b INDEXED BY idx_fact_blocker_run_id JOIN', ' FROM fact b JOIN')
+const unforced = sql => sql.replace(/ FROM fact b INDEXED BY idx_fact_blocker_(?:task_run|run)_id JOIN/, ' FROM fact b JOIN')
 function lateRole(sql) {
   sql = unforced(sql)
   if (!(sql.includes(ANCHOR) || sql.includes(REWRITTEN)) || !sql.includes(" AND b.kind='blocker'")) return null
@@ -39,6 +39,7 @@ function lateRole(sql) {
 function installVariant(db, variant) {
   // These are fresh synthetic stores; normalize production and experimental indexes.
   db.exec('DROP INDEX IF EXISTS idx_fact_blocker_run_id')
+  db.exec('DROP INDEX IF EXISTS idx_fact_blocker_task_run_id')
   db.exec('DROP INDEX IF EXISTS ' + INDEX)
   if (!variant.index) return 0
   const at = performance.now()

@@ -14,7 +14,8 @@ import { performance } from 'node:perf_hooks'
 
 const SELF = fileURLToPath(import.meta.url)
 const TASK_INDEX = 'idx_probe_blocker_task_run_id'
-const VARIANTS = ['planner_default', 'rows_run_index', 'rows_task_index']
+const PRODUCTION_TASK_INDEX = 'idx_fact_blocker_task_run_id'
+const VARIANTS = ['planner_default', 'rows_run_index', 'rows_task_index', 'rows_scoped_task_index']
 const MARKER = '.nextgen-synthetic'
 const RUN = 'probe-run'
 let phase = 'startup'
@@ -108,7 +109,9 @@ function rowVariant(sql, variant) {
   const normalized = sql.replace(/ FROM fact b(?: INDEXED BY [A-Za-z0-9_]+)? JOIN task t/, ' FROM fact b JOIN task t')
   assert.notEqual(normalized.indexOf(' FROM fact b JOIN task t'), -1, 'late row SQL changed; update probe recognition')
   if (variant === 'planner_default') return normalized
-  const index = variant === 'rows_run_index' ? 'idx_fact_blocker_run_id' : TASK_INDEX
+  const index = variant === 'rows_run_index'
+    || (variant === 'rows_scoped_task_index' && !normalized.includes(' AND t.id=?'))
+    ? 'idx_fact_blocker_run_id' : TASK_INDEX
   return normalized.replace(' FROM fact b JOIN task t', ' FROM fact b INDEXED BY ' + index + ' JOIN task t')
 }
 function withVariant(db, variant, work, capture) {
@@ -214,11 +217,23 @@ async function boardWorker(root, variant, rounds, migrationMode) {
   const fixture = JSON.parse(readFileSync(join(root, 'fixture.json'), 'utf8'))
   try {
     const openAt = performance.now(); store.open(); const open_migration_ms = elapsed(openAt)
+    // Measure the real production open/first read before changing the marked
+    // clone for candidate comparisons. New production DDL must not silently
+    // help the planner/default or run-only experimental candidates.
+    const productionAt = performance.now()
+    const productionFirst = readOnly(store, () => store.boardPage({ view: 'late_blockers', task_id: fixture.own }, RUN))
+    const production_first_read_ms = elapsed(productionAt)
+    const open_plus_production_first_read_ms = elapsed(openAt)
+    const production_task_index_at_open = Boolean(store.handle.prepare("SELECT 1 FROM sqlite_master WHERE type='index' AND name=?").get(PRODUCTION_TASK_INDEX))
+    const resetAt = performance.now()
+    store.handle.exec('DROP INDEX IF EXISTS ' + PRODUCTION_TASK_INDEX)
+    const candidate_index_reset_ms = elapsed(resetAt)
     const indexAt = performance.now()
-    if (variant === 'rows_task_index') store.handle.exec('CREATE INDEX ' + TASK_INDEX + " ON fact(task_id,run_id,id) WHERE kind='blocker'")
+    if (variant === 'rows_task_index' || variant === 'rows_scoped_task_index') store.handle.exec('CREATE INDEX ' + TASK_INDEX + " ON fact(task_id,run_id,id) WHERE kind='blocker'")
     const additional_index_create_ms = elapsed(indexAt)
     const firstAt = performance.now()
-    readOnly(store, () => withVariant(store.handle, variant, () => store.boardPage({ view: 'late_blockers', task_id: fixture.own }, RUN)))
+    const candidateFirst = readOnly(store, () => withVariant(store.handle, variant, () => store.boardPage({ view: 'late_blockers', task_id: fixture.own }, RUN)))
+    assert.equal(JSON.stringify(candidateFirst), JSON.stringify(productionFirst), 'production/candidate page or token mismatch')
     const first_read_ms = elapsed(firstAt), open_plus_first_read_ms = elapsed(openAt)
     phase = 'board-page-cases'
     const cases = await pageCases(store, fixture, variant), outputs = [], measurements = []
@@ -240,22 +255,30 @@ async function boardWorker(root, variant, rounds, migrationMode) {
         selected_rows: result.late_blockers.length, ...summary(times), ...capture })
     }
     phase = 'board-write-costs'
+    assert.equal(Number(store.handle.prepare('PRAGMA wal_checkpoint(TRUNCATE)').get().busy), 0)
     const before_write = sizes(root, store.handle), writes = await writeCosts(store, fixture, rounds), after_write = sizes(root, store.handle)
     const reference = JSON.stringify(withVariant(store.handle, variant, () => store.boardPage({ view: 'late_blockers', task_id: fixture.own }, RUN)))
     store.close()
     phase = 'board-reopen'
     const reopened = new TaskforceStore(root, { journalMode: 'wal' })
-    let reopened_open_ms, reopened_read_ms
+    let reopened_open_ms, reopened_read_ms, reopened_candidate_index_reset_ms
     try {
       const at = performance.now(); reopened.open(); reopened_open_ms = elapsed(at)
+      const resetAt = performance.now()
+      reopened.handle.exec('DROP INDEX IF EXISTS ' + PRODUCTION_TASK_INDEX)
+      reopened_candidate_index_reset_ms = elapsed(resetAt)
       const readAt = performance.now()
       assert.equal(JSON.stringify(withVariant(reopened.handle, variant, () => reopened.boardPage({ view: 'late_blockers', task_id: fixture.own }, RUN))), reference)
       reopened_read_ms = elapsed(readAt)
     } finally { reopened.close() }
     return { kind: 'nextgen_board', variant, density: fixture.density, facts: fixture.ordinary_facts,
       startup_migration_mode: migrationMode,
-      import_ms, open_migration_ms, additional_index_create_ms, first_read_ms, open_plus_first_read_ms,
-      reopened_open_ms, reopened_read_ms, before_write, after_write, writes, measurements, ...memory(),
+      import_ms, open_migration_ms, production_first_read_ms, open_plus_production_first_read_ms,
+      production_task_index_at_open, candidate_index_reset_ms, additional_index_create_ms,
+      first_read_ms, open_plus_first_read_ms, candidate_indexes_isolated: true, wal_checkpoint_before_write: true,
+      reopened_open_ms, reopened_read_ms, reopened_candidate_index_reset_ms,
+      reopen_scope: 'experiment clone after candidate index normalization; production task index may be recreated by open',
+      before_write, after_write, writes, measurements, ...memory(),
       private_outputs: outputs }
   } finally { store.close() }
 }
@@ -409,7 +432,8 @@ async function main() {
   const opts = options(args), root = syntheticRoot()
   emit({ kind: 'nextgen_configuration', ...opts, node: process.version, sqlite: process.versions.sqlite, v8: process.versions.v8,
     platform: process.platform, architecture: process.arch, timing_gate: false,
-    cold_os_cache: 'not measured', workload: 'synthetic; no provider calls', variants: VARIANTS,
+    cold_os_cache: 'not measured', candidate_isolation: 'production task index removed only from marked candidate clones after real production startup measurement',
+    workload: 'synthetic; no provider calls', variants: VARIANTS,
     counters: 'rows returned to JavaScript and separate projection reducer inputs; not SQLite visits',
     event_timing: 'complete guard/context pre-step hooks; replay oracles and separate reducer counters outside timing',
     memory_scope: 'whole harness process sampled immediately after hooks; includes benchmark projections and retained oracles from previous samples' })
@@ -425,18 +449,22 @@ async function main() {
         emit({ kind: 'nextgen_seed', density, facts: opts.facts, seed_ms: elapsed(at), ...sizes(seedRoot, seed.handle) })
       } finally { seed.close() }
       let reference
-      for (const migrationMode of ['existing_index', 'recreate_existing_blocker_index']) {
+      for (const migrationMode of ['existing_index', 'recreate_existing_blocker_index', 'recreate_task_blocker_index']) {
         for (const variant of VARIANTS) {
           const clone = join(root, density + '-' + migrationMode + '-' + variant); mkdirSync(clone)
           writeFileSync(join(clone, MARKER), 'synthetic only\n')
           copyFileSync(join(seedRoot, 'taskforce.db'), join(clone, 'taskforce.db'))
           writeFileSync(join(clone, 'fixture.json'), JSON.stringify(fixture))
-          if (migrationMode === 'recreate_existing_blocker_index') {
+          if (migrationMode !== 'existing_index') {
             // Mutate only the disposable clone, before the timed fresh process.
-            // Store.open() performs the real existing-index migration.
+            // Store.open() performs real DDL. The task-only case simulates
+            // an old store whose existing run-first index is already present.
             const { DatabaseSync } = await import('node:sqlite')
             const db = new DatabaseSync(join(clone, 'taskforce.db'))
-            try { db.exec('DROP INDEX idx_fact_blocker_run_id') } finally { db.close() }
+            try {
+              db.exec('DROP INDEX IF EXISTS ' + (migrationMode === 'recreate_task_blocker_index'
+                ? PRODUCTION_TASK_INDEX : 'idx_fact_blocker_run_id'))
+            } finally { db.close() }
           }
           const { report, fresh_process_total_wall_ms } = await invokeWorker(['--worker-board', clone, variant, String(opts.rounds), migrationMode])
           if (reference === undefined) reference = report.private_outputs

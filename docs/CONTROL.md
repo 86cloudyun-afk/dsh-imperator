@@ -59,7 +59,7 @@
 
 每个 tools activation 绑定首次观察到的恢复日志对象（包括首次控制之前已挂载的日志）。日志消失、不可读、关闭或换成另一个对象时，在效果调用前返回 `E_CONTROL_JOURNAL_UNAVAILABLE`。新 activation 的显式 `request_key` 同样要求日志。该码仅证明**本次未调用宿主**，不能推定此前同键效果失败；停止自动重试并向主控报告，恢复原日志后用原键读取 pending/replayed 结果。日志对象确需替换时，由主控核实原持久数据库并重新激活 tools；同一日志对象重连原数据库无需更换绑定。
 
-只有从未观察到日志且没有显式 `request_key` 的 detached 旧适配器保留原控制行为，返回 `operation.durable:false`、`durability:"unavailable"`，不提供重放保护。服务解析抛错不属于这种兼容场景。更多持久化边界见 [RECOVERY.md](RECOVERY.md)。
+只有从未观察到日志且没有显式 `request_key` 的 detached 旧适配器保留原控制行为，返回 `operation.durable:false`、`durability:"unavailable"`，不提供重放保护。`ctx.get` 正常返回 `undefined` 是可信缺省，不再反射查询；只有没有 `get` 的旧 context 才走属性读取。服务或 `recovery` 显式为 `null`，或主查询实际抛错，都拒绝效果调用。服务解析抛错不属于这种兼容场景。更多持久化边界见 [RECOVERY.md](RECOVERY.md)。
 
 ## 3. 授权判据（不靠提示词，靠代码）
 

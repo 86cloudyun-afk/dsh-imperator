@@ -127,6 +127,24 @@ function cases(store, fixture, variant) {
     { name: 'unscoped_exhausted', args: { ...unscoped, cursor: oldest, page_token: unscopedToken } },
   ]
 }
+function writeCosts(store, fixture, rounds) {
+  const p = putters(store.handle), blockers = [], results = []
+  for (const kind of ['fact', 'blocker', 'decision']) {
+    const times = []
+    for (let sample = 0; sample < rounds; sample++) {
+      const at = performance.now()
+      withWriteTransaction(store.handle, () => {
+        for (let i = 0; i < 100; i++) {
+          const id = p.fact(fixture.empty, RUN, kind, 'CONFIRMED', kind === 'decision' ? blockers[sample * 100 + i] : null)
+          if (kind === 'blocker') blockers.push(id)
+        }
+      })
+      times.push(performance.now() - at)
+    }
+    results.push({ kind, batch_size: 100, ...quantiles(times) })
+  }
+  return results
+}
 function worker(root, variant, config) {
   assert.equal(readFileSync(join(root, '.nextgen-synthetic'), 'utf8'), 'synthetic only\n')
   assert.ok(VARIANTS.includes(variant))
@@ -168,9 +186,12 @@ function worker(root, variant, config) {
     }
     assert.equal(Number(db.prepare('SELECT total_changes() AS n').get().n), writesBefore, 'board wrote data')
     assert.equal(db.isTransaction, false)
+    const storage_before_write = sizes(root, db)
+    const write_costs = writeCosts(store, fixture, config.rounds)
+    const storage_after_write = sizes(root, db)
     return { kind: 'density_measurement', node: process.version, sqlite: db.prepare('SELECT sqlite_version() AS v').get().v,
       variant, ...fixture, ids: undefined, target: undefined, empty: undefined, statistics: config.statistics,
-      candidate_index_create_ms, analyze_ms, storage: sizes(root, db), ...memory(), measurements, private_outputs }
+      candidate_index_create_ms, analyze_ms, storage_before_write, write_costs, storage_after_write, ...memory(), measurements, private_outputs }
   } finally { store.close() }
 }
 function main() {

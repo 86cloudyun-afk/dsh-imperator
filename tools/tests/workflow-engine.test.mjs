@@ -21,9 +21,11 @@ const worker = { sessionId: ' worker ', isRoot: false }
 const reviewer = { sessionId: ' reviewer ', isRoot: false }
 function fixture(t) {
   assert.equal(typeof module.TaskforceWorkflow, 'function', 'workflow core must be implemented')
-  const store = tempStore(t); store.open()
+  let store
+  t.after(() => store?.close())
+  store = tempStore(t); store.open()
   writeFileSync(join(store.root, 'source.js'), 'export const answer = 42\n')
-  const flow = new module.TaskforceWorkflow(store)
+  let flow = new module.TaskforceWorkflow(store)
   let sequence = 0, executions = 0
   const key = () => 'request-' + (++sequence)
   const actor = { ...lead, cwd: store.root }
@@ -50,7 +52,12 @@ function fixture(t) {
     requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer)
   const accept = id => { store.submitTask({ task_id: id }, run, worker); return store.acceptTask({ task_id: id,
     expected_version: flow.state({ task_id: id }, run).row_version, request_key: key() }, run, lead) }
-  return { store, flow, actor, create, change, claim, open, verify, artifact, review, accept, key, executions: () => executions }
+  const reopen = () => {
+    const root = store.root; store.close()
+    store = new TaskforceStore(root); store.open()
+    flow = new module.TaskforceWorkflow(store)
+  }
+  return { get store() { return store }, get flow() { return flow }, actor, create, change, claim, open, verify, artifact, review, accept, key, reopen, executions: () => executions }
 }
 
 // Replacing the template with legacy policy or accepting model provenance breaks these.
@@ -688,7 +695,7 @@ async function legacyReplacement(f, id, stage, dimension = 'requirements_result'
     } catch (error) { db.exec('ROLLBACK'); throw error }
   }
   const durable = deliveryRows(f, id)
-  f.store.close(); f.store.open()
+  f.reopen()
   assert.deepEqual(deliveryRows(f, id), durable, 'upgrade fixture must survive closing and reopening SQLite')
   const state = f.flow.state({ task_id: id }, run)
   assert.equal(state.stage, stage)

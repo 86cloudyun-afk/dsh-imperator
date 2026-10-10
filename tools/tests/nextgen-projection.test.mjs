@@ -115,3 +115,24 @@ test('overwritten restored TODO payloads are not interpreted before the final re
   agent.session.events = [discarded, { type: 'turn/start', data: { turn: 2 } }]
   assert.equal(text(await h.pre(agent)), context.renderWorkingContext(agent.session.events))
 })
+
+test('certified frozen data containers reuse their descriptors while still comparing every prefix slot', () => {
+  let descriptors = 0, slots = 0
+  const source = freeze(Array.from({ length: 256 }, (_, i) => call(String(i))))
+  const events = new Proxy(source, {
+    getOwnPropertyDescriptor(target, key) {
+      if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) descriptors++
+      return Reflect.getOwnPropertyDescriptor(target, key)
+    },
+    get(target, key, receiver) {
+      if (typeof key === 'string' && /^(0|[1-9][0-9]*)$/.test(key)) slots++
+      return Reflect.get(target, key, receiver)
+    },
+  })
+  const cursor = createEventCursor()
+  cursor.read(events)
+  descriptors = 0; slots = 0
+  assert.deepEqual(cursor.read(events), { reset: false, events: [] })
+  assert.equal(descriptors, 0, 'certified frozen slots cannot acquire accessors')
+  assert.equal(slots, source.length, 'the entire prefix must still be compared')
+})

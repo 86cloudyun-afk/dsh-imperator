@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { createRequire } from 'node:module'
+import { pathToFileURL } from 'node:url'
+import { TaskforceStore } from '../../lib/store/index.js'
+import { installationVersion } from '../host-runtime.mjs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -366,3 +370,160 @@ test('sandbox access denial cannot become strict success even with shell exit ze
   assert.equal(denied.verified, false)
   f.submit(id); assert.throws(() => f.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
 })
+
+function linkedFixture(t, kind) {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'taskforce-linked-receipts-')))
+  const physical = join(directory, 'physical'), alias = join(directory, 'alias')
+  mkdirSync(physical)
+  symlinkSync(physical, alias)
+  const root = kind === 'direct' ? alias : join(alias, 'nested')
+  const cwd = join(directory, 'workspace')
+  mkdirSync(cwd)
+  writeFileSync(join(cwd, 'source.js'), 'export const answer = 42\n')
+  const store = new TaskforceStore(root)
+  t.after(() => { store.close(); rmSync(directory, { recursive: true, force: true }) })
+  const context = { sessionId: run, cwd, isRoot: true }
+  const input = { title: 'linked strict coding', evidence_policy: 'execution',
+    verification_files: ['source.js'], verification_command: command }
+  const open = () => store.openTask(input, run, context).task_id
+  const claim = id => store.claimTask({ task_id: id, child_id: 'nickname' }, run, 'worker', 'worker')
+  const submit = id => store.submitTask({ task_id: id }, run, 'worker', 'worker')
+  const accept = id => store.acceptTask({ task_id: id }, run, 'lead', run)
+  return { directory, cwd, store, context, input, open, claim, submit, accept }
+}
+
+for (const kind of ['direct', 'ancestor']) {
+  test('strict receipts accept a configured ' + kind + ' root symlink with unchanged textual log paths', async t => {
+    const f = linkedFixture(t, kind), id = f.open(); f.claim(id)
+    const result = await verify(f, id)
+    assert.equal(result.verified, true, 'successful receipt under a legitimate root alias must verify')
+    const receipt = f.store.board(id, run).receipts[0]
+    for (const stream of ['stdout', 'stderr']) {
+      assert.equal(receipt.logs[stream].path, join(f.store.root, 'receipts', receipt.receipt_id + '.' + stream + '.log'))
+      assert.notEqual(realpathSync(receipt.logs[stream].path), receipt.logs[stream].path)
+    }
+    f.submit(id)
+    assert.equal(f.accept(id).execution_verified, true)
+  })
+}
+
+for (const kind of ['file', 'directory']) {
+  test('strict receipt rejects an external ' + kind + ' symlink beneath a legitimate root alias', async t => {
+    const f = linkedFixture(t, 'direct'), id = f.open(); f.claim(id)
+    await verify(f, id)
+    const receipt = f.store.board(id, run).receipts[0]
+    const foreign = join(f.directory, 'foreign')
+    if (kind === 'file') {
+      writeFileSync(foreign, readFileSync(receipt.logs.stdout.path))
+      rmSync(receipt.logs.stdout.path)
+      symlinkSync(foreign, receipt.logs.stdout.path)
+    } else {
+      renameSync(join(f.store.root, 'receipts'), foreign)
+      symlinkSync(foreign, join(f.store.root, 'receipts'))
+    }
+    f.submit(id)
+    assert.throws(() => f.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+  })
+}
+
+test('strict receipt keeps old-root textual provenance invalid after copying into a new root', async t => {
+  const f = linkedFixture(t, 'direct'), id = f.open(); f.claim(id)
+  await verify(f, id); f.submit(id)
+  const oldLogs = f.store.board(id, run).receipts[0].logs
+  const relocatedRoot = join(f.directory, 'relocated')
+  f.store.close()
+  cpSync(realpathSync(f.store.root), relocatedRoot, { recursive: true })
+  const relocated = new TaskforceStore(relocatedRoot)
+  t.after(() => relocated.close())
+  assert.deepEqual(relocated.board(id, run).receipts[0].logs, oldLogs)
+  assert.throws(() => relocated.acceptTask({ task_id: id }, run, 'lead', run), { code: 'E_VERIFICATION_RECEIPT' })
+})
+
+test('legacy resolved blocker path remains human-reviewed basis and cannot satisfy strict execution', t => {
+  const f = fixture(t)
+  for (const strict of [false, true]) {
+    const id = strict ? f.open() : f.store.openTask({ title: 'legacy investigation' }, run).task_id
+    f.claim(id)
+    const blocker = f.store.recordFact({ task_id: id, kind: 'blocker', statement: 'observed build failure',
+      evidence_path: 'logs/build.log' }, run, 'worker', 'worker').fact_id
+    f.store.recordFact({ task_id: id, kind: 'decision', statement: 'investigation concluded',
+      resolves_fact_id: blocker }, run, 'worker', 'worker')
+    f.submit(id)
+    if (strict) assert.throws(() => f.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+    else {
+      const accepted = f.accept(id)
+      assert.equal(accepted.status, 'accepted')
+      assert.deepEqual(accepted.evidence_basis.fact_ids, [blocker])
+      assert.equal(accepted.waiver, null)
+    }
+  }
+})
+
+const hostAnchor = process.env.DSH_INSTALL_ANCHOR
+const hostModule = name => import(pathToFileURL(createRequire(hostAnchor).resolve(name)).href)
+for (const kind of ['direct', 'ancestor']) {
+  test('actual native bash verifies a ' + kind + ' root symlink and strict acceptance reads its real logs',
+    { skip: !hostAnchor && 'requires DSH_INSTALL_ANCHOR; offline receipt shapes are not native proof' }, async t => {
+      const f = linkedFixture(t, kind)
+      const [{ Context }, { createScope }, { SessionStore }, { ToolRuntime }, { SystemPrompt },
+        { LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, bash] = await Promise.all([
+        hostModule('@deepseek-ai/cordis'), hostModule('@deepseek-ai/dsh-scope'),
+        hostModule('@deepseek-ai/dsh-session'), hostModule('@deepseek-ai/dsh-tools'),
+        hostModule('@deepseek-ai/dsh-system-prompt'), hostModule('@deepseek-ai/dsh-subprocess-local'),
+        hostModule('@deepseek-ai/dsh-bash-local'), hostModule('@deepseek-ai/dsh-shell-env'),
+        hostModule('@deepseek-ai/dsh-tool-bash'),
+      ])
+      const scope = createScope(new Context(), {})
+      t.after(() => scope.dispose())
+      const ctx = scope.ctx
+      new SystemPrompt(ctx, { includeHarnessIdentity: false })
+      new ToolRuntime(ctx)
+      const sessions = new SessionStore(ctx)
+      new LocalSubprocessRuntime(ctx)
+      new ShellEnvRegistry(ctx)
+      new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd: f.cwd, maxTimeoutMs: 120000 }))
+      if (installationVersion(hostAnchor) === '0.2.1-alpha.2') {
+        const [{ default: LocalFileSystem }, { default: SessionProjectionRegistry }, { default: WorkingDirectory }] = await Promise.all([
+          hostModule('@deepseek-ai/dsh-fs-local'), hostModule('@deepseek-ai/dsh-session-projection'),
+          hostModule('@deepseek-ai/dsh-working-directory'),
+        ])
+        await ctx.plugin(LocalFileSystem, { cwd: f.cwd })
+        await ctx.plugin(SessionProjectionRegistry)
+        await ctx.plugin(WorkingDirectory, { defaultDirectory: f.cwd })
+      }
+      await ctx.plugin(bash, { enableRunInBackground: false, promoteOnTimeout: false })
+      const agents = [
+        { options: {}, session: sessions.create(run, { meta: { cwd: f.cwd } }) },
+        { options: {}, session: sessions.create(identity.sessionId, { meta: {
+          cwd: f.cwd, origin: 'subagent', delegationDepth: 1, parentSession: run,
+        } }) },
+      ]
+      for (const agent of agents) {
+        const childScope = createScope(ctx, agent)
+        agent.ctx = childScope.ctx
+        t.after(() => childScope.dispose())
+      }
+      const [main, worker] = agents
+      const byId = new Map(agents.map(agent => [agent.session.header.id, agent]))
+      ctx.provide('taskforceStore', f.store)
+      ctx.provide('agents', { get: id => byId.get(id) })
+      applyTools(ctx)
+      await ctx.serial('agent/created', { agent: main })
+      await ctx.serial('agent/created', { agent: worker })
+      const id = f.open(); f.claim(id)
+      const nativeResult = await worker.ctx.tools.execute({ agent: worker,
+        callId: 'linked-native-' + kind, name: 'task_verify', arguments: { task_id: id, command },
+        signal: new AbortController().signal })
+      assert.equal(nativeResult.isError, false, nativeResult.error?.message)
+      const result = JSON.parse(nativeResult.value)
+      assert.equal(result.verified, true, JSON.stringify(result))
+      const receipt = f.store.board(id, run).receipts[0]
+      assert.equal(receipt.kind, 'foreground')
+      assert.equal(receipt.exit_code, 0)
+      assert.equal(receipt.output_complete, true)
+      assert.equal(readFileSync(receipt.logs.stdout.path, 'utf8'), 'verified\n')
+      assert.equal(readFileSync(receipt.logs.stderr.path, 'utf8'), 'diagnostic\n')
+      f.submit(id)
+      assert.equal(f.accept(id).execution_verified, true)
+    })
+}

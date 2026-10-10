@@ -705,3 +705,34 @@ test('doctor preserves historical workflow receipt/review identity across new ow
   assert.equal(result.ok, true)
   assert.equal(result.counts.scope_anomalies, 0)
 })
+
+for (const [table, field] of [['task', 'note'], ['fact', 'statement'], ['fact', 'evidence_path'],
+  ['handoff', 'note'], ['execution_receipt', 'command'], ['execution_waiver', 'reason']]) {
+  test('doctor and preflight reject missing runtime core column ' + table + '.' + field + ' without source changes', async t => {
+    const f = fixture(t); seed(f)
+    f.store.handle.exec('ALTER TABLE ' + table + ' DROP COLUMN ' + field)
+    const before = bytes(f.store.dbPath), listing = readdirSync(f.root)
+    const diagnosis = safe(await api().doctor({ root: f.root }))
+    assert.equal(diagnosis.ok, false, 'missing runtime core column must not report DATABASE_OK')
+    assert.ok(diagnosis.checks.some(check => check.code === 'SCHEMA_UPGRADE_REQUIRED'), JSON.stringify(diagnosis))
+    assert.equal(bytes(f.store.dbPath), before)
+    assert.deepEqual(readdirSync(f.root), listing)
+    await assert.rejects(api().preflight({ root: f.root }), { code: 'E_OPERATIONS_SCHEMA' })
+    assert.equal(bytes(f.store.dbPath), before, 'preflight must refuse an incompatible snapshot without repairing source')
+    assert.deepEqual(readdirSync(f.root), listing)
+  })
+}
+
+test('doctor and preflight reject a core view with table-shaped columns without repairing source', async t => {
+  const f = fixture(t); seed(f)
+  f.store.handle.exec('ALTER TABLE handoff RENAME TO handoff_rows; CREATE VIEW handoff AS SELECT * FROM handoff_rows')
+  const before = bytes(f.store.dbPath), listing = readdirSync(f.root)
+  const diagnosis = safe(await api().doctor({ root: f.root }))
+  assert.equal(diagnosis.ok, false, 'runtime core objects must be real tables')
+  assert.ok(diagnosis.checks.some(check => check.code === 'SCHEMA_UPGRADE_REQUIRED'), JSON.stringify(diagnosis))
+  assert.equal(bytes(f.store.dbPath), before)
+  assert.deepEqual(readdirSync(f.root), listing)
+  await assert.rejects(api().preflight({ root: f.root }), { code: 'E_OPERATIONS_SCHEMA' })
+  assert.equal(bytes(f.store.dbPath), before)
+  assert.deepEqual(readdirSync(f.root), listing)
+})

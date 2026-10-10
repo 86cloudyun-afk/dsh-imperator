@@ -7,11 +7,11 @@ import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = resolve(HERE, '..')
-const SCRIPTS = [
+export const SCRIPTS = [
   'verify-store.mjs', 'verify-store-v2.mjs', 'verify-store-v3.mjs',
   'verify-p3.mjs', 'verify-scope-guard.mjs', 'verify-child-control.mjs',
 ]
-const TESTS = [
+export const TESTS = [
   'recovery-journal.test.mjs',
   'scheduler-native.test.mjs',
   'scheduler.test.mjs',
@@ -68,6 +68,18 @@ const TESTS = [
   'nextgen-board.test.mjs',
   'nextgen-tool-integration.test.mjs',
   'nextgen-restore-integration.test.mjs',
+  'test-manifest-consistency.test.mjs',
+]
+
+/**
+ * `native boundaries` 组的测试清单（需要真实安装锚点 `DSH_INSTALL_ANCHOR` 的宿主边界组）。
+ * 与 `TESTS` 同样是**真实可执行清单**：清单一致性守卫
+ * （tools/tests/test-manifest-consistency.test.mjs）直接 import 本常量做断言，
+ * 因此把某个条目注释掉或删掉都会让守卫失败 —— 源文本正则会命中注释里的字面量而假通过。
+ */
+export const NATIVE_BOUNDARY_TESTS = [
+  'host-boundaries.test.mjs', 'host-runtime.test.mjs',
+  'host-api-contract.test.mjs', 'scheduler-native.test.mjs',
 ]
 
 /** Run one direct child with an explicit deadline and bounded termination grace. */
@@ -134,8 +146,7 @@ export async function runVerification({ mode = 'offline', profileDir,
   } else {
     await run('preset contract', [join(HERE, 'verify-preset.mjs'), '--install-anchor', anchor,
       ...(profileDir === undefined ? [] : ['--profile-dir', resolve(profileDir)])])
-    await run('native boundaries', ['--test', join(HERE, 'tests/host-boundaries.test.mjs'), join(HERE, 'tests/host-runtime.test.mjs'),
-      join(HERE, 'tests/host-api-contract.test.mjs'), join(HERE, 'tests/scheduler-native.test.mjs')],
+    await run('native boundaries', ['--test', ...NATIVE_BOUNDARY_TESTS.map(file => join(HERE, 'tests', file))],
       { ...process.env, DSH_INSTALL_ANCHOR: anchor })
     await run('host integration', [join(HERE, 'verify-host.mjs'), '--install-anchor', anchor])
     await run('preset isolation', [join(HERE, 'verify-isolation.mjs'), '--install-anchor', anchor])

@@ -206,7 +206,7 @@ test('reopening a legacy control journal preserves every row and column while re
 })
 
 
-test('measure boot audit counts at 100k assigned rows without changing NULL quarantine', t => {
+test('unassigned audit diagnostics use selective run-key searches with 100k assigned rows', t => {
   const store = tempStore(t)
   const scoped = seedSubmitted(store, run), unassigned = seedSubmitted(store), other = seedSubmitted(store, 'scope-b')
   const insertReceipt = store.handle.prepare('INSERT INTO execution_receipt(receipt_id,task_id,run_id,evidence_generation,owner_session,actor_session,command,cwd,verification_files,status,started_at,call_id,root_call_id,timeout_ms,snapshot,logs) VALUES(?,?,?,0,?,?,?,?,?,?,?,?,?,?,?,?)')
@@ -262,6 +262,12 @@ test('measure boot audit counts at 100k assigned rows without changing NULL quar
     for (const [i, task] of [scoped, unassigned, 999999].entries()) add('null-' + i, task, null)
     store.handle.prepare("UPDATE execution_receipt SET verification_files='{broken', snapshot='{broken', logs='{broken', status='HISTORICAL_UNKNOWN' WHERE receipt_id='null-2'").run()
     const expected = { task: 1, fact: 2, handoff: 0, execution_receipts: 3, execution_waivers: 3 }
+    // Exercise migration of an already populated supported journal, not only a fresh index.
+    for (const table of auditTables) for (const index of store.handle.prepare('PRAGMA index_list(' + table + ')').all()) {
+      const escaped = index.name.replaceAll('"', '""')
+      const keys = store.handle.prepare('PRAGMA index_info("' + escaped + '")').all()
+      if (index.partial && keys[0]?.name === 'run_id') store.handle.exec('DROP INDEX "' + escaped + '"')
+    }
     const before = fingerprint(store.handle), beforeColumns = columns(store.handle)
     assert.deepEqual(before.map(item => item.rows), [100003, 100003])
     const migration = measure('migrate-100k', () => store.migrate(store.handle, false))
@@ -302,4 +308,10 @@ test('measure boot audit counts at 100k assigned rows without changing NULL quar
     reopened?.close()
   }
   t.diagnostic('UNASSIGNED_AUDIT_SCALE ' + JSON.stringify({ assignedRowsPerTable: 100000, nullRowsPerTable: 3, totals, queries }))
+  assert.ok(queries.some(query => query.stage === 'open-100k'))
+  assert.ok(queries.some(query => query.stage === 'apply-boot-100k'))
+  for (const query of queries) for (const table of auditTables) {
+    assert.match(query.plan.join('\n'), new RegExp('SEARCH ' + table + ' USING .*\\(run_id=\\?'),
+      'each audit count must select its NULL run range instead of visiting assigned history')
+  }
 })

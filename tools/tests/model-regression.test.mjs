@@ -1349,3 +1349,514 @@ for (const fault of ['no-service', 'service-getter', 'no-projection', 'snapshot-
     assert.equal(calls, 0, 'untrusted identity accessors are not invoked')
   })
 }
+
+for (const finish of ['success', 'timeout']) {
+  test(`repair own direct-worker follow-up is counted before authority assignment: ${finish}`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, undefined, ({ stage, sessions }) => {
+      if (stage.name !== 'repair') return
+      sessions[0].events.push({ type: 'tool/call', data: { name: 'task_child_send', arguments: JSON.stringify({ target_id: 'worker' }) } })
+      if (finish === 'timeout') return new Promise(() => {})
+    })
+    if (finish === 'timeout') h.options.stageTimeoutMs = 100
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.ok, finish === 'success')
+    assert.equal(report.failure, finish === 'success' ? null : 'timeout')
+    assert.equal(report.stages.find(s => s.name === 'repair').reuse, 1)
+    if (finish === 'success') assert.deepEqual(report.stages.slice(2).map(s => s.reuse), [1, 1])
+  })
+}
+
+for (const invalid of ['unrelated', 'multiple', 'nondirect']) {
+  test(`repair diagnostic candidate excludes ${invalid} worker observations`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, undefined, ({ stage, sessions }) => {
+      if (stage.name !== 'repair') return
+      sessions[0].events.push({ type: 'tool/call', data: { name: 'task_child_send', arguments: { target_id: invalid === 'unrelated' ? 'other' : 'worker' } } })
+      if (invalid === 'multiple') sessions.push({ id: 'other', parent: 'root', events: [] })
+      if (invalid === 'nondirect') sessions[1].parent = 'other'
+    })
+    const report = await runModelVerification(h.options, { createHarness: h.factory })
+    assert.equal(report.stages.find(s => s.name === 'repair').reuse, 0)
+    assert.equal(report.failure, invalid === 'unrelated' ? null : 'repair-worker-count')
+  })
+}
+
+const taskToolNames = ['task_open', 'task_claim', 'task_fact', 'task_submit', 'task_accept', 'task_reject', 'task_close', 'task_board', 'task_child_send', 'task_child_stop', 'task_verify', 'task_checkpoint', 'task_workflow_create', 'task_workflow_submit', 'task_workflow_state']
+const taskToolCodes = ['E_NO_AGENT', 'E_NO_SESSION', 'E_NO_AGENTS_SERVICE', 'E_TERMINAL', 'E_STATUS', 'E_EVIDENCE_MISSING', 'E_BLOCKERS', 'E_TASK_CONFLICT', 'E_CROSS_RUN', 'E_NOT_FOUND', 'E_CHILD_SERVICE', 'E_CHILD_INPUT', 'E_CHILD_NO_AGENT', 'E_CHILD_NOT_OWN', 'E_CHILD_MISSING', 'E_CHILD_SETTLED', 'E_CHILD_NO_ID', 'E_CONTROL_JOURNAL_UNAVAILABLE', 'E_CONTROL_OUTCOME_UNKNOWN', 'UNAUTHORIZED', 'NOT_RESUMABLE', 'ABORTED', 'unknown']
+function taskProjection() {
+  return { observedEvents: 2, unattributedResults: 0,
+    byTool: Object.fromEntries(taskToolNames.map(name => [name, { calls: 0, nativeResults: 0, ptcResults: 0, envelopeOk: 0, envelopeError: 0, transportError: 0, unavailableResults: 0 }])),
+    byRole: { root: 0, worker: 0, unknown: 0 }, errorCounts: Object.fromEntries(taskToolCodes.map(code => [code, 0])), details: [], truncated: false, saturated: false }
+}
+
+test('task diagnostics are isolated copied custom data with immutable pre-cancel snapshot and unchanged gates', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, 'timeout'), projection = taskProjection()
+  projection.byTool.task_open.calls = 1; projection.byRole.root = 1
+  projection.byTool.task_open.nativeResults = 1; projection.byTool.task_open.envelopeError = 1
+  projection.errorCounts.E_STATUS = 1
+  projection.details.push({ toolName: 'task_open', role: 'root', presentation: 'native', outcome: 'envelope-error', errorCode: 'E_STATUS', eventIndex: 1 })
+  let begins = 0
+  const report = await runModelVerification({ ...h.options, stageTimeoutMs: 20 }, { createHarness: async config => {
+    const harness = await h.factory(config)
+    return { ...harness, beginTaskToolDiagnosticsStage() { begins++ }, taskToolDiagnosticsSnapshot: () => projection,
+      cancel() { projection.byTool.task_open.envelopeError = 0; projection.byTool.task_open.envelopeOk = 1; projection.errorCounts.E_STATUS = 0; projection.details = [] } }
+  } })
+  assert.equal(report.failure, 'timeout'); assert.equal(begins, 1)
+  const stage = report.stages[0]
+  assert.equal(stage.timeoutTaskToolDiagnostics?.byTool.task_open.envelopeError, 1)
+  assert.equal(stage.taskToolDiagnostics?.byTool.task_open.envelopeOk, 1)
+  assert.equal(stage.taskToolDiagnostics.source, 'custom-harness-unverified')
+  assert.deepEqual(Object.keys(stage.progress).sort(), ['lastRequestElapsedMs', 'settlement'])
+  assert.deepEqual(Object.keys(stage.timeoutProgress).sort(), ['lastRequestElapsedMs', 'settlement'])
+})
+
+for (const fault of ['absent', 'hook-getter', 'inherited-hook', 'proxy-harness', 'throw', 'promise', 'promise-then-getter', 'thenable', 'getter', 'proxy', 'inherited', 'extra', 'counter', 'tool', 'code', 'detail', 'partition']) {
+  test(`task diagnostics safely reject ${fault} without affecting original failure or cancellation`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, 'timeout')
+    let invoked = 0, cancelled = 0
+    const trap = () => { invoked++; throw new Error('SECRET_DIAGNOSTIC') }
+    const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => {
+      const harness = await h.factory(config)
+      harness.cancel = () => { cancelled++ }
+      harness.beginTaskToolDiagnosticsStage = () => {}
+      let value = taskProjection()
+      if (fault === 'promise' || fault === 'promise-then-getter') {
+        value = null
+      }
+      if (fault === 'thenable') Object.defineProperty(value, 'then', { get: trap })
+      if (fault === 'getter') Object.defineProperty(value.byTool.task_open, 'calls', { get: trap })
+      if (fault === 'proxy') value = new Proxy(value, { ownKeys: trap, get: trap })
+      if (fault === 'inherited') value = Object.assign(Object.create({ marker: true }), value)
+      if (fault === 'extra') value.unexpected = 'SECRET_DIAGNOSTIC'
+      if (fault === 'counter') value.observedEvents = 65536
+      if (fault === 'tool') value.details.push({ toolName: 'SECRET_DIAGNOSTIC', role: 'root', presentation: 'native', outcome: 'unavailable', errorCode: null, eventIndex: null })
+      if (fault === 'code') value.errorCounts.SECRET_DIAGNOSTIC = 1
+      if (fault === 'detail') value.details = Array(21).fill({ toolName: null, role: 'unknown', presentation: 'native', outcome: 'unavailable', errorCode: null, eventIndex: null })
+      if (fault === 'partition') value.byTool.task_open.envelopeOk = 1
+      harness.taskToolDiagnosticsSnapshot = () => {
+        if (fault === 'throw') throw new Error('SECRET_DIAGNOSTIC')
+        if (fault === 'promise' || fault === 'promise-then-getter') {
+          const rejected = Promise.reject(new Error('SECRET_DIAGNOSTIC'))
+          if (fault === 'promise-then-getter') Object.defineProperty(rejected, 'then', { get: trap })
+          return rejected
+        }
+        return value
+      }
+      if (fault === 'absent') delete harness.taskToolDiagnosticsSnapshot
+      if (fault === 'hook-getter') Object.defineProperty(harness, 'taskToolDiagnosticsSnapshot', { get: trap })
+      if (fault === 'inherited-hook') { delete harness.taskToolDiagnosticsSnapshot; Object.setPrototypeOf(harness, { taskToolDiagnosticsSnapshot: trap }) }
+      if (fault === 'proxy-harness') return new Proxy(harness, { getOwnPropertyDescriptor: trap })
+      return harness
+    } })
+    assert.equal(report.failure, 'timeout')
+    assert.equal(cancelled >= 2, true)
+    assert.equal(invoked, 0, 'untrusted accessors/proxy traps must never run')
+    assert.equal(report.stages[0].taskToolDiagnostics, null)
+    assert.equal(report.stages[0].timeoutTaskToolDiagnostics, null)
+    assert.doesNotMatch(JSON.stringify(report), /SECRET_DIAGNOSTIC/)
+  })
+}
+
+async function taskCollectorFixture() {
+  const { createTaskToolDiagnosticsCollector } = await api()
+  const agents = new Map()
+  const collector = createTaskToolDiagnosticsCollector({ rootId: 'root', agents })
+  const create = (id, parent = null, { cut = 0, seq = cut, announce = true } = {}) => {
+    const session = { id, header: { id, ...(parent === null ? {} : { parentSession: parent }) }, inheritedEventCount: cut, seq,
+      isOwnSeq(value) { return value >= this.inheritedEventCount && value < this.seq },
+      snapshotEvents() { throw new Error('diagnostics must not read history') }, ownEvents() { throw new Error('diagnostics must not read history') } }
+    const agent = { id, session }; agents.set(id, agent)
+    if (announce) collector.created(session)
+    return session
+  }
+  const root = create('root')
+  const emit = (session, type, data = {}, extra = {}) => {
+    const event = { seq: session.seq++, type, data, ...extra }
+    collector.published(session, event)
+    return event
+  }
+  const step = (session = root, turn = 1, step = 1) => { emit(session, 'turn/start', { turn }); emit(session, 'step/start', { turn, step }) }
+  const call = (session = root, name = 'task_open', callId = 'call', turn = 1, step = 1) => emit(session, 'tool/call', { turn, step, callId, name })
+  const result = (session, call, body = { ok: true }, changes = {}) => {
+    const { turn, step, callId } = call.data
+    return emit(session, 'tool/result', { turn, step, message: { source: { kind: 'tool', callId }, toolCallId: callId,
+      isError: false, content: [{ type: 'text', text: JSON.stringify(body) }], ...changes.message }, ...changes.data },
+    { sourceEventSeqs: [call.seq], ...changes.event })
+  }
+  collector.beginStage()
+  return { collector, agents, root, create, emit, step, call, result }
+}
+function assertTaskPartition(report) {
+  assert.ok(report)
+  assert.deepEqual(Object.keys(report).sort(), ['observedEvents', 'unattributedResults', 'byTool', 'byRole', 'errorCounts', 'details', 'truncated', 'saturated'].sort())
+  for (const row of Object.values(report.byTool)) assert.deepEqual(Object.keys(row).sort(), ['calls', 'nativeResults', 'ptcResults', 'envelopeOk', 'envelopeError', 'transportError', 'unavailableResults'].sort())
+  assert.deepEqual(Object.keys(report.byTool), taskToolNames)
+  assert.deepEqual(Object.keys(report.errorCounts), taskToolCodes)
+  for (const row of Object.values(report.byTool)) assert.equal(row.nativeResults + row.ptcResults, row.envelopeOk + row.envelopeError + row.transportError + row.unavailableResults)
+  assert.doesNotMatch(JSON.stringify(report), /SECRET_|private-path|private-id/)
+}
+
+test('published task collector uses own native coordinates, role lineage, stages and exact envelope partition', async () => {
+  const f = await taskCollectorFixture(), worker = f.create('private-id', 'root', { cut: 8, seq: 10 })
+  f.step(); f.step(worker)
+  const old = f.call(f.root), child = f.call(worker, 'task_board', 'worker-call')
+  f.result(worker, child, { ok: false, code: 'E_CONTROL_OUTCOME_UNKNOWN', error: 'SECRET_reason', path: '/private-path' })
+  assert.equal(f.collector.snapshot().byRole.worker, 1)
+  f.collector.beginStage()
+  f.result(f.root, old)
+  const report = f.collector.snapshot()
+  assertTaskPartition(report)
+  assert.equal(report.byTool.task_open.calls, 0)
+  assert.equal(report.byTool.task_open.envelopeOk, 1)
+  assert.equal(report.observedEvents, 1)
+  assert.deepEqual(report.byRole, { root: 0, worker: 0, unknown: 0 })
+})
+
+for (const mutation of ['source-kind', 'source-id', 'message-id', 'call-id', 'turn', 'step', 'name', 'source-name', 'seq', 'multiple-seqs', 'missing-seqs', 'orphan', 'duplicate']) {
+  test(`published task collector rejects conflicting native association: ${mutation}`, async () => {
+    const f = await taskCollectorFixture(); f.step()
+    const call = f.call(), changes = {}
+    if (mutation === 'source-kind') changes.message = { source: { kind: 'SECRET_source', callId: 'call' } }
+    if (mutation === 'source-id') changes.message = { source: { kind: 'tool', callId: 'SECRET_id' } }
+    if (mutation === 'message-id') changes.message = { toolCallId: 'SECRET_id' }
+    if (mutation === 'call-id') changes.data = { callId: 'SECRET_id' }
+    if (mutation === 'turn') changes.data = { turn: 2 }
+    if (mutation === 'step') changes.data = { step: 2 }
+    if (mutation === 'name') changes.data = { name: 'task_board' }
+    if (mutation === 'source-name') changes.message = { source: { kind: 'tool', callId: 'call', toolName: 'SECRET_tool' } }
+    if (mutation === 'seq') changes.event = { sourceEventSeqs: [call.seq - 1] }
+    if (mutation === 'multiple-seqs') changes.event = { sourceEventSeqs: [call.seq, call.seq] }
+    if (mutation === 'missing-seqs') changes.event = { sourceEventSeqs: undefined }
+    if (mutation === 'orphan') changes.message = { source: { kind: 'tool', callId: 'orphan' }, toolCallId: 'orphan' }
+    if (mutation === 'duplicate') f.result(f.root, call)
+    f.result(f.root, call, { ok: true }, changes)
+    const report = f.collector.snapshot(); assertTaskPartition(report)
+    assert.equal(report.unattributedResults, 1)
+    assert.equal(report.byTool.task_open.nativeResults, mutation === 'duplicate' ? 1 : 0)
+    assert.equal(report.byTool.task_open.unavailableResults, 0)
+  })
+}
+
+for (const shape of ['malformed', 'array', 'missing-ok', 'string-ok', 'multiple', 'nontext', 'oversize-char', 'oversize-utf8', 'transport', 'unknown-code']) {
+  test(`published task collector bounds and decodes associated result: ${shape}`, async () => {
+    const f = await taskCollectorFixture(); f.step(); const call = f.call()
+    const message = {}, body = shape === 'unknown-code' ? { ok: false, code: 'SECRET_CODE' } : { ok: true }
+    if (shape === 'malformed') message.content = [{ type: 'text', text: '{' }]
+    if (shape === 'array') message.content = [{ type: 'text', text: '[{"ok":true}]' }]
+    if (shape === 'missing-ok') message.content = [{ type: 'text', text: '{}' }]
+    if (shape === 'string-ok') message.content = [{ type: 'text', text: '{"ok":"true"}' }]
+    if (shape === 'multiple') message.content = [{ type: 'text', text: '{"ok":true}' }, { type: 'text', text: '{}' }]
+    if (shape === 'nontext') message.content = [{ type: 'image', data: 'SECRET_' }]
+    if (shape === 'oversize-char') message.content = [{ type: 'text', text: 'x'.repeat(65537) }]
+    if (shape === 'oversize-utf8') message.content = [{ type: 'text', text: '界'.repeat(30000) }]
+    if (shape === 'transport') { message.isError = true; message.content = [{ type: 'text', text: '{"ok":true}' }] }
+    f.result(f.root, call, body, { message })
+    const report = f.collector.snapshot(); assertTaskPartition(report)
+    assert.equal(report.byTool.task_open.nativeResults, 1)
+    assert.equal(report.byTool.task_open[shape === 'transport' ? 'transportError' : shape === 'unknown-code' ? 'envelopeError' : 'unavailableResults'], 1)
+    assert.equal(report.errorCounts.unknown, shape === 'unknown-code' ? 1 : 0)
+    assert.equal(report.truncated, shape.startsWith('oversize'))
+  })
+}
+
+test('published task collector rejects inherited seed results and accepts legal cold unpublished suffix without replay', async () => {
+  const f = await taskCollectorFixture(); f.step(); const parentCall = f.call()
+  const child = f.create('worker', 'root', { cut: f.root.seq, seq: f.root.seq + 2 })
+  f.result(child, parentCall)
+  assert.equal(f.collector.snapshot().unattributedResults, 1)
+  f.step(child); const pending = f.call(child, 'task_board')
+  const savedSeq = child.seq
+  f.collector.disposed(child); f.agents.delete(child.id)
+  const restored = f.create('worker', 'root', { cut: f.root.seq, seq: savedSeq + 3 })
+  f.collector.beginStage(); f.step(restored)
+  f.result(restored, pending)
+  const current = f.call(restored, 'task_board', 'current'); f.result(restored, current)
+  const report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.byTool.task_board.calls, 1)
+  assert.equal(report.byTool.task_board.envelopeOk, 1)
+  assert.equal(report.unattributedResults, 1)
+})
+
+for (const fault of ['gap', 'duplicate-publication', 'seq-rollback', 'cut', 'lineage', 'registry', 'concurrent', 'ownership-throw']) {
+  test(`published task collector contains invalid ownership/publication: ${fault}`, async () => {
+    const f = await taskCollectorFixture(), worker = f.create('worker', 'root'); f.step(worker)
+    if (fault === 'gap') worker.seq++
+    if (fault === 'duplicate-publication') worker.seq--
+    if (fault === 'seq-rollback') { f.collector.disposed(worker); f.create('worker', 'root', { seq: 0 }) }
+    if (fault === 'cut') worker.inheritedEventCount++
+    if (fault === 'lineage') worker.header.parentSession = 'private-id'
+    if (fault === 'registry') f.agents.set(worker.id, { id: worker.id, session: worker })
+    if (fault === 'concurrent') f.create('worker', 'root', { seq: worker.seq })
+    if (fault === 'ownership-throw') worker.isOwnSeq = () => { throw new Error('SECRET_fault') }
+    assert.doesNotThrow(() => f.call(worker))
+    assert.equal(f.collector.snapshot(), null)
+  })
+}
+
+test('published task collector bounds details, events, coordinates, cumulative bytes and counter saturation', async () => {
+  const f = await taskCollectorFixture(); f.step()
+  for (let i = 0; i < 34; i++) {
+    const call = f.call(f.root, 'task_board', `call-${i}`)
+    f.result(f.root, call, { ok: true, padding: 'x'.repeat(65500) })
+  }
+  let report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.details.length, 20); assert.equal(report.truncated, true)
+  assert.equal(report.byTool.task_board.envelopeOk, 32)
+  assert.equal(report.byTool.task_board.unavailableResults, 2)
+  const huge = f.call(f.root, 'task_board', 'x'.repeat(257)); f.result(f.root, huge)
+  assert.equal(f.collector.snapshot().unattributedResults, 1)
+  const pending = f.call(f.root, 'task_board', 'pending')
+  while (f.collector.snapshot().observedEvents < 4096) f.emit(f.root, 'unknown/event')
+  f.result(f.root, pending)
+  report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.observedEvents, 4096); assert.equal(report.byTool.task_board.unavailableResults, 3)
+  for (let i = 0; i < 65536; i++) f.result(f.root, pending)
+  report = f.collector.snapshot()
+  assert.equal(report.unattributedResults, 65535); assert.equal(report.saturated, true)
+})
+
+for (const fault of ['begin-throws', 'begin-accessor', 'begin-promise', 'source-forgery']) {
+  test(`task diagnostic stage boundary refuses ${fault} without stale success`, async t => {
+    const { runModelVerification } = await api(), h = setup(t, 'timeout')
+    let getters = 0
+    const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => {
+      const harness = await h.factory(config)
+      harness.beginTaskToolDiagnosticsStage = () => { if (fault === 'begin-throws') throw new Error('SECRET_'); if (fault === 'begin-promise') return Promise.reject(new Error('SECRET_')) }
+      if (fault === 'begin-accessor') Object.defineProperty(harness, 'beginTaskToolDiagnosticsStage', { get() { getters++; throw new Error('SECRET_') } })
+      harness.taskToolDiagnosticsSnapshot = () => ({ ...taskProjection(), ...(fault === 'source-forgery' ? { source: 'native-own-published-events' } : {}) })
+      return harness
+    } })
+    assert.equal(report.failure, 'timeout'); assert.equal(getters, 0)
+    assert.equal(report.stages[0].taskToolDiagnostics, null)
+    assert.equal(report.stages[0].timeoutTaskToolDiagnostics, null)
+  })
+}
+
+function ptcFixture(f) {
+  f.step()
+  const root = f.call(f.root, 'run_code', 'wrapper')
+  const start = (subCallId = 'inner', name = 'task_board', parentCallId = 'wrapper', rootCallId = 'wrapper') => {
+    const data = { rootCallId, parentCallId, subCallId, name }
+    f.emit(f.root, 'tool/ptc-dispatch-start', data)
+    return data
+  }
+  const result = (data, changes = {}) => f.emit(f.root, 'tool/ptc-dispatch', { ...data, isError: false, content: [{ type: 'text', text: '{"ok":true}' }], ...changes })
+  return { root, start, result }
+}
+for (const fault of ['root', 'parent', 'sub', 'name', 'turn', 'step', 'orphan', 'duplicate', 'conflicting-start', 'outside-step']) {
+  test(`published task collector requires full PTC association: ${fault}`, async () => {
+    const f = await taskCollectorFixture(), p = ptcFixture(f), data = p.start()
+    if (fault === 'duplicate') p.result(data)
+    if (fault === 'conflicting-start') p.start('inner', 'task_open')
+    if (fault === 'outside-step') f.emit(f.root, 'step/end', { turn: 1, step: 1 })
+    const change = fault === 'root' ? { rootCallId: 'other' } : fault === 'parent' ? { parentCallId: 'other' } : fault === 'sub' || fault === 'orphan' ? { subCallId: 'other' } : fault === 'name' ? { name: 'task_open' } : fault === 'turn' ? { turn: 2 } : fault === 'step' ? { step: 2 } : {}
+    p.result(data, change)
+    const report = f.collector.snapshot(); assertTaskPartition(report)
+    assert.equal(report.unattributedResults, 1)
+    assert.equal(report.byTool.task_board.ptcResults, fault === 'duplicate' ? 1 : 0)
+  })
+}
+
+test('published task collector accepts nested PTC and re-used sub-ID only under distinct native roots', async () => {
+  const f = await taskCollectorFixture(), p = ptcFixture(f)
+  const parent = p.start('parent', 'read'), nested = p.start('same', 'task_board', 'parent')
+  p.result(nested); p.result(parent)
+  f.result(f.root, p.root)
+  const nextRoot = f.call(f.root, 'run_code', 'next-wrapper')
+  const next = p.start('same', 'task_board', 'next-wrapper', 'next-wrapper'); p.result(next)
+  f.result(f.root, nextRoot)
+  const report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.byTool.task_board.ptcResults, 2)
+  assert.equal(report.byTool.task_board.envelopeOk, 2)
+})
+
+test('published task collector counts unexpected tool results only as unattributed', async () => {
+  const f = await taskCollectorFixture(); f.step(); const call = f.call(f.root, 'SECRET_tool', 'unknown')
+  f.result(f.root, call)
+  const report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.unattributedResults, 1)
+  assert.deepEqual(report.byRole, { root: 0, worker: 0, unknown: 0 })
+})
+
+test('published task collector bounds scoped sessions and retained calls across stages', async () => {
+  const f = await taskCollectorFixture()
+  for (let i = 0; i < 16; i++) f.create(`worker-${i}`, 'root')
+  assert.equal(f.collector.snapshot().truncated, true)
+  f.collector.beginStage(); f.step()
+  for (let i = 0; i < 4094; i++) f.call(f.root, 'task_open', `call-${i}`)
+  f.collector.beginStage()
+  for (let i = 4094; i < 4097; i++) f.call(f.root, 'task_open', `call-${i}`)
+  const report = f.collector.snapshot()
+  assert.equal(report.truncated, true)
+  assert.equal(report.byTool.task_open.calls, 3)
+})
+
+test('published task collector accepts canonical append with surface replacement and ignores stale disposal identity', async () => {
+  const f = await taskCollectorFixture(); f.step(); const call = f.call()
+  f.result(f.root, call, { ok: true }, { event: { surfaceOp: 'replace', replaces: [1] } })
+  const old = f.create('worker', 'root'); f.collector.disposed(old)
+  const current = f.create('worker', 'root', { seq: old.seq + 1 })
+  f.collector.disposed(old); f.step(current)
+  const next = f.call(current, 'task_board'); f.result(current, next)
+  const report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.byTool.task_open.envelopeOk, 1)
+  assert.equal(report.byTool.task_board.envelopeOk, 1)
+})
+
+test('task diagnostic Promise constructor accessors are refused without calling a getter', async t => {
+  const { runModelVerification } = await api(), h = setup(t, 'timeout')
+  let getters = 0
+  const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => {
+    const harness = await h.factory(config)
+    harness.beginTaskToolDiagnosticsStage = () => {}
+    harness.taskToolDiagnosticsSnapshot = () => {
+      const value = Promise.resolve(taskProjection())
+      Object.defineProperty(value, 'constructor', { get() { getters++; throw new Error('SECRET_constructor') } })
+      return value
+    }
+    return harness
+  } })
+  assert.equal(report.failure, 'timeout'); assert.equal(getters, 0)
+  assert.equal(report.stages[0].taskToolDiagnostics, null)
+})
+
+test('published task collector keeps exhausted session coverage unavailable across stage boundaries', async () => {
+  const f = await taskCollectorFixture()
+  let overflow
+  for (let i = 0; i < 16; i++) overflow = f.create(`worker-${i}`, 'root')
+  f.collector.beginStage()
+  f.step(overflow); const call = f.call(overflow); f.result(overflow, call)
+  const report = f.collector.snapshot(); assertTaskPartition(report)
+  assert.equal(report.truncated, true)
+  assert.equal(report.unattributedResults, 1)
+  assert.equal(report.byTool.task_open.envelopeOk, 0)
+})
+
+test('published task collector preserves known public sequence above counter saturation limit', async () => {
+  const f = await taskCollectorFixture(), worker = f.create('worker', 'root', { cut: 100000 })
+  f.step(worker); const call = f.call(worker), result = f.result(worker, call)
+  assert.equal(f.collector.snapshot().details[0].eventIndex, result.seq)
+})
+
+test('task diagnostic application rejection remains report-only on all otherwise successful stages', async t => {
+  const { runModelVerification } = await api(), h = setup(t)
+  const report = await runModelVerification(h.options, { createHarness: async config => ({
+    ...await h.factory(config), beginTaskToolDiagnosticsStage() {}, taskToolDiagnosticsSnapshot() {
+      const value = taskProjection()
+      value.byTool.task_board.nativeResults = 1; value.byTool.task_board.envelopeError = 1
+      value.errorCounts.E_CONTROL_JOURNAL_UNAVAILABLE = 1
+      return value
+    },
+  }) })
+  assert.equal(report.ok, true); assert.equal(report.failure, null)
+  assert.ok(report.stages.every(stage => stage.taskToolDiagnostics.errorCounts.E_CONTROL_JOURNAL_UNAVAILABLE === 1))
+  assert.ok(report.stages.every(stage => stage.taskToolDiagnostics.source === 'custom-harness-unverified'))
+})
+
+test('task diagnostics remain independently available when the final runtime snapshot throws', async t => {
+  const { runModelVerification } = await api(), h = setup(t), value = taskProjection()
+  const report = await runModelVerification(h.options, { createHarness: async () => {
+    let snapshots = 0
+    return { hostVersion: '0.2.0-rc.2', rootId: 'root', beginTaskToolDiagnosticsStage() {}, taskToolDiagnosticsSnapshot: () => value,
+      snapshot() { if (snapshots++) throw new Error('SECRET_snapshot'); return { sessions: [{ id: 'root', parent: null, events: [] }], tasks: [], settled: true } },
+      runStage() { value.byTool.task_open.calls = 1; value.byRole.root = 1; throw new Error('SECRET_runtime') }, cancel() {}, dispose() {},
+    }
+  } })
+  assert.equal(report.failure, 'runtime-error')
+  assert.equal(report.stages[0].taskToolDiagnostics.byTool.task_open.calls, 1)
+})
+
+for (const source of ['native-own-published-events', 'custom-harness-unverified', 'accessor', 'inherited']) {
+  test(`task diagnostic hook cannot declare source authority: ${source}`, async t => {
+    const { runModelVerification } = await api(), h = setup(t, 'timeout')
+    let getters = 0
+    const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => ({
+      ...await h.factory(config), beginTaskToolDiagnosticsStage() {}, taskToolDiagnosticsSnapshot() {
+        const value = taskProjection()
+        if (source === 'accessor') Object.defineProperty(value, 'source', { get() { getters++; return 'native-own-published-events' } })
+        else if (source === 'inherited') Object.setPrototypeOf(value, { source: 'native-own-published-events' })
+        else value.source = source
+        return value
+      },
+    }) })
+    assert.equal(report.failure, 'timeout'); assert.equal(getters, 0)
+    assert.equal(report.stages[0].taskToolDiagnostics, null)
+  })
+}
+
+test('task diagnostic Promise foreign species is never invoked or assimilated', async t => {
+  const { runModelVerification } = await api(), h = setup(t, 'timeout')
+  let getters = 0
+  const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => ({
+    ...await h.factory(config), beginTaskToolDiagnosticsStage() {}, taskToolDiagnosticsSnapshot() {
+      const promise = Promise.resolve(taskProjection())
+      Object.defineProperty(promise, 'constructor', { value: { get [Symbol.species]() { getters++; throw new Error('SECRET_species') } } })
+      return promise
+    },
+  }) })
+  assert.equal(report.failure, 'timeout'); assert.equal(getters, 0)
+  assert.equal(report.stages[0].taskToolDiagnostics, null)
+})
+
+test('published task collector maps every exact application code and absent or invalid codes to unknown', async () => {
+  const f = await taskCollectorFixture(); f.step()
+  for (const [index, code] of taskToolCodes.entries()) f.result(f.root, f.call(f.root, 'task_board', `code-${index}`), { ok: false, code })
+  f.result(f.root, f.call(f.root, 'task_board', 'absent-code'), { ok: false })
+  f.result(f.root, f.call(f.root, 'task_board', 'invalid-code'), { ok: false, code: { secret: 'SECRET_' } })
+  const report = f.collector.snapshot(); assertTaskPartition(report)
+  for (const code of taskToolCodes) assert.equal(report.errorCounts[code], code === 'unknown' ? 3 : 1)
+  assert.equal(report.byTool.task_board.envelopeError, 25)
+  assert.equal(report.details.length, 20)
+  assert.equal(report.truncated, true)
+})
+
+test('published task collector contains creation and disposal observer faults and out-of-scope events', async () => {
+  const f = await taskCollectorFixture()
+  const other = f.create('other'); f.step(other); f.result(other, f.call(other))
+  assert.equal(f.collector.snapshot().observedEvents, 0)
+  const hostile = Object.defineProperty({}, 'id', { get() { throw new Error('SECRET_callback') } })
+  assert.doesNotThrow(() => f.collector.created(hostile)); assert.equal(f.collector.snapshot(), null)
+  f.collector.beginStage()
+  assert.doesNotThrow(() => f.collector.disposed(hostile)); assert.equal(f.collector.snapshot(), null)
+})
+
+test('task diagnostic rejection handling uses captured invocation without an exposed call getter', async t => {
+  const { runModelVerification } = await api(), h = setup(t, 'timeout')
+  const then = Promise.prototype.then, original = Object.getOwnPropertyDescriptor(then, 'call')
+  let getters = 0
+  const restore = () => { if (original) Object.defineProperty(then, 'call', original); else delete then.call }
+  t.after(restore)
+  const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => ({
+    ...await h.factory(config), beginTaskToolDiagnosticsStage() {}, cancel: restore,
+    taskToolDiagnosticsSnapshot() {
+      const promise = Promise.resolve(taskProjection())
+      Object.defineProperty(then, 'call', { configurable: true, get() { getters++; throw new Error('SECRET_invocation') } })
+      return promise
+    },
+  }) })
+  assert.equal(report.failure, 'timeout'); assert.equal(getters, 0)
+  assert.equal(report.stages[0].taskToolDiagnostics, null)
+})
+
+for (const shape of ['subclass', 'foreign', 'own-native-constructor']) {
+  test(`task diagnostic async ${shape} shape remains unsupported and never supplies report data`, async t => {
+    const { runModelVerification } = await api(), h = setup(t, 'timeout')
+    const { runInNewContext } = await import('node:vm')
+    let getters = 0
+    class ForeignSpecies extends Promise { static get [Symbol.species]() { getters++; throw new Error('SECRET_foreign') } }
+    const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => ({
+      ...await h.factory(config), beginTaskToolDiagnosticsStage() {}, taskToolDiagnosticsSnapshot() {
+        if (shape === 'foreign') return runInNewContext('Promise.resolve({})')
+        if (shape === 'subclass') return new ForeignSpecies(resolve => resolve(taskProjection()))
+        const promise = Promise.resolve(taskProjection())
+        Object.defineProperty(promise, 'constructor', { value: Promise })
+        return promise
+      },
+    }) })
+    assert.equal(report.failure, 'timeout'); assert.equal(getters, 0)
+    assert.equal(report.stages[0].taskToolDiagnostics, null)
+  })
+}

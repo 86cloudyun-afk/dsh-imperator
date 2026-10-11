@@ -1444,6 +1444,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
     assert.equal(harness.settlementSnapshot?.().phase, 'not-started')
     for (stage = 1; stage <= 2; stage++) {
       reset()
+      harness.beginTaskToolDiagnosticsStage()
       const beforeNotices = notices()
       pending = harness.runStage({ name: 'local-settlement', prompt: 'Exercise the local child lifecycle.' }).then(() => { completed = true })
       pending.catch(() => {})
@@ -1483,7 +1484,11 @@ test('native settlement diagnostics follow mounted continuable child, live send,
       assert.equal(final.deliveredNotices, 1)
       assert.equal(final.idleAgents, 2)
       assert.equal(final.pendingIdleWaits, 0)
-      observations.push({ stage, boundary: 'settled', ...final })
+      const taskDiagnostics = harness.taskToolDiagnosticsSnapshot()
+      assert.ok(taskDiagnostics, 'legal cold Session lifecycle keeps task observations available')
+      assert.equal(taskDiagnostics.byTool.task_child_send.calls, 1)
+      assert.equal(taskDiagnostics.byTool.task_child_send.envelopeOk, 1)
+      observations.push({ stage, boundary: 'settled', ...final, taskDiagnostics })
     }
     assert.equal(children[0].id, children[1].id)
     assert.notEqual(children[0], children[1], 'cold reuse replaces the native Agent object')
@@ -1532,7 +1537,7 @@ test('native settlement timeout snapshots the held local stream before signal ca
       } })
       const cancel = nativeHarness.cancel
       nativeHarness.cancel = () => {
-        actualBeforeCancel ??= { status: root.status, observation: nativeHarness.settlementSnapshot() }
+        actualBeforeCancel ??= { status: root.status, observation: nativeHarness.settlementSnapshot(), taskDiagnostics: nativeHarness.taskToolDiagnosticsSnapshot() }
         cancel()
       }
       return nativeHarness
@@ -1544,6 +1549,8 @@ test('native settlement timeout snapshots the held local stream before signal ca
   assert.equal(aborted, 1); assert.equal(drained, 1)
   assert.equal(actualBeforeCancel.status, 'running')
   assert.deepEqual(report.stages[0].timeoutProgress.settlement, actualBeforeCancel.observation)
+  assert.deepEqual(report.stages[0].timeoutTaskToolDiagnostics, { source: 'custom-harness-unverified', ...actualBeforeCancel.taskDiagnostics })
+  assert.equal(report.stages[0].taskToolDiagnostics.source, 'custom-harness-unverified', 'wrapping the native factory cannot establish native report authority')
   assert.equal(report.stages[0].timeoutProgress.settlement.phase, 'waiting-idle')
   assert.equal(report.stages[0].timeoutProgress.settlement.runningAgents, 1)
   assert.equal(report.stages[0].timeoutProgress.settlement.pendingIdleWaits, 1)
@@ -1719,3 +1726,95 @@ for (const route of ['spawn', 'fork', 'nested-fork']) {
     }
   })
 }
+
+test('native task action diagnostics distinguish registered business outcomes and transport errors in native and PTC', options, async t => {
+  const { createNativeHarness } = await import('../verify-model.mjs')
+  const { createUserMessage } = await native('@deepseek-ai/dsh-llm')
+  const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-task-diagnostics-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  await native('@deepseek-ai/dsh-subprocess-local') // SDK module owns one process exit callback.
+  const listenerEvents = ['exit', 'unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+  const listeners = listenerEvents.map(name => process.rawListeners(name))
+  let localRequests = 0, child, root, ctx, fixtureRoot
+  const publications = []
+  const harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+    workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+  }, { inspectNative: state => {
+    root = state.root; ctx = state.ctx; fixtureRoot = dirname(process.env.DSH_HOME)
+    ctx.on('session/event', (session, event) => {
+      if (['tool/call', 'tool/result', 'tool/ptc-dispatch-start', 'tool/ptc-dispatch'].includes(event.type)) publications.push({ session: session.id === root.id ? 'root' : 'worker', event })
+    }, { global: true })
+    ctx.on('tools/execute', (exec, next) => {
+      if (exec.name === 'task_board' && exec.arguments?.task_id === 424242) throw new Error('LOCAL_TRANSPORT_FAILURE')
+      return next()
+    }, { global: true })
+    const steps = new Map()
+    ctx.on('llm/stream', request => (async function* () {
+      localRequests++
+      const step = (steps.get(request.sessionId) ?? 0) + 1
+      steps.set(request.sessionId, step)
+      let block = { type: 'text', text: '137' }
+      if (request.sessionId === root.id && step === 1) block = { type: 'tool-call', id: 'root-board', name: 'task_board', arguments: '{}' }
+      if (request.sessionId !== root.id) {
+        if (step <= 3) block = { type: 'tool-call', id: `native-board-${step}`, name: 'task_board', arguments: JSON.stringify(step === 1 ? {} : { task_id: step === 2 ? 999999 : 424242 }) }
+        if (step === 4) block = { type: 'tool-call', id: 'ptc-board', name: 'run_code', arguments: JSON.stringify({ description: 'Exercise task outcomes locally', code: 'await tools.task_board({}); await tools.task_board({task_id:999999}); try { await tools.task_board({task_id:424242}); } catch {} return "done";' }) }
+      }
+      yield { type: 'block-end', index: 0, block }
+      yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+      yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+    })(), { global: true })
+  } })
+  try {
+    harness.beginTaskToolDiagnosticsStage?.()
+    root.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Exercise local root task diagnostics.' }] }))
+    await root.whenIdle()
+    const seed = root.session.snapshotEvents()
+    child = await ctx.agents.create({ sessionId: 'task-diagnostics-child', parentAgent: root, seed, inheritedEventCount: seed.length,
+      agentOptions: resolveChildAgentOptions(root, undefined, 1), meta: childSessionMeta(root, 1, true),
+      setup: childCtx => applyChildComposition(childCtx, root, {}),
+    })
+    child.agent.ctx.tools.presentAs('both')
+    assert.equal(child.agent.session.inheritedEventCount, seed.length)
+    assert.ok(seed.some(event => event.type === 'tool/result'), 'the real child inherits a completed parent task result')
+    for (const agent of [child.agent]) {
+      agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Exercise local task diagnostics.' }] }))
+      await agent.whenIdle()
+    }
+    const results = publications.filter(row => row.event.type === 'tool/result' || row.event.type === 'tool/ptc-dispatch')
+    t.diagnostic(JSON.stringify({ rawTaskPublications: publications }))
+    const business = results.filter(({ event }) => {
+      const content = event.data.message?.content ?? event.data.content
+      try { return content?.length === 1 && content[0].type === 'text' && JSON.parse(content[0].text).ok === false } catch { return false }
+    })
+    assert.equal(business.length, 2, JSON.stringify(publications))
+    assert.ok(business.every(({ event }) => (event.data.message?.isError ?? event.data.isError) === false))
+    assert.equal(results.filter(({ event }) => event.data.message?.isError === true || event.data.isError === true).length, 2)
+    // On the unchanged verifier this assertion fails after real registered
+    // native/PTC results have already proved the semantic transport mismatch.
+    const diagnostics = harness.taskToolDiagnosticsSnapshot?.() ?? null
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0, publications, diagnostics }))
+    assert.equal(diagnostics?.byTool.task_board.envelopeError, 2)
+    assert.equal(diagnostics.byTool.task_board.envelopeOk, 3)
+    assert.equal(diagnostics.byTool.task_board.transportError, 2)
+    assert.equal(diagnostics.byTool.task_board.nativeResults, 4)
+    assert.equal(diagnostics.byTool.task_board.ptcResults, 3)
+    assert.equal(diagnostics.byRole.root, 1)
+    assert.equal(diagnostics.byRole.worker, 6)
+    assert.equal(diagnostics.errorCounts.E_NOT_FOUND, 2)
+    assert.equal(diagnostics.unattributedResults, 0, 'run_code is a wrapper, not a task result')
+  } catch (error) {
+    t.diagnostic(JSON.stringify({ originalAssertion: error.message, stack: error.stack }))
+    throw error
+  } finally {
+    let cleanupTimer
+    try {
+      await Promise.race([(async () => { await child?.dispose(); await harness.dispose() })(), new Promise((_, reject) => { cleanupTimer = setTimeout(() => reject(new Error('FIXTURE_CLEANUP_DEADLINE_12S')), 12000) })])
+    } finally { clearTimeout(cleanupTimer) }
+    await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+    for (const [index, name] of listenerEvents.entries()) {
+      if (name === 'exit' && process.rawListeners(name).length !== listeners[index].length) t.diagnostic(JSON.stringify({ addedExitCallbacks: process.rawListeners(name).filter(fn => !listeners[index].includes(fn)).map(fn => String(fn.listener ?? fn)) }))
+      assert.deepEqual(process.rawListeners(name), listeners[index], `exact ${name} callbacks restored`)
+    }
+  }
+})

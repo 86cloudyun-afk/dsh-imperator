@@ -250,6 +250,265 @@ function settlementProgress(harness, lastRequestElapsedMs) {
   return { lastRequestElapsedMs, settlement }
 }
 
+const taskTools = ['task_open', 'task_claim', 'task_fact', 'task_submit', 'task_accept', 'task_reject', 'task_close', 'task_board', 'task_child_send', 'task_child_stop', 'task_verify', 'task_checkpoint', 'task_workflow_create', 'task_workflow_submit', 'task_workflow_state']
+const taskCodes = ['E_NO_AGENT', 'E_NO_SESSION', 'E_NO_AGENTS_SERVICE', 'E_TERMINAL', 'E_STATUS', 'E_EVIDENCE_MISSING', 'E_BLOCKERS', 'E_TASK_CONFLICT', 'E_CROSS_RUN', 'E_NOT_FOUND', 'E_CHILD_SERVICE', 'E_CHILD_INPUT', 'E_CHILD_NO_AGENT', 'E_CHILD_NOT_OWN', 'E_CHILD_MISSING', 'E_CHILD_SETTLED', 'E_CHILD_NO_ID', 'E_CONTROL_JOURNAL_UNAVAILABLE', 'E_CONTROL_OUTCOME_UNKNOWN', 'UNAUTHORIZED', 'NOT_RESUMABLE', 'ABORTED', 'unknown']
+const taskCounters = ['calls', 'nativeResults', 'ptcResults', 'envelopeOk', 'envelopeError', 'transportError', 'unavailableResults']
+const taskRoles = ['root', 'worker', 'unknown']
+const taskOutcomes = ['envelope-ok', 'envelope-error', 'transport-error', 'unavailable']
+const taskFields = ['observedEvents', 'unattributedResults', 'byTool', 'byRole', 'errorCounts', 'details', 'truncated', 'saturated']
+const taskDetailFields = ['toolName', 'role', 'presentation', 'outcome', 'errorCode', 'eventIndex']
+const taskCounter = value => count(value) && value <= 65535
+const taskCoordinate = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && Buffer.byteLength(value, 'utf8') <= 256
+const zeroMap = keys => Object.fromEntries(keys.map(key => [key, 0]))
+const taskPromise = Promise
+const taskPromisePrototype = Promise.prototype
+const taskPromiseThen = Promise.prototype.then
+const taskPromiseSpecies = Object.getOwnPropertyDescriptor(Promise, Symbol.species).get
+const taskApply = Reflect.apply
+function discardTaskDiagnosticPromise(value) {
+  if (types.isProxy(value) || !types.isPromise(value)) return false
+  // Native then ignores an own .then getter, but performs SpeciesConstructor.
+  // Refuse a foreign constructor/prototype before that can run user code.
+  const constructor = Object.getOwnPropertyDescriptor(value, 'constructor')
+  const inheritedConstructor = Object.getOwnPropertyDescriptor(taskPromisePrototype, 'constructor')
+  const species = Object.getOwnPropertyDescriptor(taskPromise, Symbol.species)
+  if (Object.getPrototypeOf(value) === taskPromisePrototype
+    && constructor === undefined && inheritedConstructor?.value === taskPromise
+    && species?.get === taskPromiseSpecies) {
+    taskApply(taskPromiseThen, value, [() => {}, () => {}])
+  }
+  return true
+}
+function emptyTaskDiagnostics() {
+  return { observedEvents: 0, unattributedResults: 0,
+    byTool: Object.fromEntries(taskTools.map(name => [name, zeroMap(taskCounters)])),
+    byRole: zeroMap(taskRoles), errorCounts: zeroMap(taskCodes), details: [], truncated: false, saturated: false }
+}
+// Validate before copying. Data descriptors only; even a Proxy's reflection
+// traps and a foreign thenable's getter must remain untouched.
+function diagnosticFields(value, keys) {
+  if (!value || typeof value !== 'object' || types.isProxy(value)) return null
+  const proto = Object.getPrototypeOf(value)
+  if (proto !== Object.prototype && proto !== null) return null
+  const own = Reflect.ownKeys(value)
+  if (own.length !== keys.length || own.some(key => !keys.includes(key))) return null
+  const fields = Object.getOwnPropertyDescriptors(value)
+  if (keys.some(key => !Object.hasOwn(fields[key], 'value'))) return null
+  return Object.fromEntries(keys.map(key => [key, fields[key].value]))
+}
+function projectTaskDiagnostics(value) {
+  if (types.isProxy(value)) return null
+  if (discardTaskDiagnosticPromise(value)) return null
+  const fields = diagnosticFields(value, taskFields)
+  if (!fields || !taskCounter(fields.observedEvents) || fields.observedEvents > 4096 || !taskCounter(fields.unattributedResults)
+    || typeof fields.truncated !== 'boolean' || typeof fields.saturated !== 'boolean') return null
+  const byTool = diagnosticFields(fields.byTool, taskTools)
+  const byRole = diagnosticFields(fields.byRole, taskRoles)
+  const errorCounts = diagnosticFields(fields.errorCounts, taskCodes)
+  if (!byTool || !byRole || !errorCounts || [...Object.values(byRole), ...Object.values(errorCounts)].some(n => !taskCounter(n))) return null
+  for (const name of taskTools) {
+    const row = diagnosticFields(byTool[name], taskCounters)
+    if (!row || Object.values(row).some(n => !taskCounter(n))) return null
+    if (!fields.saturated && row.nativeResults + row.ptcResults !== row.envelopeOk + row.envelopeError + row.transportError + row.unavailableResults) return null
+    byTool[name] = row
+  }
+  const details = fields.details
+  if (!Array.isArray(details) || types.isProxy(details) || Object.getPrototypeOf(details) !== Array.prototype) return null
+  const length = Object.getOwnPropertyDescriptor(details, 'length')?.value
+  if (!count(length) || length > 20 || Reflect.ownKeys(details).length !== length + 1) return null
+  const copied = []
+  for (let index = 0; index < length; index++) {
+    const item = Object.getOwnPropertyDescriptor(details, String(index))
+    if (!item || !Object.hasOwn(item, 'value')) return null
+    const detail = diagnosticFields(item.value, taskDetailFields)
+    if (!detail || (detail.toolName !== null && !taskTools.includes(detail.toolName)) || !taskRoles.includes(detail.role)
+      || !['native', 'ptc'].includes(detail.presentation) || !taskOutcomes.includes(detail.outcome)
+      || (detail.errorCode !== null && !taskCodes.includes(detail.errorCode))
+      || (detail.eventIndex !== null && !count(detail.eventIndex))) return null
+    copied.push(detail)
+  }
+  return { observedEvents: fields.observedEvents, unattributedResults: fields.unattributedResults,
+    byTool, byRole, errorCounts, details: copied, truncated: fields.truncated, saturated: fields.saturated }
+}
+function taskDiagnosticHook(harness, name) {
+  if (!harness || types.isProxy(harness)) return null
+  const field = Object.getOwnPropertyDescriptor(harness, name)
+  if (!field || !Object.hasOwn(field, 'value') || typeof field.value !== 'function' || types.isProxy(field.value)) return null
+  return taskApply(field.value, harness, [])
+}
+function beginTaskDiagnostics(harness) {
+  try {
+    const result = taskDiagnosticHook(harness, 'beginTaskToolDiagnosticsStage')
+    return !discardTaskDiagnosticPromise(result) && result === undefined
+  } catch { return false }
+}
+function taskDiagnostics(harness, native) {
+  try {
+    const value = projectTaskDiagnostics(taskDiagnosticHook(harness, 'taskToolDiagnosticsSnapshot'))
+    return value && { source: native ? 'native-own-published-events' : 'custom-harness-unverified', ...value }
+  } catch { return null }
+}
+
+/** Public Session publications only: no history/store reads, arguments or raw text retained. */
+export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
+  const sessions = new Map()
+  let report = emptyTaskDiagnostics(), unavailable = false, limitedSessions = false, associations = 0, stageCursor = 0, decodedBytes = 0
+  const increment = (object, key) => {
+    if (object[key] === 65535) report.saturated = true
+    else object[key]++
+  }
+  const detail = (record, presentation, outcome, errorCode, seq) => {
+    if (report.details.length === 20) { report.truncated = true; return }
+    report.details.push({ toolName: record?.toolName ?? null, role: record?.role ?? 'unknown', presentation, outcome, errorCode,
+      eventIndex: count(seq) ? seq : null })
+  }
+  const unattributed = (presentation, seq) => {
+    increment(report, 'unattributedResults'); detail(null, presentation, 'unavailable', null, seq)
+  }
+  const invalidate = state => { if (state) state.valid = false; unavailable = true }
+  function clearCalls(state) { associations -= state.calls.size + state.ptc.size; state.calls.clear(); state.ptc.clear() }
+  function created(session) {
+    try {
+      if (!session || types.isProxy(session) || !taskCoordinate(session.id)) return
+      const id = session.id, prior = sessions.get(id), agent = agents.get(id)
+      const parent = session.header?.parentSession ?? null
+      const parentState = sessions.get(parent)
+      if (id !== rootId && !parentState) return
+      if (!agent || agent.session !== session || agent.id !== id || session.header?.id !== id
+        || (id === rootId ? parent !== null : !parentState.valid || parentState.closed || agents.get(parent)?.session !== parentState.session)
+        || !count(session.inheritedEventCount) || !count(session.seq) || session.seq < session.inheritedEventCount
+        || typeof session.isOwnSeq !== 'function') { invalidate(prior); return }
+      if (prior) {
+        if (!prior.closed || prior.parent !== parent || prior.cut !== session.inheritedEventCount || session.seq < prior.next) { invalidate(prior); return }
+        // A cold lifecycle can add unpublished seed/setup suffixes. None of
+        // its unresolved prior calls is evidence for a newly published result.
+        clearCalls(prior)
+      } else if (sessions.size === 16) { limitedSessions = true; report.truncated = true; return }
+      sessions.set(id, { session, agent, parent, cut: session.inheritedEventCount, next: session.seq,
+        valid: prior?.valid ?? true, closed: false, role: id === rootId ? 'root' : 'worker', calls: new Map(), ptc: new Map(), turn: null, step: null })
+    } catch { unavailable = true }
+  }
+  function disposed(session) {
+    try { const state = sessions.get(session?.id); if (state?.session === session) state.closed = true } catch { unavailable = true }
+  }
+  const callKey = (turn, step, id) => count(turn) && count(step) && taskCoordinate(id) ? JSON.stringify([turn, step, id]) : null
+  function retain(map, key, record) {
+    if (map.has(key)) { map.get(key).ambiguous = true; return }
+    if (associations === 4096) { report.truncated = true; return }
+    associations++; map.set(key, record)
+  }
+  function recordCall(state, map, key, name, seq, extra = {}) {
+    const toolName = taskTools.includes(name) ? name : null
+    if (toolName) { increment(report.byTool[toolName], 'calls'); increment(report.byRole, state.role) }
+    if (key === null || !taskCoordinate(name)) return
+    retain(map, key, { toolName, name, role: state.role, seq, stageCursor, resolved: false, ambiguous: false, ...extra })
+  }
+  function result(record, presentation, data, seq, budget) {
+    if (!record || record.ambiguous || record.resolved) { unattributed(presentation, seq); return }
+    record.resolved = true
+    if (!record.toolName) {
+      if (record.name !== 'run_code') unattributed(presentation, seq)
+      return // The native run_code wrapper is never another TaskForce outcome.
+    }
+    const row = report.byTool[record.toolName]
+    increment(row, presentation === 'native' ? 'nativeResults' : 'ptcResults')
+    let outcome = 'unavailable', errorCode = null
+    if (budget && data?.isError === true) outcome = 'transport-error'
+    else if (budget && data?.isError === false) {
+      const content = data.content
+      if (Array.isArray(content) && content.length === 1 && content[0]?.type === 'text' && typeof content[0].text === 'string') {
+        const text = content[0].text
+        if (text.length > 65536) report.truncated = true
+        else {
+          const bytes = Buffer.byteLength(text, 'utf8')
+          if (bytes > 65536 || bytes + decodedBytes > 2097152) report.truncated = true
+          else {
+            decodedBytes += bytes
+            try {
+              const envelope = JSON.parse(text)
+              if (envelope && typeof envelope === 'object' && !Array.isArray(envelope) && Object.hasOwn(envelope, 'ok') && typeof envelope.ok === 'boolean') {
+                outcome = envelope.ok ? 'envelope-ok' : 'envelope-error'
+                if (!envelope.ok) { errorCode = Object.hasOwn(envelope, 'code') && taskCodes.includes(envelope.code) ? envelope.code : 'unknown'; increment(report.errorCounts, errorCode) }
+              }
+            } catch { /* associated but undecodable */ }
+          }
+        }
+      }
+    }
+    increment(row, { 'envelope-ok': 'envelopeOk', 'envelope-error': 'envelopeError', 'transport-error': 'transportError', unavailable: 'unavailableResults' }[outcome])
+    detail(record, presentation, outcome, errorCode, seq)
+  }
+  function published(session, event) {
+    let state
+    try {
+      state = sessions.get(session?.id)
+      if (!state) {
+        // Beyond the session budget no authority/coordinates are retained.
+        // A public result from a further registered direct descendant can
+        // only be unavailable; it cannot silently look like full coverage.
+        if (limitedSessions && sessions.has(session?.header?.parentSession) && agents.get(session.id)?.session === session
+          && (event?.type === 'tool/result' || event?.type === 'tool/ptc-dispatch')) {
+          unattributed(event.type === 'tool/result' ? 'native' : 'ptc', event.seq)
+        }
+        return
+      }
+      if (!state.valid || state.closed || state.session !== session || agents.get(session.id) !== state.agent
+        || state.agent.session !== session || (session.header?.parentSession ?? null) !== state.parent
+        || session.inheritedEventCount !== state.cut || !count(event?.seq) || event.seq !== state.next
+        || session.seq !== event.seq + 1 || session.isOwnSeq(event.seq) !== true) { invalidate(state); return }
+      state.next++
+      const budget = report.observedEvents < 4096
+      if (budget) increment(report, 'observedEvents'); else report.truncated = true
+      const data = event.data
+      if (event.type === 'turn/start') { state.turn = count(data?.turn) ? data.turn : null; state.step = null }
+      if (event.type === 'step/start') { state.turn = count(data?.turn) ? data.turn : null; state.step = count(data?.step) ? data.step : null }
+      if (event.type === 'step/end' || event.type === 'turn/end') state.step = null
+      if (event.type === 'turn/end') state.turn = null
+      if (event.type === 'tool/call') {
+        if (budget) recordCall(state, state.calls, callKey(data?.turn, data?.step, data?.callId), data?.name, event.seq)
+        return
+      }
+      if (event.type === 'tool/result') {
+        const message = data?.message, source = message?.source
+        const key = callKey(data?.turn, data?.step, source?.callId), record = state.calls.get(key)
+        if (!record || source?.kind !== 'tool' || message?.toolCallId !== source.callId
+          || data.callId !== undefined && data.callId !== source.callId
+          || data.name !== undefined && data.name !== record.name
+          || source.toolName !== undefined && source.toolName !== record.name
+          || !Array.isArray(event.sourceEventSeqs) || event.sourceEventSeqs.length !== 1 || event.sourceEventSeqs[0] !== record.seq || record.seq >= event.seq) {
+          unattributed('native', event.seq); return
+        }
+        result(record, 'native', message, event.seq, budget); return
+      }
+      if (event.type !== 'tool/ptc-dispatch-start' && event.type !== 'tool/ptc-dispatch') return
+      const isResult = event.type === 'tool/ptc-dispatch'
+      const rootKey = callKey(state.turn, state.step, data?.rootCallId), root = state.calls.get(rootKey)
+      if (!root || root.ambiguous || root.resolved || !taskCoordinate(data?.parentCallId) || !taskCoordinate(data?.subCallId) || !taskCoordinate(data?.name)
+        || data.turn !== undefined && data.turn !== state.turn || data.step !== undefined && data.step !== state.step) {
+        if (isResult) unattributed('ptc', event.seq); return
+      }
+      const key = JSON.stringify([root.seq, state.turn, state.step, data.rootCallId, data.parentCallId, data.subCallId])
+      if (isResult) {
+        const record = state.ptc.get(key)
+        if (record?.name !== data.name) unattributed('ptc', event.seq)
+        else result(record, 'ptc', data, event.seq, budget)
+        return
+      }
+      let parentValid = data.parentCallId === data.rootCallId
+      if (!parentValid) {
+        let matches = 0
+        for (const row of state.ptc.values()) if (row.rootSeq === root.seq && row.subCallId === data.parentCallId && !row.ambiguous && !row.resolved) matches++
+        parentValid = matches === 1
+      }
+      if (budget && parentValid) recordCall(state, state.ptc, key, data.name, event.seq, { rootSeq: root.seq, subCallId: data.subCallId })
+    } catch { invalidate(state) }
+  }
+  return { created, disposed, published,
+    beginStage() { report = emptyTaskDiagnostics(); report.truncated = limitedSessions; decodedBytes = 0; unavailable = [...sessions.values()].some(state => !state.valid); stageCursor++ },
+    snapshot() { try { return unavailable ? null : projectTaskDiagnostics(report) } catch { return null } },
+  }
+}
+
 /** The optional second argument is an offline harness dependency seam, never a CLI option. */
 export async function runModelVerification(options = {}, { createHarness = createNativeHarness } = {}) {
   const config = validate(options)
@@ -257,7 +516,8 @@ export async function runModelVerification(options = {}, { createHarness = creat
   const requests = new Set()
   let harness, stopped = false, capHit = false, runtimeStopped = false, workerId
   let stageRecord, stageStart, stageRequestStart = 0, stageUsageStart, stageBefore, stagePreviousRequests
-  let lastRequestElapsedMs = null
+  let lastRequestElapsedMs = null, stageTaskDiagnosticsReady = false
+  const readTaskDiagnostics = () => stageTaskDiagnosticsReady ? taskDiagnostics(harness, createHarness === createNativeHarness) : null
   const report = { ok: false, provenance: {
     packageVersion: JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version,
     gitCommit: null, sourceSha256: productFingerprint(), packageSha256: config.packageSha256 ?? null,
@@ -292,12 +552,17 @@ export async function runModelVerification(options = {}, { createHarness = creat
     report.runtimeDiagnostics = total.runtimeDiagnostics
     if (!stageRecord) return { total }
     stageRecord.progress = settlementProgress(harness, lastRequestElapsedMs)
+    stageRecord.taskToolDiagnostics = readTaskDiagnostics()
     const workers = after.sessions.filter(s => s.id !== harness.rootId)
     const newWorkers = workers.filter(s => !stageBefore.sessions.some(old => old.id === s.id)).length
     const newTasks = after.tasks.filter(t => !stageBefore.tasks.some(old => old.id === t.id))
+    // Observation only: repair has not established authoritative workerId yet.
+    const reuseWorker = stageRecord.name === 'repair'
+      ? workers.length === 1 && typeof workers[0].id === 'string' && workers[0].id.length > 0 && workers[0].parent === harness.rootId ? workers[0].id : undefined
+      : workerId
     const reuseCalls = calls(after, 'task_child_send').slice(calls(stageBefore, 'task_child_send').length)
     const reuse = reuseCalls.filter(e => {
-      try { const args = typeof e.data.arguments === 'string' ? JSON.parse(e.data.arguments) : e.data.arguments; return args?.target_id === workerId } catch { return false }
+      try { const args = typeof e.data.arguments === 'string' ? JSON.parse(e.data.arguments) : e.data.arguments; return reuseWorker !== undefined && args?.target_id === reuseWorker } catch { return false }
     }).length
     const rework = calls(after, 'task_reject').length - calls(stageBefore, 'task_reject').length
     Object.assign(stageRecord, { requests: requests.size - stageRequestStart, durationMs: Date.now() - stageStart,
@@ -327,11 +592,15 @@ export async function runModelVerification(options = {}, { createHarness = creat
       stageRequestStart = beforeRequests
       stageUsageStart = beforeUsage
       lastRequestElapsedMs = null
-      stageRecord = { name: stage.name, ok: false, requests: 0, usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, newWorkers: 0, reuse: 0, rework: 0, facts: 0, accepted: 0, independentChecks: 0, strictVerified: false, progress: settlementProgress(harness, lastRequestElapsedMs), timeoutProgress: null }
+      stageTaskDiagnosticsReady = beginTaskDiagnostics(harness)
+      stageRecord = { name: stage.name, ok: false, requests: 0, usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, newWorkers: 0, reuse: 0, rework: 0, facts: 0, accepted: 0, independentChecks: 0, strictVerified: false, progress: settlementProgress(harness, lastRequestElapsedMs), timeoutProgress: null, taskToolDiagnostics: readTaskDiagnostics(), timeoutTaskToolDiagnostics: null }
       report.stages.push(stageRecord)
       await deadline(() => harness.runStage(stage), config.stageTimeoutMs, () => {
         // Capture a fresh primitive copy before cancellation mutates native state.
-        try { stageRecord.timeoutProgress = settlementProgress(harness, lastRequestElapsedMs) }
+        try {
+          stageRecord.timeoutProgress = settlementProgress(harness, lastRequestElapsedMs)
+          stageRecord.timeoutTaskToolDiagnostics = readTaskDiagnostics()
+        }
         finally { stopped = true; harness.cancel() }
       })
       const after = safeSnapshot(harness)
@@ -372,6 +641,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
     }
     if (stageRecord) {
       stageRecord.progress = settlementProgress(harness, lastRequestElapsedMs)
+      stageRecord.taskToolDiagnostics = readTaskDiagnostics()
       stageRecord.requests = requests.size - stageRequestStart
       stageRecord.durationMs = Date.now() - stageStart
       stageRecord.usage = Object.fromEntries(usageKeys.map(key => [key, report.usage[key] - stageUsageStart[key]]))
@@ -666,6 +936,13 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     const boundary = createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure })
     app.ctx.on('llm/stream', (options, next) => boundary.intercept(options, next), { global: true, prepend: true })
     const rootId = `taskforce-model-${randomUUID()}`
+    let taskCollector
+    try {
+      taskCollector = createTaskToolDiagnosticsCollector({ rootId, agents: app.ctx.get('agents') })
+      app.ctx.on('session/created', taskCollector.created, { global: true, prepend: true })
+      app.ctx.on('session/event', taskCollector.published, { global: true, prepend: true })
+      app.ctx.on('session/disposed', taskCollector.disposed, { global: true, prepend: true })
+    } catch { taskCollector = null } // Diagnostics cannot veto native creation.
     app.ctx.on('agent/created', ({ agent }) => {
       if (agent.id !== rootId && !tracked.has(agent.session.header.parentSession)) return
       tracked.set(agent.id, agent)
@@ -703,7 +980,8 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
       const tasks = observeModelTasks(store, rootId, workspace)
       return { sessions: sessions(), tasks, settled, streamAccounting: boundary.snapshot() }
     }
-    return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, settlementSnapshot: () => settlementSnapshot(), streamSnapshot: boundary.snapshot, cancel, dispose }
+    return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, settlementSnapshot: () => settlementSnapshot(), streamSnapshot: boundary.snapshot,
+      beginTaskToolDiagnosticsStage: () => taskCollector?.beginStage(), taskToolDiagnosticsSnapshot: () => taskCollector?.snapshot() ?? null, cancel, dispose }
   } catch (error) {
     try { await dispose() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'native setup and cleanup failed') }
     throw error

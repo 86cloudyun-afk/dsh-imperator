@@ -1381,7 +1381,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
   t.after(() => rm(workspace, { recursive: true, force: true }))
   let root, ctx, agents, fixtureRoot, childId, stage = 0, rootRequests = 0, localRequests = 0, completed = false
   const children = [], disposed = [], observations = [], releases = []
-  let childGate, flushGate, parentGate, childEntered, flushEntered, parentEntered, childEnded = false
+  let childGate, flushGate, parentGate, childEntered, flushEntered, parentEntered, childEnded = false, backgroundArgument
   const arrived = async (promise, boundary) => {
     let timer
     try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(JSON.stringify({ boundary, stage, rootRequests, localRequests, children: children.length, progress: harness.settlementSnapshot(), events: root.session.snapshotEvents().filter(e => ['step/error', 'tool/result'].includes(e.type)).map(e => ({ type: e.type, code: e.data.error?.code, error: e.data.error?.message })) }))), 5000) })]) }
@@ -1399,6 +1399,10 @@ test('native settlement diagnostics follow mounted continuable child, live send,
     onRequest() {},
   }, { inspectNative: nativeState => {
     root = nativeState.root; ctx = nativeState.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+    const schema = root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent')
+    const supportsBackground = Object.hasOwn(schema.parameters.properties, 'run_in_background')
+    assert.equal(supportsBackground, installationVersion(anchor) === '0.2.0-rc.2')
+    backgroundArgument = supportsBackground ? { run_in_background: true } : {}
     // Registration only: every real creation and continuation below is caused
     // by runStage's root loop after its activation and notice baselines exist.
     ctx.on('agent/created', ({ agent }) => {
@@ -1420,7 +1424,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
       if (request.sessionId === root.id) {
         rootRequests++
         if (rootRequests === 1) block = stage === 1
-          ? { type: 'tool-call', id: `local-spawn-${stage}`, name: 'subagent', arguments: JSON.stringify({ description: 'local settlement worker', prompt: 'Return 137.', run_in_background: true }) }
+          ? { type: 'tool-call', id: `local-spawn-${stage}`, name: 'subagent', arguments: JSON.stringify({ description: 'local settlement worker', prompt: 'Return 137.', ...backgroundArgument }) }
           : { type: 'tool-call', id: `local-cold-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Return 137 again.' }) }
         else if (stage === 1 && rootRequests === 2) block = { type: 'tool-call', id: 'local-live-send', name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Continue with the same answer.' }) }
         else if (notices() >= stage) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
@@ -1551,3 +1555,167 @@ test('native settlement timeout snapshots the held local stream before signal ca
   t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0, aborted, drained,
     timeoutProgress: report.stages[0].timeoutProgress, fixtureDisposed: true }))
 })
+
+for (const route of ['spawn', 'fork', 'nested-fork']) {
+  test(`native delegation contract: rc2 foreground ${route} waits for real disposal and parent turns without a notice`, options, async t => {
+    if (installationVersion(anchor) !== '0.2.0-rc.2') return t.skip('alpha has no foreground parameter or one-shot mounted route')
+    const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+    const { isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+    const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-foreground-'))
+    t.after(() => rm(workspace, { recursive: true, force: true }))
+    const nested = route === 'nested-fork', gates = []
+    const gate = () => { const value = nativeGate(); gates.push(value); return value }
+    const childGate = gate(), disposeGate = gate(), parentGate = gate(), rootGate = gate(), seedFlushGate = gate(), finalFlushGate = gate()
+    const childEntered = gate(), disposeEntered = gate(), parentEntered = gate(), rootEntered = gate(), seedFlushEntered = gate(), finalFlushEntered = gate()
+    const children = [], createdIdentities = [], observations = [], toolResults = new Map()
+    let root, ctx, agents, fixtureRoot, middle, leaf, stage = 'seed', rootRequests = 0, middleRequests = 0, middleEnds = 0
+    let localRequests = 0, completed = false, disposedLeaf = false, disposalReleased = false, seedFlushClaimed = false, pending
+    const identity = agent => ctx.sessionProjections.snapshot(agent.session, ['subagent']).values.subagent
+    const notices = agent => agent.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data?.source?.kind === 'subagent-settled')
+    const toolResult = (agent, callId) => agent.session.snapshotEvents().find(e => e.type === 'tool/result' && e.data.message?.toolCallId === callId)?.data.message
+    const arrived = async (promise, boundary) => {
+      let timer
+      try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(JSON.stringify({ route, boundary, rootRequests, middleRequests, middleEnds, progress: harness.settlementSnapshot(), events: [root, middle].filter(Boolean).flatMap(a => a.session.snapshotEvents().filter(e => ['step/error', 'tool/result'].includes(e.type)).map(e => ({ type: e.type, data: e.data }))) }))), 5000) })]) }
+      finally { clearTimeout(timer) }
+    }
+    const harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+      workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+    }, { inspectNative: state => {
+      root = state.root; ctx = state.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+      assert.ok(root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent').parameters.properties.run_in_background)
+      ctx.on('tools/result', (exec, result) => { toolResults.set(exec.callId, result) }, { global: true })
+      ctx.on('agent/created', ({ agent }) => {
+        if (agent.session.header.parentSession !== root.id && agent.session.header.parentSession !== middle?.id) return
+        children.push(agent)
+        const initial = identity(agent)
+        createdIdentities.push({ mode: initial?.mode ?? null, own: initial ? agent.session.isOwnSeq(initial.seq) : false })
+        if (nested && agent.session.header.parentSession === root.id) middle = agent
+        else {
+          leaf = agent
+          // This is the real child's scope teardown, awaited by handle.dispose
+          // before JSONL close/unregister and the foreground tool return.
+          agent.ctx.effect(() => async () => { disposeEntered.resolve(); await disposeGate.promise; disposalReleased = true })
+        }
+      }, { global: true })
+      ctx.on('agent/disposed', ({ agent }) => { if (agent === leaf) disposedLeaf = true }, { global: true })
+      ctx.on('session/event', (session, event) => {
+        if (session.id === middle?.id && event.type === 'turn/end' && event.data.reason.kind === 'completed') middleEnds++
+      }, { global: true })
+      ctx.on('session/flush', session => {
+        if (session.id !== middle?.id || middleEnds === 0) return
+        if (middleEnds === 1) {
+          if (!seedFlushClaimed) { seedFlushClaimed = true; seedFlushEntered.resolve(); return seedFlushGate.promise }
+          return
+        }
+        finalFlushEntered.resolve(); return finalFlushGate.promise
+      }, { global: true })
+      ctx.on('llm/stream', request => (async function* () {
+        localRequests++
+        assert.equal(isAgentLoopRequest(request), true); assert.equal(request.maxTokens, 8192)
+        let block = { type: 'text', text: '137' }
+        if (stage !== 'seed' && request.sessionId === root.id) {
+          rootRequests++
+          if (rootRequests === 1) block = { type: 'tool-call', id: 'foreground-create', name: route === 'fork' ? 'subagent_fork' : 'subagent',
+            arguments: JSON.stringify({ description: 'local lifecycle worker', prompt: 'Return 137.', run_in_background: nested }) }
+          else if (nested && rootRequests === 2) {
+            await signalGate(request.signal, seedFlushEntered.promise)
+            block = { type: 'tool-call', id: 'middle-live-send', name: 'task_child_send', arguments: JSON.stringify({ target_id: middle.id, message: 'Now fork a foreground child.' }) }
+          } else if (nested && notices(root).length) { rootEntered.resolve(); await signalGate(request.signal, rootGate.promise) }
+          else if (!nested) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
+        } else if (request.sessionId === middle?.id) {
+          middleRequests++
+          if (middleRequests === 2) {
+            seedFlushGate.resolve()
+            block = { type: 'tool-call', id: 'foreground-leaf', name: 'subagent_fork', arguments: JSON.stringify({ description: 'local foreground leaf', prompt: 'Return 137.', run_in_background: false }) }
+          } else if (middleRequests > 2) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
+        } else if (request.sessionId === leaf?.id) { childEntered.resolve(); await signalGate(request.signal, childGate.promise) }
+        yield { type: 'block-end', index: 0, block }
+        yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+        yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+      })(), { global: true })
+    } })
+    try {
+      assert.equal(children.length, 0)
+      await arrived(harness.runStage({ name: 'seed', prompt: 'Return a completed seed turn.' }), 'root-seed')
+      assert.equal(children.length, 0, 'all delegations follow the foreground stage baselines')
+      stage = 'foreground'
+      pending = harness.runStage({ name: stage, prompt: 'Exercise the actual mounted foreground lifecycle.' }).then(() => { completed = true })
+      pending.catch(() => {})
+      await arrived(childEntered.promise, 'child-stream')
+      assert.equal(children.length, nested ? 2 : 1)
+      assert.equal(completed, false)
+      const own = identity(leaf)
+      assert.equal(own.mode, 'one-shot'); assert.equal(leaf.session.isOwnSeq(own.seq), true)
+      assert.equal(createdIdentities.at(-1).own, false, 'creation precedes the own one-shot descriptor')
+      if (nested) {
+        assert.deepEqual(createdIdentities.at(-1), { mode: 'continuable', own: false }, 'fork seed carries the parent identity but does not own it')
+        assert.equal(identity(middle).mode, 'continuable')
+      }
+      assert.equal(harness.settlementSnapshot().requiredNotices, nested ? 1 : 0)
+      observations.push({ boundary: 'child-stream', ...harness.settlementSnapshot() })
+      childGate.resolve()
+      await arrived(disposeEntered.promise, 'scope-disposal')
+      assert.equal(completed, false); assert.equal(disposalReleased, false)
+      assert.equal(agents.get(leaf.id), leaf, 'actual unregister is still blocked by scope disposal')
+      assert.equal(toolResult(middle ?? root, nested ? 'foreground-leaf' : 'foreground-create'), undefined)
+      observations.push({ boundary: 'scope-disposal', ...harness.settlementSnapshot() })
+      disposeGate.resolve()
+      await arrived(parentEntered.promise, 'foreground-parent-turn')
+      assert.equal(disposalReleased, true); assert.equal(disposedLeaf, true)
+      assert.equal(agents.get(leaf.id), undefined)
+      const result = toolResult(middle ?? root, nested ? 'foreground-leaf' : 'foreground-create')
+      assert.equal(result?.isError, false)
+      assert.equal(result.content.filter(block => block.type === 'text').map(block => block.text).join(''), '137')
+      const value = toolResults.get(nested ? 'foreground-leaf' : 'foreground-create').value
+      assert.equal(value.kind, 'foreground'); assert.equal(value.runId, leaf.id)
+      assert.equal(notices(middle ?? root).filter(event => event.data.source.senderSessionId === leaf.id).length, 0)
+      assert.equal(completed, false, 'real foreground result cannot bypass the still-running parent')
+      observations.push({ boundary: 'parent-turn', ...harness.settlementSnapshot() })
+      parentGate.resolve()
+      if (nested) {
+        await arrived(finalFlushEntered.promise, 'continuable-parent-flush')
+        assert.equal(notices(root).length, 0); assert.equal(completed, false)
+        assert.equal(harness.settlementSnapshot().requiredNotices, 1)
+        assert.equal(harness.settlementSnapshot().missingNotices, 1)
+        observations.push({ boundary: 'continuable-parent-flush', ...harness.settlementSnapshot() })
+        finalFlushGate.resolve()
+        await arrived(rootEntered.promise, 'root-notice-turn')
+        assert.equal(notices(root).length, 1); assert.equal(completed, false)
+        rootGate.resolve()
+      }
+      await nativeCondition(() => root.status === 'idle' && children.every(agent => agent.status === 'idle') && harness.streamSnapshot().records.every(record => record.ended))
+      await arrived(pending, 'final-settlement')
+      const final = harness.settlementSnapshot()
+      t.diagnostic(JSON.stringify({ route, localRequests, paidRequests: 0, createdIdentities, observations, final, disposedLeaf, disposalReleased }))
+      assert.equal(completed, true, `completed foreground must settle without an inapplicable notice: ${JSON.stringify(final)}`)
+      await pending
+      assert.equal(final.phase, 'settled'); assert.equal(final.requiredNotices, nested ? 1 : 0)
+      assert.equal(final.deliveredNotices, nested ? 1 : 0); assert.equal(final.missingNotices, 0)
+      assert.equal(final.trackedAgents, nested ? 3 : 2); assert.equal(final.idleAgents, final.trackedAgents)
+      assert.ok(harness.streamSnapshot().records.every(record => record.ended))
+      assert.equal(identity(leaf).mode, 'one-shot', 'host identity remains authoritative after child scope disposal')
+      assert.deepEqual(diagnoseModelRuntime(harness.snapshot()).failureCodes, [])
+      // Actual owned-child guard refuses this exact settled one-shot id. It
+      // cannot satisfy later reuse by quietly creating a replacement worker.
+      const before = children.length
+      if (!nested) {
+        const refusal = await root.ctx.tools.execute({ agent: root, callId: 'foreground-reuse-refusal', name: 'task_child_send',
+          arguments: { target_id: leaf.id, message: 'Continue the same child.' }, signal: new AbortController().signal })
+        assert.equal(refusal.isError, false)
+        const denied = JSON.parse(refusal.value)
+        assert.equal(denied.ok, false); assert.equal(denied.code, 'E_CHILD_SETTLED')
+        assert.equal(children.length, before); assert.equal(agents.get(leaf.id), undefined)
+      }
+    } finally {
+      for (const item of gates) item.resolve()
+      harness.cancel()
+      const deadline = setTimeout(() => { console.error('FIXTURE_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+      try { await harness.dispose() } finally { clearTimeout(deadline) }
+      if (pending) await pending.catch(() => {})
+      assert.equal(agents.get(root.id), undefined)
+      for (const agent of children) assert.equal(agents.get(agent.id), undefined)
+      await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+      t.diagnostic(JSON.stringify({ route, nativeForegroundCleanup: true, paidRequests: 0 }))
+    }
+  })
+}

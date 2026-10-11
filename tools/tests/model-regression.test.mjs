@@ -1002,7 +1002,7 @@ function controlledSettlement(waitForNativeSettlement, definitions) {
   return { tracked, counts, beforeCounts, beforeNotices, histories, add, notice, seen, waitPhase,
     read: () => read(), hook: fn => { hook = fn }, release: () => { for (const gate of gates) gate.resolve() },
     stop: () => { disposed = true; for (const gate of gates) gate.resolve() },
-    run: () => waitForNativeSettlement({ tracked, rootId: 'root', activationCounts: counts, beforeCounts, beforeNotices, isDisposed: () => disposed, observe }) }
+    run: extra => waitForNativeSettlement({ tracked, rootId: 'root', activationCounts: counts, beforeCounts, beforeNotices, isDisposed: () => disposed, observe, ...extra }) }
 }
 
 test('settlement progress distinguishes maintenance idle from resolved native idle promises', async () => {
@@ -1169,3 +1169,183 @@ test('settlement last admitted request timestamp resets to null when a later sta
   assert.equal(report.stages[1].requests, 0)
   assert.deepEqual(report.stages[1].timeoutProgress, { lastRequestElapsedMs: null, settlement: null })
 })
+
+const settlementWindow = () => new Promise(resolve => setTimeout(resolve, 45))
+async function settlementDeadline(promise) {
+  let timer
+  try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('settlement did not complete')), 500) })]) }
+  finally { clearTimeout(timer) }
+}
+
+test('delegation contract: own mode uses the live host projection and rejects every untrusted identity', async () => {
+  const exported = await api()
+  // Old semantics classify all activations as continuable. This fallback lets
+  // the RED assert wrong behavior rather than stop on a missing export.
+  const classify = exported.nativeSubagentMode ?? (() => 'continuable')
+  let value = { mode: 'one-shot', seq: 2 }, reads = 0, checks = 0, inheritedBoundary = 2
+  const agent = { session: { isOwnSeq(seq) { checks++; return seq >= inheritedBoundary && seq < 10 } } }
+  Object.defineProperty(agent, 'ctx', { get() { throw new Error('disposed child scope must never be consulted') } })
+  const host = { sessionProjections: {
+    snapshot(session, keys) { reads++; assert.equal(session, agent.session); assert.deepEqual(keys, ['subagent']); return { values: { subagent: value } } },
+    cachedSnapshot() { throw new Error('cached mode may be stale') },
+  } }
+  assert.equal(classify(host, agent), 'one-shot')
+  value = { mode: 'continuable', seq: 2 }; assert.equal(classify(host, agent), 'continuable')
+  inheritedBoundary = 3; assert.equal(classify(host, agent), 'unknown', 'fork-inherited descriptor is not this child')
+  inheritedBoundary = 2
+  const invalid = [null, undefined, {}, { mode: 'one-shot' }, { mode: 'background', seq: 2 }, { mode: 'one-shot', seq: -1 },
+    { mode: 'one-shot', seq: 1.5 }, { mode: 'one-shot', seq: Number.MAX_SAFE_INTEGER + 1 }, { mode: 'one-shot', seq: '2' },
+    { mode: 'one-shot', seq: NaN }, { mode: 'one-shot', seq: Infinity }, { mode: 'one-shot', seq: 10 },
+    Object.create({ mode: 'one-shot', seq: 2 }), { mode: 'one-shot', get seq() { throw new Error('seq accessor') } },
+    { get mode() { return 'one-shot' }, seq: 2 }]
+  for (value of invalid) assert.equal(classify(host, agent), 'unknown')
+  value = { mode: 'one-shot', seq: 2 }
+  assert.equal(classify({}, agent), 'unknown')
+  assert.equal(classify({ sessionProjections: { snapshot: () => ({ values: {} }) } }, agent), 'unknown')
+  assert.equal(classify({ get sessionProjections() { throw new Error('service read') } }, agent), 'unknown')
+  assert.equal(classify({ sessionProjections: { snapshot() { throw new Error('projection failure') } } }, agent), 'unknown')
+  assert.equal(classify(host, { session: {} }), 'unknown')
+  assert.equal(classify(host, { session: { isOwnSeq() { throw new Error('own seq failure') } } }), 'unknown')
+  assert.equal(classify(host, { session: { isOwnSeq: () => 1 } }), 'unknown')
+  assert.ok(reads >= invalid.length + 3); assert.ok(checks >= 3)
+  assert.equal(classify(host, agent), 'one-shot', 'unknown is read again, never cached at creation')
+})
+
+test('delegation contract: one-shot notice exemption retains the entire mixed tree and exact continuable pairs', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['parent', 'root'], ['leaf', 'parent'], ['other', 'root']])
+  const modes = new Map([['parent', 'continuable'], ['leaf', 'one-shot'], ['other', 'continuable']])
+  f.notice('root', 'parent'); f.notice('root', 'parent'); f.notice('root', 'parent')
+  let completed = false
+  const pending = f.run({ classifyMode: agent => modes.get(agent.id) }).then(() => { completed = true })
+  try {
+    assert.equal(f.read().requiredNotices, 2)
+    assert.equal(f.read().deliveredNotices, 1); assert.equal(f.read().missingNotices, 1)
+    assert.equal(f.read().trackedAgents, 4); assert.equal(f.read().pendingIdleWaits, 4)
+    f.release(); await settlementWindow(); assert.equal(completed, false)
+    f.notice('root', 'other'); await settlementDeadline(pending)
+    assert.equal(f.read().requiredNotices, 2); assert.equal(f.read().deliveredNotices, 2)
+    assert.equal(f.tracked.get('leaf').idleCalls > 0, true)
+  } finally { f.stop(); await pending.catch(() => {}) }
+})
+
+for (const result of ['unknown', 'undefined', 'throws']) {
+  test(`delegation contract: ${result} mode blocks even with a delivered notice and zero missing count`, async () => {
+    const { waitForNativeSettlement } = await api()
+    const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['child', 'root']])
+    f.notice('root', 'child')
+    let known = false, completed = false
+    const pending = f.run({ classifyMode() { if (known) return 'continuable'; if (result === 'throws') throw new Error('mode read'); return result === 'undefined' ? undefined : 'unknown' } }).then(() => { completed = true })
+    try {
+      f.release(); await settlementWindow()
+      assert.equal(completed, false, 'a notice does not establish a valid current own descriptor')
+      assert.equal(f.read().phase, 'waiting-notices'); assert.equal(f.read().missingNotices, 0)
+      assert.equal(f.read().unknownAgents, 0, 'mode uncertainty is not Agent status uncertainty')
+      known = true; await settlementDeadline(pending)
+      assert.equal(f.read().phase, 'settled')
+    } finally { f.stop(); await pending.catch(() => {}) }
+  })
+}
+
+test('delegation contract: late own one-shot descriptor is reread after creation instead of permanently unknown', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['child', 'root']])
+  let mode = 'unknown', completed = false
+  const pending = f.run({ classifyMode: () => mode }).then(() => { completed = true })
+  try {
+    assert.equal(f.read().requiredNotices, 1)
+    f.release(); await settlementWindow(); assert.equal(completed, false)
+    mode = 'one-shot'; await settlementDeadline(pending)
+    assert.equal(f.read().phase, 'settled'); assert.equal(f.read().requiredNotices, 0)
+  } finally { f.stop(); await pending.catch(() => {}) }
+})
+
+for (const change of ['unknown', 'continuable', 'activation', 'replacement']) {
+  test(`delegation contract: final stable window rechecks ${change} despite unchanged event lengths`, async () => {
+    const { waitForNativeSettlement } = await api()
+    const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['child', 'root']])
+    if (change !== 'continuable') f.notice('root', 'child')
+    let mode = 'one-shot', changed = false, completed = false, replacement
+    f.hook(value => {
+      if (value?.phase !== 'checking-stability' || changed) return
+      changed = true
+      if (change === 'unknown' || change === 'continuable') mode = change
+      if (change === 'activation') { f.counts.set('child', 2); mode = 'continuable' }
+      if (change === 'replacement') replacement = f.add('child', 'root')
+    })
+    const pending = f.run({ classifyMode: () => mode }).then(() => { completed = true })
+    try {
+      f.release(); await settlementWindow()
+      assert.equal(changed, true); assert.equal(completed, false)
+      if (change === 'activation' || change === 'continuable') f.notice('root', 'child')
+      if (change === 'replacement') { assert.ok(f.read().pendingIdleWaits >= 1); replacement.gate.resolve() }
+      mode = 'one-shot'; await settlementDeadline(pending)
+    } finally { f.stop(); await pending.catch(() => {}) }
+  })
+}
+
+test('delegation contract: historical unknown child owes no new notice but still joins idle and cold activation checks', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['child', 'root']])
+  f.beforeCounts.set('child', 1); f.notice('root', 'child'); f.beforeNotices.set(JSON.stringify(['root', 'child']), 1)
+  let mode = 'unknown'
+  const first = f.run({ classifyMode: () => mode })
+  try {
+    assert.equal(f.read().requiredNotices, 0); assert.equal(f.read().pendingIdleWaits, 2)
+    f.release(); await settlementDeadline(first)
+    const child = f.add('child', 'root')
+    let completed = false
+    const second = f.run({ classifyMode: () => mode }).then(() => { completed = true })
+    try {
+      child.gate.resolve(); await settlementWindow(); assert.equal(completed, false)
+      assert.equal(f.read().requiredNotices, 1); assert.equal(f.read().deliveredNotices, 0)
+      f.notice('root', 'child'); await settlementWindow(); assert.equal(completed, false)
+      mode = 'continuable'; await settlementDeadline(second)
+      assert.equal(f.read().deliveredNotices, 1)
+    } finally { f.stop(); await second.catch(() => {}) }
+  } finally { f.stop(); await first.catch(() => {}) }
+})
+
+test('delegation contract: repair discloses the two future same-child stages before irreversible worker creation', async () => {
+  const { MODEL_STAGES } = await import('../model-fixtures.mjs')
+  const repair = MODEL_STAGES.find(stage => stage.name === 'repair').prompt
+  assert.match(repair, /可续作.*continuable/)
+  assert.match(repair, /后续两个阶段.*task_child_send.*同一 childId.*不新建代理/)
+  assert.match(repair, /若派发工具提供 run_in_background 参数.*true.*未提供则不传/)
+})
+
+for (const fault of ['no-service', 'service-getter', 'no-projection', 'snapshot-throws', 'no-values', 'absent', 'null',
+  'no-mode', 'unsupported', 'mode-getter', 'mode-throws', 'inherited-fields', 'no-seq', 'seq-getter', 'seq-throws',
+  'negative-seq', 'fraction-seq', 'unsafe-seq', 'string-seq', 'nan-seq', 'infinite-seq', 'non-own', 'no-own-method', 'own-throws', 'own-truthy']) {
+  test(`delegation contract: classifier fails closed for ${fault}`, async () => {
+    const { nativeSubagentMode = () => 'continuable' } = await api()
+    let identity = { mode: 'one-shot', seq: 2 }, calls = 0
+    const agent = { session: { isOwnSeq: () => true } }
+    let host = { sessionProjections: { snapshot: () => ({ values: { subagent: identity } }) } }
+    if (fault === 'no-service') host = {}
+    if (fault === 'service-getter') host = { get sessionProjections() { throw new Error('service') } }
+    if (fault === 'no-projection') host.sessionProjections.snapshot = () => ({ values: {} })
+    if (fault === 'snapshot-throws') host.sessionProjections.snapshot = () => { throw new Error('read') }
+    if (fault === 'no-values') host.sessionProjections.snapshot = () => ({})
+    if (fault === 'absent') identity = undefined
+    if (fault === 'null') identity = null
+    if (fault === 'no-mode') delete identity.mode
+    if (fault === 'unsupported') identity.mode = 'background'
+    if (fault === 'inherited-fields') identity = Object.create(identity)
+    if (fault === 'mode-getter' || fault === 'mode-throws') Object.defineProperty(identity, 'mode', { get() { calls++; if (fault === 'mode-throws') throw new Error('mode'); return 'one-shot' } })
+    if (fault === 'no-seq') delete identity.seq
+    if (fault === 'seq-getter' || fault === 'seq-throws') Object.defineProperty(identity, 'seq', { get() { calls++; if (fault === 'seq-throws') throw new Error('seq'); return 2 } })
+    if (fault === 'negative-seq') identity.seq = -1
+    if (fault === 'fraction-seq') identity.seq = 0.5
+    if (fault === 'unsafe-seq') identity.seq = Number.MAX_SAFE_INTEGER + 1
+    if (fault === 'string-seq') identity.seq = '2'
+    if (fault === 'nan-seq') identity.seq = NaN
+    if (fault === 'infinite-seq') identity.seq = Infinity
+    if (fault === 'non-own') agent.session.isOwnSeq = () => false
+    if (fault === 'no-own-method') delete agent.session.isOwnSeq
+    if (fault === 'own-throws') agent.session.isOwnSeq = () => { throw new Error('own') }
+    if (fault === 'own-truthy') agent.session.isOwnSeq = () => 1
+    assert.equal(nativeSubagentMode(host, agent), 'unknown')
+    assert.equal(calls, 0, 'untrusted identity accessors are not invoked')
+  })
+}

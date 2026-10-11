@@ -417,34 +417,63 @@ function settlementCounts(sessions) {
   return counts
 }
 
-function nativeSettlementSnapshot({ tracked, rootId, activationCounts, beforeCounts, beforeNotices }, state) {
+/** Current, child-owned SDK identity. A fork prefix and a disposed child scope
+ * are not authority; the live host projection remains readable after disposal. */
+export function nativeSubagentMode(host, agent) {
   try {
-    const agents = [...tracked.values()], sessions = nativeSessions(tracked), notices = settlementCounts(sessions)
+    const identity = host.sessionProjections.snapshot(agent.session, ['subagent']).values.subagent
+    const mode = Object.getOwnPropertyDescriptor(identity, 'mode')?.value
+    const seq = Object.getOwnPropertyDescriptor(identity, 'seq')?.value
+    return (mode === 'one-shot' || mode === 'continuable') && count(seq)
+      && agent.session.isOwnSeq(seq) === true ? mode : 'unknown'
+  } catch { return 'unknown' }
+}
+
+// The compatibility seam without a classifier keeps its original all-notice
+// contract. The actual native harness always supplies the authoritative reader.
+function nativeSettlementObligations({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode }, sessions) {
+  const notices = settlementCounts(sessions)
+  let requiredNotices = 0, deliveredNotices = 0, missingNotices = 0, unknown = false
+  for (const child of sessions.filter(session => session.id !== rootId)) {
+    const activations = Math.max(0, (activationCounts.get(child.id) ?? 0) - (beforeCounts.get(child.id) ?? 0))
+    if (activations === 0) continue
+    let mode = 'unknown'
+    try { mode = classifyMode === undefined ? 'continuable' : classifyMode(tracked.get(child.id)) } catch { /* fail closed */ }
+    if (mode !== 'one-shot' && mode !== 'continuable') unknown = true
+    const needed = mode === 'one-shot' ? 0 : activations
+    const key = JSON.stringify([child.parent, child.id])
+    const delivered = sessions.some(session => session.id === child.parent)
+      ? Math.min(needed, Math.max(0, (notices.get(key) ?? 0) - (beforeNotices.get(key) ?? 0))) : 0
+    requiredNotices += needed
+    deliveredNotices += delivered
+    missingNotices += needed - delivered
+  }
+  return { requiredNotices, deliveredNotices, missingNotices, ready: !unknown && missingNotices === 0 }
+}
+
+function nativeSettlementSnapshot(config, state) {
+  try {
+    const { tracked } = config
+    const agents = [...tracked.values()], sessions = nativeSessions(tracked)
     const result = { phase: state.phase, trackedAgents: agents.length, idleAgents: 0, runningAgents: 0, unknownAgents: 0,
       pendingIdleWaits: state.pending.size, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0 }
     for (const agent of agents) {
       const status = agent.status
       result[status === 'idle' ? 'idleAgents' : status === 'running' ? 'runningAgents' : 'unknownAgents']++
     }
-    for (const child of sessions.filter(session => session.id !== rootId)) {
-      const needed = Math.max(0, (activationCounts.get(child.id) ?? 0) - (beforeCounts.get(child.id) ?? 0))
-      const key = JSON.stringify([child.parent, child.id])
-      const delivered = sessions.some(session => session.id === child.parent)
-        ? Math.min(needed, Math.max(0, (notices.get(key) ?? 0) - (beforeNotices.get(key) ?? 0))) : 0
-      result.requiredNotices += needed
-      result.deliveredNotices += delivered
-      result.missingNotices += needed - delivered
-    }
+    const { requiredNotices, deliveredNotices, missingNotices } = nativeSettlementObligations(config, sessions)
+    Object.assign(result, { requiredNotices, deliveredNotices, missingNotices })
     return projectSettlement(result)
   } catch { return null }
 }
 
 /** Wait through native asynchronous flush/dispose and the parent's resulting turn.
- * Each newly created activation requires its own delivered notice, including
- * cold reuse of an existing session id and every depth of the descendant tree. */
-export async function waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed, observe }) {
+ * Continuable activations require their own notice at every depth and on cold
+ * reuse. One-shot exemption never removes an Agent from the native idle tree. */
+export async function waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed, observe, classifyMode }) {
+  const config = { tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode }
   const state = { phase: 'not-started', pending: new Set() }
-  const read = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, beforeCounts, beforeNotices }, state)
+  const read = () => nativeSettlementSnapshot(config, state)
   const publish = () => { try { discardDiagnosticPromise(observe?.(read)) } catch { /* observation cannot affect waiting */ } }
   const phase = value => { state.phase = value; publish() }
   publish()
@@ -468,19 +497,16 @@ export async function waitForNativeSettlement({ tracked, rootId, activationCount
     phase('waiting-notices')
     await tick()
     const sessions = nativeSessions(tracked)
-    const notices = settlementCounts(sessions)
-    const delivered = sessions.filter(s => s.id !== rootId).every(child => {
-      const needed = (activationCounts.get(child.id) ?? 0) - (beforeCounts.get(child.id) ?? 0)
-      const key = JSON.stringify([child.parent, child.id])
-      return needed === 0 || sessions.some(s => s.id === child.parent)
-        && (notices.get(key) ?? 0) - (beforeNotices.get(key) ?? 0) >= needed
-    })
-    if (delivered && [...tracked.values()].every(agent => agent.status === 'idle')) {
+    if (nativeSettlementObligations(config, sessions).ready && [...tracked.values()].every(agent => agent.status === 'idle')) {
       const positions = new Map(sessions.map(s => [s.id, s.events.length]))
+      const stableAgents = new Map(tracked), stableCounts = new Map(activationCounts)
       phase('checking-stability')
       await tick()
+      const current = nativeSessions(tracked)
       if ([...tracked.values()].every(agent => agent.status === 'idle') && tracked.size === positions.size
-        && nativeSessions(tracked).every(s => s.events.length === positions.get(s.id))) { phase('settled'); return }
+        && [...tracked].every(([id, agent]) => agent === stableAgents.get(id) && activationCounts.get(id) === stableCounts.get(id))
+        && current.every(s => s.events.length === positions.get(s.id))
+        && nativeSettlementObligations(config, current).ready) { phase('settled'); return }
     }
   }
   fail('unsettled-tree')
@@ -661,13 +687,14 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     // live object; its durable session history contains prior usage and notices.
     const sessions = () => nativeSessions(tracked)
     let settled = true
-    let settlementSnapshot = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, beforeCounts: new Map(activationCounts), beforeNotices: settlementCounts(sessions()) }, { phase: 'not-started', pending: new Set() })
+    const classifyMode = agent => nativeSubagentMode(app.ctx, agent)
+    let settlementSnapshot = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, classifyMode, beforeCounts: new Map(activationCounts), beforeNotices: settlementCounts(sessions()) }, { phase: 'not-started', pending: new Set() })
     async function runStage(stage) {
       settled = false
       const beforeNotices = settlementCounts(sessions())
       const beforeCounts = new Map(activationCounts)
       handle.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: stage.prompt }] }))
-      await waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
+      await waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
       settled = true
     }
 

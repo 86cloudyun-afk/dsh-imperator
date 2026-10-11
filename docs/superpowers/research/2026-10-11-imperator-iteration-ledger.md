@@ -222,3 +222,22 @@ Task19 已选择25清单记录：24个输出读取点（9 explicit+15 single-sta
 唯一新的私有空编译缓存观测仍FAIL：原60s阶段exit1/timedOuttrue，78实际TAP pass，scheduler C001于59.946s进入后未结束。旧/新77可比较body记录总时长差−0.408889579s，但未测cachehit或因果收益；cache-alone不作为充分修复。全部83case静态重算和1083命名输入复核通过，root分析receipt `e2de29b9c71867c3cac8644c6b53e29417d23b1e4bd6774c0ae322fdc2ad5a65`。Task18新的helper-only公开初始化候选已静态封存，两SDK源分别核对；只移除首次丢弃loadProfile，保留后续加载与native named boot、cold fixture、选项/getter/Promise/lifecycle/全部原测试和门槛。其性能未测、transient read failure顺序差异明确披露；独立设计审核进行中，无runtime/productGO。
 
 最新真实模型8237仍FAILED、不可改写；无新增paid、无旧候选重试。PR69仍draft/remote da50未合并，artifact已关联本任务。原60000/12000/2×10000/180000、80/8192、Node/SDK pins/range、DDL/依赖/名字/SDK adapter CLOSED/acceptance gate均未放宽。用户历史生产停止仍未归因。后续整候选验收、whole SPEC→root→QUALITY、实际PR CI与额外fresh合并前审核、预期head合并及actualmain验证全部保留。
+
+
+### 16:16 UTC：Task16 完整实现审核通过，Task17 正式采用
+
+Task16 最终 `b9e29fa0a9331e7d92549104abb0c7338a4bd361` / tree `07ba8417b122966660d6feb269306158a0577f03`，208 tracked、111产品 fingerprint `f57db5b1642989053f101e65b066ba2e8d2d223074549e5c29055053c7b76564`。十六身份读取点/三十二字段恢复后再比较、绑定或序列化，旧 prefix capture 与旧 clipped JSON 不猜测重建。两准确 pin 目标各574PASS；最终仅测试 hook 加强后各217PASS，包含213顶层+4nested； inherited public 各45case PASS。Node24 offline1967total/1947PASS/20existing host SKIP/0FAIL，六scripts加node:test七检查通过；host仍UNVERIFIED。早期574未执行最后hook断言，217与完整offline绑定最终源码，不能混淆。
+
+fresh SPEC `786e9a627472cfd1fc0b6b072c8ebe4807e3c759f8856b9318e8b7097223aa30` 保存STOP，root全文复核12制品/1842输入/670support并明确fresh QUALITY GO；fresh QUALITY `60d1a2bf15bd5bc7b202de8c61c353483e186fefa4155e6b72a0665b12ceb89a` PASS，无阻断问题。root全文复核13制品、1855primary/1596support输入与208 source/Git blob/模式、111产品指纹；最终 acceptance receipt `7cbd2b69e589a8f1b8b1944c088576521c91cd649d760fe0d9ae2e47270c7955`。严格 C-E1 malformed transport→receipt wrapper 合成故障未独立执行；通用decoder故障、真实strict路径与未变catch源码组成证据。dense positive 细分计数由邻接width/lifecycle测试提供。这些覆盖粒度限制不写成已实测个案。
+
+初始 permanent baseline collector 因Node24实际spec reporter被误作TAP而失败，原日志/结果保留；root完整raw核对后另行处置，未重跑旧baseline。CODE GREEN后的fixture cleanup删除12先前audit canonical路径，原作者 EVIDENCE CLEANUP STOP 保留不改；独立 relocation审核与root additive disposition `7ca41978c360802f69407523b2f131168fd9131fb106cef09e6341b715f44ada` 证明372原路径无漂移及12明确archive字节/模式相符。没有恢复路径/inode/时间连续性；archive只支持历史静态审查，不能当未来canonical receipt seed。
+
+正式采用 [Task17 retained fingerprint规范](../specs/2026-10-11-retained-fingerprint-design.md) / [计划](../plans/2026-10-11-retained-fingerprint.md)。已通过独立设计审核和真实旧706 RED；最新actual-b9e静态准备10输出/503输入/30case记录已root全文核对，receipt `99461401cc753659df920ddbb5aef887fcdf925fbabd905a72af10de7ad48616`。ops/tests与旧706相同，imports当前差异已有绑定。R1保留normal历史、R2 armed原源非迁移只读/clone真实迁移规范优先。正式文档采用不表示已经实施；sole producer CODEGO与NEW GREEN derivative root全文/manifest/runtimeGO分别发出。
+
+Task19已补入公开接受的call_id/root_call_id/nullable parent_call_id；修订E1七字段、25记录75字段DESIGNPASS/root全文与85输出准备已通过。旧closed-seed读取反例不表示同creation-handle immediate已实测，未来P4须真实同handle加reopen。实际approved16 AND17基线绑定、正式采用、六组合15star max-width/独立later-coordinate故障机制、CODEGO与publicP1–P7实现/审核尚待。
+
+Task20 repeated certified frozen cursor 的静态设计独立PASS，报告 `9a4515d056d14904712a12fd2207d4830c56fa202591ace32bcc324019907eec`，root全文/7制品248input核验 receipt `7fd172115c9889a4cde8d53c15575cb14d885e375e0f1b7f1cdecef0f6c87d68`。仅单WeakRef提示，当前原guard/seq/outer certification/prefix update/result/append/snapshot顺序与fallback保持；T1新结果身份、T8非空batch故障、T6/T7可达fault-fired boolean诊断等执行要求保留。未实施、未测性能、未证明native60s问题解决；approved16/17/19源码重新绑定后才可正式采用/实施。
+
+Task18三次original60s观测均FAIL保留；fresh cache与initializer-only不足，initializer correctness268checks通过不替代整native。boot-only省略后加载会改变invalid-config dotenv副作用顺序，source-confirmed reject，无候选product patch/实际negative probe。原CI Node22目标12s被杀phase未观测，历史生产停止仍未归因。最终候选将补准确Node22 source/npm/fullnative，与原四Node24 local gates及六CI共同验收；65s standalone native diagnostic collector不变为完整multi-stage验收新上限。
+
+原Node/DSH pins、DDL/名字/依赖/SDK adapter CLOSED、60000/12000/2×10000/180000、80/8192及原grader/gate不变。paid8237 FAILED不可改写、无旧候选重试、无新增paid。PR69实际仍draft/remote da50未合并，正文已更新当前局部进展；源码尚未推送。新冻结整候选/source/npm/双pin双SDK完整native/ONEpurposeful paid原始60检查加独立diagnostics/whole SPEC-root-QUALITY/实际PR六CI/额外fresh合并前审核/match-head合并/actualmain parents-tree-fingerprint-version-六CI仍全部必须完成。

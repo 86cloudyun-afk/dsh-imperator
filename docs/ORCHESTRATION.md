@@ -130,7 +130,7 @@ repair/reuse 的提示与实际任务 policy 均固定为 `legacy`，便于与�
 
 grader 在工作区外运行固定断言，不运行模型自行改写的测试来决定最终通过；删除测试、打印成功或提前 exit(0) 都不能替代 grader 完成。strict 固定命令为 `node --test money.test.mjs`，清单为 `money.mjs` 和 `money.test.mjs`。任务豁免不计通过。模型请求错误、工具错误、非正常 turn/end、缺 usage、不完整验收、超额、超时或清理失败均不能标记 `ok: true`。
 
-runner 走官方 `controlledProfile`、registry mount 和 native followup，记录所有真实子代激活并等待各层宿主结算通知及主会话再次空闲。上限默认且最大 80 个全树请求（允许调低），每阶段默认 180000 ms；重试和自动标题模型调用关闭。失败时取消所有跟踪 agent，dispose 主句柄与应用，每步清理最多等待 10 秒，最终清除临时 profile/home/workspace 并还原环境和退出码。
+runner 走官方 `controlledProfile`、registry mount 和 native followup，记录所有真实子代激活，等待全部跟踪 Agent 的原始 `whenIdle` 与主会话再次空闲，并保留两次稳定性检查。通知义务按公开当前 own-session 模式判定：continuable 每次本阶段激活须收到相应父子对的真实结算通知；明确 one-shot 不等待 SDK 不发送的通知，前台结果及实际销毁仍由原生工具完成；当前新增激活的身份未知时阻止结算。repair 首次任务明确后两阶段必须通过 `task_child_send` 复用同一可续作执行者。上限默认且最大 80 个全树请求（允许调低），每阶段默认 180000 ms；重试和自动标题模型调用关闭。失败时取消所有跟踪 agent，dispose 主句柄与应用，每步清理最多等待 10 秒，最终清除临时 profile/home/workspace 并还原环境和退出码。
 
 报告只持久化白名单元数据，不保存模型推理、对话、原始工具返回、证据内容或 credentials。任务/会话历史及 native 日志位于运行期间的临时 home，清理后移除。报告含固定阶段名称、数值指标、独立判据结果、固定失败码和版本/摘要；模型原文、异常消息及任意事实陈述不能进入报告。源码指纹覆盖排序后的 `package.json`、`cordis.patch.yml`、`lib/` 与 `tools/` 路径和文件字节；文档、报告和 git 元数据不计入。缓存 tokens 按宿主语义单列，`inputTokens` 是未缓存输入，缺省 cache 字段计 0。报告是单次受控样例，不能独自证明普遍性能提升。
 

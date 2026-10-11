@@ -41,7 +41,7 @@ node tools/imperator.mjs preflight --root /absolute/taskforce --json
 node tools/imperator.mjs restore --backup /absolute/backup --out /absolute/new-staging-root --json
 ```
 
-普通验收不发模型请求。0.4.1 原包真实模型在固定 80 次请求内完成前三阶段，第四阶段未完成验收；0.4.2 首包及追加诊断后的第二包均通过本地四道检查，但实际模型均在 repair 达到 180 秒限时，后两阶段未执行。第二包取消前确有两 Agent idle、一个结算通知未满足；报告没有执行者模式，历史因果仍未知。源码深查确认的 rc.2 前台 one-shot 通知误等已通过三条真实原生 RED/GREEN 修正，首次任务也已披露后续复用前提。十二项任务分别通过独立 SPEC→QUALITY；新产品/提示样本仍须重新完成全部实际验收、整轮及额外 PR 审核后才能合并，旧失败全部保留。实际状态见 [本轮迭代记录](docs/superpowers/research/2026-10-11-imperator-iteration-ledger.md)。生产部署入口和历史失败 run/child 日志尚无证据，不能据此推定历史生产停止根因。
+普通验收不发模型请求。0.4.1 原包真实模型在固定 80 次请求内完成前三阶段，第四阶段未完成验收；0.4.2 三个冻结包均通过本地四道检查，实际模型均在 repair 达到 180 秒限时，后两阶段未执行。第二包取消前确有两 Agent idle、一个结算通知未满足，历史因果仍未知。源码深查确认的 rc.2 前台 one-shot 通知误等已通过三条真实原生 RED/GREEN 修正，首次任务也已披露后续复用前提；第三包的 49 请求新样本在取消前仍有一个运行中的 Agent 和原始 idle 等待，任务尚未提交，不能沿用前台误等解释。十二项任务分别通过独立 SPEC→QUALITY；真实模型门槛仍失败，整轮及额外 PR 审核、最终 CI/合并尚未完成，失败样本全部保留。实际状态见 [本轮迭代记录](docs/superpowers/research/2026-10-11-imperator-iteration-ledger.md)。生产部署入口和历史失败 run/child 日志尚无证据，不能据此推定历史生产停止根因。
 
 ## 两个正交的问题，一次解决
 

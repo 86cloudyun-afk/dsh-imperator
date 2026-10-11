@@ -6,7 +6,7 @@
 
 包版本为 0.4.2，固定包名、preset、显示名和数据库位置不变。本轮没有新增运行时依赖或 DDL，原生全树 adapter 仍关闭；队列撤回要求同库调度写入者协调升级到同一版本。Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2 / 0.2.1-alpha.2（预发布版），版本范围不代表所有未来版本均已测试。逐项 RED/GREEN、审核和精确最终验收状态见 [本轮记录](superpowers/research/2026-10-11-imperator-iteration-ledger.md)。
 
-截至 2026-10-11 08:49 UTC，十二项任务分别通过独立 SPEC→QUALITY。第十二项原生 RED/GREEN 证明并修正 rc.2 前台通知误等；alpha 实际 schema 没有前台参数，47 项适用原生测试通过，三个 rc.2 专属前台分支明确跳过，不当作 alpha 覆盖。两个旧 0.4.2 包的本地四门槛通过、真实模型均 FAILED；新产品/提示样本的最终包验收、整轮与额外 PR 审核、CI/合并/main 验证仍待完成。源码缺陷不证明历史模型选择了前台模式。
+截至 2026-10-11 09:02 UTC，十二项任务分别通过独立 SPEC→QUALITY。第三个冻结包已通过 source、单 CPU、同一解包的两 pins 全量 native：rc.2 原生 104/104，alpha 101/104，三个 rc.2 专属前台分支因 alpha 实际 schema 不支持而明确跳过。新产品/提示样本的唯一实际模型仍 FAILED：49 请求，repair 到达 180 秒限时，取消前有一个 Agent 运行、一个原始 idle 等待，任务 claimed 而未提交；后两阶段未执行。整轮与额外 PR 审核、最终 CI/合并/main 验证仍未完成。源码修正不证明此前模型选择了前台模式，第三包也不能解释为相同误等。
 
 历史 0.3.2 修复 ID-only 代理调用、未归属任务接管与子代理错误分类，blocker 索引测量见 [0.3.2 研究记录](superpowers/research/2026-10-09-imperator-0.3.2-recovery.md)。以下旧候选数据属于其历史验收，不作为本版通过证据。
 
@@ -83,7 +83,7 @@ node tools/verify-model.mjs --model-calls \
 
 可选 `--package-sha256 <64位小写SHA256>` 绑定实际交付 tarball 的摘要；调用者应先独立计算该摘要。报告 `report.json` 绑定包版本、完整 git commit（源码树可取时）、产品源码 SHA256、可选包摘要、宿主/Node 版本与 provider/model。每阶段给出请求、输入/输出/缓存 tokens、时长、新建/复用/返工、事实和验收数量、固定独立断言数量；失败阶段仍保留已知计数。只有四阶段独立判据、真实任务闭环、完整 usage 与清理全部通过，`ok` 才为 true，CLI 才退出 0。
 
-每阶段 `progress` 给出最近一次获准请求的阶段内时间 `lastRequestElapsedMs`（无请求时为 null），以及 `settlement`：固定阶段位置和八项计数，无法读取时为 null。计数来自实际 tracked Agents 的状态、原始 `whenIdle` 等待和本阶段各父子对的结算通知；单独的 idle 或 accepted 不表示运行树已结束。阶段达到限时才记录独立的 `timeoutProgress`，在取消前复制；后续取消、清理和普通 progress 更新不改写它。仅保存固定枚举和数字，不保存会话身份或原始内容，原等待条件、两次稳定性检查、独立 grader 与有限额度保持。
+每阶段 `progress` 给出最近一次获准请求的阶段内时间 `lastRequestElapsedMs`（无请求时为 null），以及 `settlement`：固定阶段位置和八项计数，无法读取时为 null。计数来自实际 tracked Agents 的状态、原始 `whenIdle` 等待和本阶段各父子对的结算通知；单独的 idle 或 accepted 不表示运行树已结束。阶段达到限时才记录独立的 `timeoutProgress`，在取消前复制；后续取消、清理和普通 progress 更新不改写它。仅保存固定枚举和数字，不保存会话身份或原始内容。原生 `whenIdle` 等待与两次 tick 保留；通知义务按当前 own-session 模式判定，未知的本阶段新增 activation 阻止结算；独立 grader 与有限额度保持。
 
 原生验证器固定每个获准请求输出容量为8192 tokens，同时配置 provider 默认值与 root agent；官方子会话继承此配置，不降低 reasoning effort。在全局公开 `llm/stream` waterfall 消费边界，以 SDK `isAgentLoopRequest` 的精确对象标记、真实 agent/request 的 agent/turn/step/signal 和受控 root 子树核对归属，只对匹配的一次实际流消费计请求。SDK prepared call 已解析的 provider/model/maxTokens 必须匹配固定路由与8192，错误路由或65536等容量在派发前拒绝。报告 `outputCapacity.source=native-stream-boundary`；自定义离线 harness 为 `custom-harness-unverified`。报告 `auxiliaryPolicy=reject-before-dispatch`：本固定回归不支持辅助 LLM 调用，包括自动 compaction；尝试即拒绝并锁存失败，不能捕获异常后继续获准。生产 preset compaction 保持 auto=true 及其原配置，未被禁用或更改。历史 `native-configuration` 仅证明普通 agent 配置，不能证明辅助请求容量；8192与历史4096不能作同额度性能比较。
 

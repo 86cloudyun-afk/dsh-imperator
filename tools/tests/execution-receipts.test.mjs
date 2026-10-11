@@ -5,6 +5,7 @@ import { TaskforceStore } from '../../lib/store/index.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { DatabaseSync } from 'node:sqlite'
 import { apply as applyTools } from '../../lib/tools/index.js'
 import { tempStore } from './helpers.mjs'
 
@@ -58,6 +59,141 @@ async function verify(f, id, options = {}) {
   return runTaskVerification({ store: f.store, identity: options.identity ?? identity, agent,
     task_id: id, command, execute: async () => foreground(), ...options, exec, signal: exec.signal })
 }
+
+const nativeJobNext = '本次验证观察到原生非 foreground 结果；请由发起本次验证的原生会话在其当前进程中使用宿主 job_output/job_kill 检查并确认 job 已结束后，再重新验证。任务重新分配不会转移原生 job 权限。'
+const nonforeground = (extra = {}, envelope = {}) => ({ isError: false,
+  value: { kind: 'promoted', jobId: 'bash-observed-1', timeoutMs: 50, ...extra }, content: [], ...envelope })
+const expectedJob = (kind = 'promoted', job_id = 'bash-observed-1', timeout_ms = 50) => ({
+  kind, job_id, timeout_ms, scope: 'current-owner-process', durable: false,
+})
+
+// Dropping the observed native locator, copying extra fields, or treating it as
+// successful/durable evidence must fail these public wrapper/store assertions.
+for (const kind of ['promoted', 'background']) {
+  test(`${kind} returns only bounded current-caller native job diagnostics and remains unaccepted`, async t => {
+    const f = fixture(t), id = f.open(); f.claim(id)
+    const result = await verify(f, id, { execute: async () => nonforeground({ kind,
+      output: 'PRIVATE_RENDERED_OUTPUT', spillPath: '/private/spill', error: { message: 'PRIVATE_ERROR' },
+      owner: 'forged-owner', durable: true, extra: 'PRIVATE_EXTRA',
+    }, { content: [{ type: 'text', text: 'PRIVATE_RENDERER jobId=forged' }] }) })
+    assert.deepEqual(result.native_job, expectedJob(kind, 'bash-observed-1', kind === 'promoted' ? 50 : null))
+    assert.equal(result.next, nativeJobNext)
+    assert.equal(result.status, 'unknown'); assert.equal(result.verified, false)
+    assert.equal(result.output_complete, false)
+    assert.doesNotMatch(JSON.stringify(result), /PRIVATE_|\/private\/|forged/)
+    const row = f.store.board(id, run).receipts[0]
+    assert.equal(row.kind, kind); assert.equal(row.actual_timeout_ms, null)
+    assert.equal(row.logs.stdout.bytes, 0); assert.equal(row.logs.stderr.bytes, 0)
+    assert.equal(Object.hasOwn(row, 'native_job'), false)
+    assert.equal(Object.hasOwn(row, 'job_id'), false)
+    f.submit(id); assert.throws(() => f.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+  })
+}
+
+for (const [label, jobId, expected] of [
+  ['one character', 'Z', 'Z'], ['all allowed punctuation', '0.A_z:-9', '0.A_z:-9'],
+  ['256 characters', 'a'.repeat(256), 'a'.repeat(256)], ['257 characters', 'a'.repeat(257), null],
+  ['empty', '', null], ['initial punctuation', '-job', null], ['slash', 'bash/job', null],
+  ['space', 'bash job', null], ['leading whitespace', ' bash', null], ['trailing whitespace', 'bash ', null],
+  ['trailing newline', 'bash\n', null], ['carriage return', 'bash\r', null], ['control separator', 'bash\u0000job', null],
+  ['unicode', 'bash-工作', null],
+  ['number', 123, null], ['boolean', true, null], ['object', { id: 'bash' }, null],
+  ['array', ['bash'], null], ['null', null, null], ['missing', undefined, null],
+]) test(`native job ID projection: ${label}`, async t => {
+  const f = fixture(t), id = f.open(); f.claim(id)
+  const result = await verify(f, id, { execute: async () => nonforeground({ jobId }) })
+  assert.deepEqual(result.native_job, expectedJob('promoted', expected))
+})
+
+for (const [label, timeoutMs, expected] of [
+  ['minimum', 1, 1], ['safe maximum', Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+  ['zero', 0, null], ['negative', -1, null], ['fraction', 1.5, null],
+  ['unsafe integer', Number.MAX_SAFE_INTEGER + 1, null], ['infinity', Infinity, null],
+  ['NaN', NaN, null], ['string', '50', null], ['boolean', true, null],
+  ['object', {}, null], ['array', [50], null], ['null', null, null], ['missing', undefined, null],
+]) test(`promoted timeout projection: ${label}`, async t => {
+  const f = fixture(t), id = f.open(); f.claim(id)
+  const result = await verify(f, id, { execute: async () => nonforeground({ timeoutMs }) })
+  assert.deepEqual(result.native_job, expectedJob('promoted', 'bash-observed-1', expected))
+})
+
+for (const [label, result] of [
+  ['foreground', foreground({ jobId: 'unrelated' })],
+  ['error carrying a promoted value', nonforeground({}, { isError: true, error: { message: 'denied' } })],
+  ['missing isError', nonforeground({}, { isError: undefined })],
+  ['null isError', nonforeground({}, { isError: null })],
+  ['nonboolean isError', nonforeground({}, { isError: 0 })],
+  ['unknown kind', nonforeground({ kind: 'unknown' })],
+  ['null kind', nonforeground({ kind: null })],
+  ['missing kind', nonforeground({ kind: undefined })],
+  ['rendered text only', { isError: false, value: null, content: [{ type: 'text', text: JSON.stringify(nonforeground().value) }] }],
+]) test(`${label} does not gain native job diagnostics`, async t => {
+  const f = fixture(t), id = f.open(); f.claim(id)
+  const response = await verify(f, id, { execute: async () => result })
+  assert.equal(Object.hasOwn(response, 'native_job'), false)
+  assert.equal(Object.hasOwn(response, 'next'), false)
+  assert.equal(response.verified, label === 'foreground')
+})
+
+test('native job diagnostics do not survive a new store connection, backup or restore', async t => {
+  const { backup, restore } = await import('../../lib/operations/index.js')
+  const f = fixture(t), id = f.open(); f.claim(id)
+  const jobId = 'unique-process-local-job-4de089'
+  const result = await verify(f, id, { execute: async () => nonforeground({ jobId }) })
+  const row = f.store.handle.prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(result.receipt_id)
+  assert.doesNotMatch(JSON.stringify(row), /native_job|job_id|jobId|unique-process-local-job-4de089/)
+  const reopened = new TaskforceStore(f.store.root)
+  t.after(() => reopened.close())
+  assert.equal(Object.hasOwn(reopened.board(id, run).receipts[0], 'native_job'), false)
+  const directory = mkdtempSync(join(tmpdir(), 'taskforce-job-archive-'))
+  t.after(() => rmSync(directory, { recursive: true, force: true }))
+  const archive = join(directory, 'backup'), restored = join(directory, 'restored')
+  assert.equal((await backup({ root: f.store.root, out: archive })).ok, true)
+  const manifestText = readFileSync(join(archive, 'manifest.json'), 'utf8')
+  assert.doesNotMatch(manifestText, /native_job|job_id|jobId|unique-process-local-job-4de089/)
+  for (const entry of JSON.parse(manifestText).files) {
+    assert.equal(readFileSync(join(archive, entry.path)).includes(Buffer.from(jobId)), false)
+  }
+  const snapshot = new DatabaseSync(join(archive, 'taskforce.db'), { readOnly: true })
+  try { assert.deepEqual(snapshot.prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(result.receipt_id), row) }
+  finally { snapshot.close() }
+  assert.equal((await restore({ backup: archive, out: restored })).ok, true)
+  const restoredStore = new TaskforceStore(restored)
+  try {
+    assert.deepEqual(restoredStore.open().prepare('SELECT * FROM execution_receipt WHERE receipt_id=?').get(result.receipt_id), row)
+    restoredStore.submitTask({ task_id: id }, run, 'worker', 'worker')
+    assert.throws(() => restoredStore.acceptTask({ task_id: id }, run, 'lead', run), { code: 'E_VERIFICATION_RECEIPT' })
+  } finally { restoredStore.close() }
+  assert.deepEqual(result.native_job, expectedJob('promoted', jobId))
+})
+
+test('promotion after owner/generation drift remains an observation for the original invoking session', async t => {
+  const f = fixture(t), id = f.open(); f.claim(id); f.submit(id)
+  const result = await verify(f, id, { execute: async input => {
+    assert.equal(input.agent.session.header.id, 'worker')
+    f.store.rejectTask({ task_id: id, reason: 'handover' }, run, 'lead', run)
+    f.store.claimTask({ task_id: id, child_id: 'replacement' }, run, 'lead', 'replacement')
+    f.store.submitTask({ task_id: id }, run, 'replacement', 'replacement')
+    return nonforeground()
+  } })
+  const row = f.store.board(id, run).receipts[0], task = f.store.taskOf(id, run).task
+  assert.equal(task.owner_session, 'replacement'); assert.equal(task.evidence_generation, 1)
+  assert.equal(row.owner_session, 'worker'); assert.equal(row.actor_session, 'worker')
+  assert.equal(row.evidence_generation, 0); assert.equal(row.status, 'unknown')
+  assert.equal(result.verified, false); assert.equal(result.output_complete, false)
+  assert.throws(() => f.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+  assert.equal(Object.hasOwn(row, 'native_job'), false)
+  assert.deepEqual(result.native_job, expectedJob())
+  assert.equal(result.next, nativeJobNext)
+})
+
+test('promotion diagnostics cannot escape before the receipt completion is durable', async t => {
+  const f = fixture(t), id = f.open(); f.claim(id); f.submit(id)
+  f.store.handle.exec("CREATE TEMP TRIGGER refuse_promoted BEFORE UPDATE ON execution_receipt BEGIN SELECT RAISE(ABORT, 'promotion receipt failed'); END")
+  await assert.rejects(verify(f, id, { execute: async () => nonforeground() }), /promotion receipt failed/)
+  assert.equal(f.store.board(id, run).receipts[0].status, 'pending')
+  assert.throws(() => f.accept(id), { code: 'E_VERIFICATION_RECEIPT' })
+})
 
 test('manifest rejects missing, escaping, absolute, directory and external symlink paths', t => {
   const f = fixture(t), outside = join(f.store.root, 'outside.js')
@@ -289,6 +425,8 @@ test('native registry without bash reports capability failure and retains unknow
     error: { message: 'unknown tool "bash"', info: { code: 'UNKNOWN_TOOL' } }, content: [] }) })
   assert.equal(result.code, 'E_VERIFICATION_CAPABILITY')
   assert.equal(result.verified, false)
+  assert.equal(Object.hasOwn(result, 'native_job'), false)
+  assert.equal(Object.hasOwn(result, 'next'), false)
   assert.equal(f.store.board(id, run).receipts[0].status, 'unknown')
 })
 

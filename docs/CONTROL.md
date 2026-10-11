@@ -164,3 +164,27 @@ ctx.subagents.interrupt(targetId, { kind: 'ancestor', agent: caller })         /
   以决定是否给子代理注入续作提示语。本包是**独立命名**的控制工具，既不打标也不读该标记 ——
   与官方工具共存、互不干扰。
 - **未决**：本包工具与官方 `send_message` 对同一目标的**并发投递顺序**未定义，取决于目标 inbox 的接纳顺序。
+
+## 7. `task_verify` 的原生 job 即时定位
+
+`task_verify` 请求 `run_in_background:false`，宿主仍可能在超时后返回 `promoted`。
+只有本次原生结果为 `isError:false` 且 `kind` 为 `promoted` 或 `background` 时，
+完成现有回执持久化后，直接返回体才附加以下白名单诊断和固定 `next` 提示：
+
+```
+native_job: { kind: "promoted" | "background", job_id, timeout_ms,
+              scope: "current-owner-process", durable: false }
+```
+
+`job_id` 只保留完整匹配 `[A-Za-z0-9][A-Za-z0-9._:-]{0,255}` 的字符串，否则为 `null`。
+`timeout_ms` 只保留 `promoted` 的正 safe integer；非法值及 `background` 均为 `null`。
+不复制原生 rendered output、路径、任意错误或其他 union 字段，不把显示文本解析成定位或成功日志。
+回执仍为 `unknown`、`verified:false`、`output_complete:false`，严格验收仍拒绝。
+
+此定位只描述本次调用观察到的非 foreground 结果，不承诺返回时 job 仍在运行。
+须由**发起本次验证的原生会话**在其当前进程中使用宿主 `job_output` / `job_kill` 检查，
+确认 job 已结束后再重新验证；wrapper 不自动轮询、停止或重跑。
+任务在 await 期间换 owner 或 generation，不会把原生 job 权限转交给新 owner。
+`native_job` 不写入 Imperator receipt、备份或恢复记录，旧数据库不能恢复此进程内句柄。
+`durable:false` 表示它不是持久执行授权或 Imperator 归档句柄，不承诺宿主不会保存普通工具结果文本。
+普通 foreground、原生错误和 `UNKNOWN_TOOL` 的返回行为保持原契约；主会话仍不能调用验证执行。

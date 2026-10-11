@@ -432,6 +432,98 @@ test('native task_verify awaits real bash, correlates its parent and retains nat
   assert.throws(() => store.acceptTask({ task_id: id }, 'receipt-root', 'lead', 'receipt-root'), { code: 'E_VERIFICATION_RECEIPT' })
 })
 
+for (const scenario of ['foreground', 'promoted']) {
+  test(`native task_verify default job policy: ${scenario} observation and owner cleanup`, options, async t => {
+    const { ctx, agent } = await fixture(t)
+    const [{ LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, { LocalJobRegistry },
+      bash, { apply: applyTools }, { tempStore }, { writeFile, readFile }] = await Promise.all([
+      native('@deepseek-ai/dsh-subprocess-local'), native('@deepseek-ai/dsh-bash-local'),
+      native('@deepseek-ai/dsh-shell-env'), native('@deepseek-ai/dsh-jobs-local'), native('@deepseek-ai/dsh-tool-bash'),
+      import('../../lib/tools/index.js'), import('./helpers.mjs'), import('node:fs/promises'),
+    ])
+    const cwd = await mkdtemp(join(tmpdir(), 'taskforce-native-job-'))
+    t.after(() => rm(cwd, { recursive: true, force: true }))
+    await writeFile(join(cwd, 'source.js'), 'source\n')
+    const store = tempStore(t), run = `job-${scenario}-root`, owner = `job-${scenario}-worker`
+    const main = agent(run, undefined, { cwd })
+    const worker = agent(owner, undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: run })
+    // Native Bash binds job ownership to Agent.id; these scoped fixtures do not run an agent loop.
+    main.id = run; worker.id = owner
+    const byId = new Map([[run, main], [owner, worker]])
+    ctx.provide('taskforceStore', store)
+    ctx.provide('agents', { get: id => byId.get(id) })
+    new LocalSubprocessRuntime(ctx)
+    new ShellEnvRegistry(ctx)
+    new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
+    await mountNativeWorkingDirectory(ctx, cwd)
+    new LocalJobRegistry(ctx, LocalJobRegistry.Config({ pumpPollMs: 5 }))
+    ctx.jobs.attachController('verification-boundary')
+    await ctx.plugin(bash)
+    applyTools(ctx)
+    const command = scenario === 'promoted'
+      ? "printf 'partial proof\\n'; sleep 1; printf 'finished\\n'" : "printf 'foreground proof\\n'"
+    const timeout_ms = scenario === 'promoted' ? 50 : 1000
+    const id = store.openTask({ title: scenario, evidence_policy: 'execution',
+      verification_files: ['source.js'], verification_command: command }, run, { sessionId: run, cwd, isRoot: true }).task_id
+    store.claimTask({ task_id: id, child_id: 'worker' }, run, owner, owner)
+    let observedBash, bashCalls = 0
+    ctx.tools.guard(exec => {
+      if (exec.name !== 'bash') return
+      bashCalls++
+      assert.equal(exec.agent, worker)
+      assert.equal(exec.arguments.run_in_background, false)
+    })
+    ctx.on('tools/result', (exec, result) => {
+      if (exec.name === 'bash') observedBash = structuredClone(result)
+    })
+    try {
+      const outer = await worker.ctx.tools.execute({ agent: worker, callId: `native-job-${scenario}`, name: 'task_verify',
+        arguments: { task_id: id, command, timeout_ms }, signal: new AbortController().signal })
+      assert.equal(outer.isError, false, outer.error?.message)
+      const result = JSON.parse(outer.value), row = store.board(id, run).receipts[0]
+      assert.equal(bashCalls, 1)
+      assert.equal(observedBash.isError, false)
+      assert.equal(observedBash.value.kind, scenario)
+      t.diagnostic(JSON.stringify({ host: installationVersion(anchor), scenario, native: observedBash,
+        result, modelRequests: 0 }))
+      store.submitTask({ task_id: id }, run, owner, owner)
+      if (scenario === 'foreground') {
+        assert.equal(result.verified, true)
+        assert.equal(Object.hasOwn(result, 'native_job'), false)
+        assert.equal(Object.hasOwn(result, 'next'), false)
+        assert.equal(await readFile(row.logs.stdout.path, 'utf8'), 'foreground proof\n')
+        assert.equal(store.acceptTask({ task_id: id }, run, 'lead', run).execution_verified, true)
+        assert.deepEqual(ctx.jobs.list(owner), [])
+      } else {
+        assert.equal(result.status, 'unknown'); assert.equal(result.verified, false)
+        assert.equal(result.output_complete, false)
+        assert.throws(() => store.acceptTask({ task_id: id }, run, 'lead', run), { code: 'E_VERIFICATION_RECEIPT' })
+        assert.equal(row.owner_session, owner); assert.equal(row.kind, 'promoted')
+        assert.equal(row.actual_timeout_ms, null)
+        assert.equal(await readFile(row.logs.stdout.path, 'utf8'), '')
+        assert.equal(await readFile(row.logs.stderr.path, 'utf8'), '')
+        assert.equal(Object.hasOwn(row, 'native_job'), false)
+        assert.match(observedBash.value.jobId, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/)
+        assert.equal(observedBash.value.timeoutMs, timeout_ms)
+        assert.equal(ctx.jobs.get(observedBash.value.jobId, owner).id, observedBash.value.jobId)
+        assert.throws(() => ctx.jobs.get(observedBash.value.jobId, run), /belongs to another session/)
+        assert.deepEqual(result.native_job, { kind: 'promoted', job_id: observedBash.value.jobId,
+          timeout_ms, scope: 'current-owner-process', durable: false }, 'native promotion locator must reach the invoking owner')
+        assert.match(result.next, /发起本次验证的原生会话.*当前进程.*job_output\/job_kill.*确认 job 已结束后.*重新验证/)
+      }
+    } finally {
+      // Keep cleanup independent of the response assertion, including during RED.
+      for (const job of ctx.jobs.list(owner)) {
+        ctx.jobs.kill(job.id, owner, 'bounded native verifier test cleanup')
+        const settled = await ctx.jobs.wait(job.id, 2000, owner)
+        assert.notEqual(settled.status, 'running'); assert.notEqual(settled.status, 'stopping')
+        t.diagnostic(JSON.stringify({ host: installationVersion(anchor), cleanup: { job_id: job.id, status: settled.status } }))
+      }
+      assert.equal(ctx.jobs.list(owner).some(job => ['running', 'stopping'].includes(job.status)), false)
+    }
+  })
+}
+
 for (const operation of ['task_submit', 'task_close', 'task_claim']) {
   test(`native legal child session ID lead cannot ${operation} a sibling task`, options, async t => {
     const { ctx, agent } = await fixture(t)

@@ -869,3 +869,93 @@ for (const delta of [-1, 0, 1]) {
     try { assert.notEqual(reopened.open(), creationHandle); check(reopened) } finally { reopened.close() }
   })
 }
+
+// Count the real public reader pair; oracle/setup reads occur outside this hook.
+function task19BoardLifecycle(t, db, originalSql, match, args, rowCount, work, mutate) {
+  const originalPrepare = db.prepare, prepare = originalPrepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if (!match(sql)) return statement
+    const record = { kind: sql === originalSql ? 'original' : 'generated', columns: 0,
+      get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] }
+    records.push(record)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...values) => { record.columns++; return columns(...values) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...values) => {
+        record[method]++; record.bindings.push(values)
+        const result = read(...values)
+        if (method === 'all') {
+          assert.equal(Array.isArray(result), true); record.rows.push(result.length)
+          if (record.kind === 'generated' && mutate) mutate(result)
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  let result
+  try { result = work() } finally { db.prepare = originalPrepare }
+  t.diagnostic('public SQL lifecycle ' + JSON.stringify({ originalSql, records }))
+  assert.deepEqual(records, rowCount === null ? [] : [
+    { kind: 'original', columns: 1, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] },
+    { kind: 'generated', columns: 1, get: 0, all: 1, iterate: 0, run: 0, bindings: [args], rows: [rowCount] },
+  ])
+  return result
+}
+
+for (const [view, scope] of [['facts', 'lifecycle\0run'], ['handoffs', 'lifecycle\0run'], ['latest', 'lifecycle\0run'], ['handoffs', null]]) {
+  test(`Task19 ${view} public lifecycle counts empty and multi-field rows without extra reads: ${JSON.stringify(scope)}`, t => {
+    const store = tempStore(t), db = store.open()
+    const statement = 'statement\0full', by = 'display\0full', actor = 'actor\0full'
+    const ids = [], expected = []
+    if (view !== 'latest') ids.push(store.openTask('history', scope).task_id)
+    const check = count => {
+      const history = view !== 'latest'
+      const suffix = history
+        ? ' FROM ' + (view === 'facts' ? 'fact' : 'handoff')
+          + ' f JOIN task t ON t.id=f.task_id AND f.run_id IS t.run_id WHERE t.run_id IS ? AND t.id=? ORDER BY f.id DESC LIMIT ?'
+        : ' FROM fact f JOIN task t ON t.id=f.task_id AND f.run_id IS t.run_id WHERE t.run_id IS ? AND t.id IN ('
+          + [...ids].reverse().map(() => '?').join(',') + ') AND f.id=(SELECT MAX(b.id) FROM fact b WHERE b.task_id=t.id AND b.run_id IS t.run_id)'
+      const match = sql => sql.startsWith('SELECT ') && (history ? sql.endsWith(suffix)
+        : sql.includes(' FROM fact f JOIN task t ON t.id=f.task_id AND f.run_id IS t.run_id WHERE t.run_id IS ? AND t.id IN (')
+          && sql.endsWith(' AND f.id=(SELECT MAX(b.id) FROM fact b WHERE b.task_id=t.id AND b.run_id IS t.run_id)'))
+      const before = db.prepare('SELECT total_changes() AS n').get().n
+      const page = task19BoardLifecycle(t, db, 'SELECT f.*' + suffix, match,
+        history ? [scope, ids[0], 4] : [scope, ...[...ids].reverse()], count,
+        () => store.boardPage(history ? { view, task_id: ids[0], limit: 3 } : { limit: 3 }, scope))
+      const rows = history ? page[view] : page.tasks.flatMap(task => task.facts)
+      assert.equal(rows.length, expected.length)
+      assert.deepEqual(rows.map(row => row.id), [...expected].reverse().map(row => row.id))
+      rows.forEach((row, index) => {
+        const wanted = expected.at(-1 - index)
+        if (view === 'handoffs') {
+          for (const field of ['from_child', 'to_child', 'note', 'run_id']) assert.equal(row[field], wanted[field])
+        } else {
+          assert.equal(row.statement, statement); assert.equal(row.by, by); assert.equal(row.actor_session, actor)
+          assert.equal(row.evidence, null)
+          if (view === 'facts') {
+            assert.equal(row.created_by, by); assert.equal(row.evidence_path, null); assert.equal(row.run_id, scope)
+          }
+        }
+      })
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+      assert.equal(db.isTransaction, false)
+    }
+    check(view === 'latest' ? null : 0) // A4 alone skips preparation when no task is selected.
+    if (view === 'latest') { ids.push(store.openTask('latest one', scope).task_id); check(0) }
+    for (let index = 0; index < 2; index++) {
+      if (view === 'latest' && index === 1) ids.push(store.openTask('latest two', scope).task_id)
+      if (view === 'handoffs') {
+        const values = { from_child: 'from\0full', to_child: 'to\0full', note: 'note\0full', run_id: scope }
+        const created = store.recordHandoff({ task_id: ids[0], ...values }, scope)
+        expected.push({ ...values, id: created.handoff_id })
+      } else {
+        const created = store.recordFact({ task_id: view === 'latest' ? ids.at(-1) : ids[0], statement }, scope, by, actor)
+        expected.push({ id: created.fact_id })
+      }
+      check(index + 1)
+    }
+  })
+}

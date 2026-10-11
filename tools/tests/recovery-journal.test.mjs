@@ -667,3 +667,90 @@ test('Task19 restored recovery owner suffix drives existing omission and continu
     assert.ok(Buffer.byteLength(JSON.stringify({ ok: true, ...value })) <= 16384)
   }
 })
+
+// Count the real public reader pair; oracle/setup reads occur outside this hook.
+function task19RecoveryLifecycle(t, db, originalSql, match, args, rowCount, work, mutate) {
+  const originalPrepare = db.prepare, prepare = originalPrepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if (!match(sql)) return statement
+    const record = { kind: sql === originalSql ? 'original' : 'generated', columns: 0,
+      get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] }
+    records.push(record)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...values) => { record.columns++; return columns(...values) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...values) => {
+        record[method]++; record.bindings.push(values)
+        const result = read(...values)
+        if (method === 'all') {
+          assert.equal(Array.isArray(result), true); record.rows.push(result.length)
+          if (record.kind === 'generated' && mutate) mutate(result)
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  let result
+  try { result = work() } finally { db.prepare = originalPrepare }
+  t.diagnostic('public SQL lifecycle ' + JSON.stringify({ originalSql, records }))
+  assert.deepEqual(records, rowCount === null ? [] : [
+    { kind: 'original', columns: 1, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] },
+    { kind: 'generated', columns: 1, get: 0, all: 1, iterate: 0, run: 0, bindings: [args], rows: [rowCount] },
+  ])
+  return result
+}
+
+for (const site of ['R1', 'R2']) {
+  test(`Task19 ${site} public lifecycle counts empty, NULL and full owner rows and fails closed on generated data`, t => {
+    const { store, recovery } = fixture(t), db = store.open(), owner = 'owner\0full'
+    // Preinitialize lazy journal tables before no-write snapshots and instrumentation.
+    recovery.inspect({}, 'root')
+    const table = site === 'R1' ? 'task_event' : 'task_checkpoint', alias = site === 'R1' ? 'e' : 'c'
+    const suffix = ' FROM ' + table + ' ' + alias + ' JOIN task t ON t.id=' + alias + '.task_id AND t.run_id IS '
+      + alias + '.run_id WHERE ' + alias + '.run_id IS ? ORDER BY ' + alias + '.id DESC LIMIT ?'
+    const original = 'SELECT ' + alias + '.*' + suffix
+    const match = sql => sql.startsWith('SELECT ') && sql.endsWith(suffix)
+    const read = () => site === 'R1' ? recovery.timeline({ limit: 5 }, 'root') : recovery.inspect({ limit: 5 }, 'root')
+    const rowsOf = result => site === 'R1' ? result.events : result.checkpoints
+    const expected = []
+    const check = count => {
+      const before = db.prepare('SELECT total_changes() AS n').get().n
+      const result = task19RecoveryLifecycle(t, db, original, match, ['root', 6], count, read)
+      assert.deepEqual(rowsOf(result).map(row => row.owner_session), [...expected].reverse())
+      assert.equal(db.isTransaction, false)
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    }
+    check(0)
+    const id = store.openTask('recovery lifecycle', 'root').task_id
+    if (site === 'R2') recovery.checkpoint({ task_id: id, summary: 'before claim' }, 'root', root)
+    expected.push(null); check(1)
+    store.claimTask({ task_id: id, child_id: 'display' }, 'root', { sessionId: owner, isRoot: false }, owner)
+    if (site === 'R2') recovery.checkpoint({ task_id: id, summary: 'after claim' }, 'root', root)
+    expected.push(owner); check(2)
+    // Independent lossless SELECTs; no stored row is changed to create a failure.
+    const snapshot = () => ({
+      tasks: db.prepare("SELECT json_object('id',id,'run_id',run_id,'status',status,'owner',owner,'owner_session',owner_session,'generation',evidence_generation) AS j FROM task ORDER BY id").all().map(row => row.j),
+      events: db.prepare("SELECT json_object('id',id,'task_id',task_id,'run_id',run_id,'kind',kind,'source',source,'actor_session',actor_session,'status',status,'previous_status',previous_status,'owner_session',owner_session,'generation',evidence_generation,'history_complete',history_complete,'observed_at',observed_at) AS j FROM task_event ORDER BY id").all().map(row => row.j),
+      checkpoints: db.prepare("SELECT json_object('id',id,'task_id',task_id,'run_id',run_id,'actor_session',actor_session,'owner_session',owner_session,'generation',evidence_generation,'summary',summary,'next_action',next_action,'created_at',created_at) AS j FROM task_checkpoint ORDER BY id").all().map(row => row.j),
+      controls: db.prepare('SELECT COUNT(*) AS n FROM control_operation').get().n,
+    })
+    const before = snapshot(), changes = db.prepare('SELECT total_changes() AS n').get().n
+    assert.equal(before.controls, 0)
+    const never = Symbol('no result'); let returned = never, injections = 0
+    task19RecoveryLifecycle(t, db, original, match, ['root', 6], 2, () => {
+      assert.throws(() => { returned = read() }, { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    }, rows => {
+      assert.deepEqual(rows.map(row => row.owner_session), ['J' + JSON.stringify(owner), null])
+      assert.equal(Object.getPrototypeOf(rows[1]), null)
+      // The earlier row is valid; failure on the second prevents any partial public result.
+      rows[1].owner_session = 'J"invalid recovery text without NUL"'; injections++
+    })
+    assert.equal(injections, 1); assert.equal(returned, never)
+    assert.equal(db.isTransaction, false)
+    assert.deepEqual(snapshot(), before)
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  })
+}

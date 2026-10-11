@@ -1092,3 +1092,183 @@ test('Task19 delegated withdrawal closure preserves full run after reopen withou
     assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
   } finally { reopened.close() }
 })
+
+// Task19 public reader instrumentation: fixed caller suffixes, no helper import.
+const task19ReaderSites = {
+  G1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ?', ['owner_session', 'session_id', 'run_id']],
+  G2: ['*', ' FROM governor_reservation WHERE run_id = ? AND operation_key = ?', ['owner_session', 'run_id', 'session_id']],
+  G3: ['*', ' FROM governor_reservation WHERE reservation_id = ?', ['run_id']],
+  G4: ['*', ' FROM governor_reservation WHERE run_id = ? ORDER BY rowid', ['run_id', 'session_id']],
+  G5: ['h.*', ' FROM governor_hold h JOIN governor_reservation r USING(reservation_id) WHERE r.run_id = ? ORDER BY h.reservation_id, h.resource_key', ['resource_key']],
+  G6: ['*', ' FROM governor_audit WHERE run_id = ? ORDER BY id', ['run_id', 'session_id']],
+  Q1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?', ['session_id']],
+  Q2: ['*', ' FROM scheduler_request WHERE request_id = ?', ['run_id']],
+}
+function task19Transport(values) {
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => [key,
+    typeof value === 'string' ? (value.includes('\0') ? 'J' + JSON.stringify(value) : 'T' + value) : value]))
+}
+function task19Observe(t, store, action, onRow) {
+  const db = store.open(), originalPrepare = db.prepare
+  const trace = { events: [], allPrepares: [], unrelatedPrepares: [], value: undefined }
+  db.prepare = sql => {
+    trace.allPrepares.push(sql)
+    const statement = originalPrepare.call(db, sql)
+    const match = Object.entries(task19ReaderSites).find(([, [, suffix]]) => sql.startsWith('SELECT ') && sql.endsWith(suffix))
+    if (!match) { trace.unrelatedPrepares.push(sql); return statement }
+    const [site, [projection, suffix, fields]] = match
+    const kind = sql === 'SELECT ' + projection + suffix ? 'original' : 'generated'
+    const event = { site, kind, sql, prepare: 1, columns: 0, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [], transport: [] }
+    trace.events.push(event)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...args) => { event.columns++; return columns(...args) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...args) => {
+        event[method]++; event.bindings.push({ method, args: [...args] })
+        const result = read(...args)
+        if (kind === 'generated' && (method === 'get' || method === 'all')) {
+          const rows = method === 'all' ? result : result === undefined ? [] : [result]
+          event.rows.push(rows.length)
+          for (const row of rows) {
+            assert.equal(Object.getPrototypeOf(row), null)
+            event.transport.push(Object.fromEntries(fields.map(field => [field, row[field]])))
+          }
+          onRow?.({ site, method, args, rows, db })
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  try { trace.value = action() } finally {
+    db.prepare = originalPrepare
+    t.diagnostic('Task19 public reader lifecycle ' + JSON.stringify({
+      prepares: trace.allPrepares.length, unrelatedPrepares: trace.unrelatedPrepares.length,
+      events: trace.events.map(event => ({ site: event.site, kind: event.kind,
+        ...(event.kind === 'original' ? { sql: event.sql } : { sqlBytes: Buffer.byteLength(event.sql) }),
+        prepare: event.prepare, columns: event.columns, get: event.get, all: event.all,
+        iterate: event.iterate, run: event.run, bindings: event.bindings, rows: event.rows })),
+    }))
+  }
+  return trace
+}
+function task19AssertTrace(trace, expected) {
+  assert.equal(trace.events.length, expected.length * 2, 'every invocation has exactly one original/generated pair')
+  assert.equal(trace.allPrepares.length, trace.events.length + trace.unrelatedPrepares.length)
+  expected.forEach(([site, method, args, rows, values], index) => {
+    for (const [offset, kind] of [[0, 'original'], [1, 'generated']]) {
+      const event = trace.events[index * 2 + offset]
+      assert.equal(event.site, site); assert.equal(event.kind, kind)
+      assert.deepEqual(Object.fromEntries(['prepare', 'columns', 'get', 'all', 'iterate', 'run'].map(key => [key, event[key]])),
+        { prepare: 1, columns: 1, get: Number(kind === 'generated' && method === 'get'),
+          all: Number(kind === 'generated' && method === 'all'), iterate: 0, run: 0 })
+      assert.deepEqual(event.bindings, kind === 'original' ? [] : [{ method, args }])
+      assert.deepEqual(event.rows, kind === 'original' ? [] : [rows])
+      if (kind === 'generated' && values) assert.deepEqual(event.transport, values.map(task19Transport))
+    }
+  })
+}
+function task19LosslessRows(store) {
+  const db = store.open(), quote = value => '"' + value.replaceAll('"', '""') + '"'
+  return db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(({ name }) => {
+    const columns = db.prepare('PRAGMA table_info(' + quote(name) + ')').all().map(row => row.name)
+    const pairs = columns.flatMap(column => ["'" + column.replaceAll("'", "''") + "'", quote(column)]).join(',')
+    return [name, db.prepare('SELECT json_object(' + pairs + ') AS row_json FROM ' + quote(name) + ' ORDER BY rowid').all()
+      .map(row => JSON.parse(row.row_json))]
+  })
+}
+
+test('Task19 Q1/Q2 public lifecycle counts every nested invocation including empty state and native NULL session', t => {
+  const { store, scheduler: s, governor: g } = setup(t), scope = 'queue-count\0run', owner = 'queue-count\0worker'
+  const actor = { role: 'worker', sessionId: owner }
+  s.state({}, scope, lead); g.snapshot(scope)
+  let trace = task19Observe(t, store, () => s.state({}, scope, lead))
+  task19AssertTrace(trace, []); assert.deepEqual(trace.value.requests, [])
+  const firstArgs = input(task(store, owner, scope), { request_key: 'queue-count-first' })
+  trace = task19Observe(t, store, () => s.enqueue(firstArgs, scope, actor))
+  const queued = trace.value
+  task19AssertTrace(trace, [['Q2', 'get', [queued.request_id], 1, [{ run_id: scope }]]])
+  assert.equal(queued.run_id, scope); assert.equal(queued.session_id, null)
+  trace = task19Observe(t, store, () => s.state({}, scope, lead))
+  task19AssertTrace(trace, []); assert.deepEqual(trace.value.requests, [queued])
+  trace = task19Observe(t, store, () => s.admitNext({ request_key: 'queue-count-admit-first' }, scope, lead))
+  const first = trace.value.request
+  assert.equal(trace.value.status, 'admitted'); assert.equal(first.session_id, null)
+  task19AssertTrace(trace, [['G2', 'get', [scope, 'scheduler:' + queued.request_id], 0, []],
+    ['G3', 'get', [first.reservation_id], 1, [{ run_id: scope }]],
+    ['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: null }]]])
+  trace = task19Observe(t, store, () => s.bind(ref(first, { session_id: owner }), scope, actor))
+  const bound = trace.value
+  task19AssertTrace(trace, [['G1', 'get', [first.reservation_id, scope], 1, [{ owner_session: owner, session_id: null, run_id: scope }]],
+    ['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]]])
+  assert.equal(bound.session_id, owner)
+  trace = task19Observe(t, store, () => s.state({}, scope, actor))
+  task19AssertTrace(trace, [['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]]])
+  assert.deepEqual(trace.value.requests, [bound])
+  trace = task19Observe(t, store, () => s.enqueue(firstArgs, scope, actor))
+  task19AssertTrace(trace, [['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]]])
+  assert.deepEqual(trace.value, bound)
+  const secondArgs = input(task(store, owner, scope), { request_key: 'queue-count-second' })
+  trace = task19Observe(t, store, () => s.enqueue(secondArgs, scope, actor))
+  const queuedSecond = trace.value
+  task19AssertTrace(trace, [['Q2', 'get', [queuedSecond.request_id], 1, [{ run_id: scope }]]])
+  trace = task19Observe(t, store, () => s.admitNext({ request_key: 'queue-count-admit-second' }, scope, lead))
+  const second = trace.value.request
+  task19AssertTrace(trace, [['G2', 'get', [scope, 'scheduler:' + queuedSecond.request_id], 0, []],
+    ['G3', 'get', [second.reservation_id], 1, [{ run_id: scope }]],
+    ['Q1', 'get', [second.reservation_id, scope, second.task_id], 1, [{ session_id: null }]]])
+  trace = task19Observe(t, store, () => s.state({}, scope, actor))
+  task19AssertTrace(trace, [['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]],
+    ['Q1', 'get', [second.reservation_id, scope, second.task_id], 1, [{ session_id: null }]]])
+  assert.deepEqual(trace.value.requests, [bound, second]); assert.equal(trace.value.has_more, false)
+})
+
+for (const action of ['state', 'bind', 'markUnknown', 'enqueue']) {
+  test('Task19 scheduler ' + action + ' generated row fault leaves no result and preserves complete accepted state', t => {
+    const { store, scheduler: s, governor: g } = setup(t), scope = 'queue-fault\0run', owner = 'queue-fault\0worker'
+    const actor = { role: 'worker', sessionId: owner }
+    s.state({}, scope, lead); g.snapshot(scope)
+    const args = input(task(store, owner, scope), { request_key: 'queue-fault-existing', resources: ['queue\0hold'] })
+    const queued = s.enqueue(args, scope, actor)
+    const admitted = s.admitNext({ request_key: 'queue-fault-admit' }, scope, lead).request
+    if (action !== 'bind') s.bind(ref(admitted, { session_id: owner }), scope, actor)
+    const newArgs = input(task(store, owner, scope), { request_key: 'queue-fault-new' })
+    const before = task19LosslessRows(store), db = store.open()
+    const beforeChanges = db.prepare('SELECT total_changes() AS n').get().n
+    const site = action === 'enqueue' ? 'Q2' : 'Q1'
+    const invoke = () => action === 'state' ? s.state({}, scope, actor)
+      : action === 'bind' ? s.bind(ref(admitted, { session_id: owner }), scope, actor)
+      : action === 'markUnknown' ? s.markUnknown(ref(admitted, { reason: 'delivery unknown' }), scope, actor)
+      : s.enqueue(newArgs, scope, actor)
+    const unreturned = Symbol('no partial public result'); let result = unreturned, injections = 0, insertedId
+    const trace = task19Observe(t, store, () => assert.throws(() => { result = invoke() },
+      { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' }), event => {
+      if (event.site !== site) return
+      assert.equal(event.rows.length, 1); assert.equal(event.db.isTransaction, true)
+      const row = event.rows[0]
+      if (site === 'Q2') {
+        assert.equal(row.run_id, task19Transport({ run_id: scope }).run_id)
+        assert.equal(row.task_id, newArgs.task_id); assert.equal(row.state, 'queued'); assert.equal(row.reservation_id, null)
+        insertedId = row.request_id; row.run_id = 'J"invalid transport without NUL"'
+      } else {
+        assert.equal(row.reservation_id, admitted.reservation_id); assert.equal(row.task_id, admitted.task_id)
+        assert.equal(row.session_id, task19Transport({ session_id: owner }).session_id)
+        assert.equal(row.state, action === 'markUnknown' ? 'unknown' : 'running')
+        row.session_id = 'J"invalid transport without NUL"'
+      }
+      injections++
+    })
+    assert.equal(result, unreturned); assert.equal(injections, 1); assert.equal(db.isTransaction, false)
+    const q1 = ['Q1', 'get', [admitted.reservation_id, scope, admitted.task_id], 1]
+    task19AssertTrace(trace, action === 'enqueue' ? [['Q2', 'get', [insertedId], 1]] : action === 'state' ? [q1]
+      : [['G1', 'get', [admitted.reservation_id, scope], 1, [{ owner_session: owner, session_id: action === 'bind' ? null : owner, run_id: scope }]], q1])
+    // Covers task/events, governor reservation/audit/holds/retry charges, queue/decisions and sequences losslessly.
+    assert.deepEqual(task19LosslessRows(store), before)
+    if (action === 'state') assert.equal(db.prepare('SELECT total_changes() AS n').get().n, beforeChanges)
+    if (action === 'enqueue') assert.equal(db.prepare('SELECT COUNT(*) AS n FROM scheduler_request WHERE request_id = ?').get(insertedId).n, 0)
+    const restored = s.state({}, scope, actor).requests.find(row => row.request_id === queued.request_id)
+    assert.equal(restored.state, action === 'bind' ? 'reserved' : 'running')
+    assert.equal(restored.session_id, action === 'bind' ? null : owner)
+  })
+}

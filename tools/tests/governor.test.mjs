@@ -814,3 +814,175 @@ for (const [position, scope, owner] of [
     assert.equal(reopened.open().prepare('SELECT total_changes() AS n').get().n, before)
   } finally { reopened.close() }
 })
+
+// Task19 public reader instrumentation: fixed caller suffixes, no helper import.
+const task19ReaderSites = {
+  G1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ?', ['owner_session', 'session_id', 'run_id']],
+  G2: ['*', ' FROM governor_reservation WHERE run_id = ? AND operation_key = ?', ['owner_session', 'run_id', 'session_id']],
+  G3: ['*', ' FROM governor_reservation WHERE reservation_id = ?', ['run_id']],
+  G4: ['*', ' FROM governor_reservation WHERE run_id = ? ORDER BY rowid', ['run_id', 'session_id']],
+  G5: ['h.*', ' FROM governor_hold h JOIN governor_reservation r USING(reservation_id) WHERE r.run_id = ? ORDER BY h.reservation_id, h.resource_key', ['resource_key']],
+  G6: ['*', ' FROM governor_audit WHERE run_id = ? ORDER BY id', ['run_id', 'session_id']],
+  Q1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?', ['session_id']],
+  Q2: ['*', ' FROM scheduler_request WHERE request_id = ?', ['run_id']],
+}
+function task19Transport(values) {
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => [key,
+    typeof value === 'string' ? (value.includes('\0') ? 'J' + JSON.stringify(value) : 'T' + value) : value]))
+}
+function task19Observe(t, store, action, onRow) {
+  const db = store.open(), originalPrepare = db.prepare
+  const trace = { events: [], allPrepares: [], unrelatedPrepares: [], value: undefined }
+  db.prepare = sql => {
+    trace.allPrepares.push(sql)
+    const statement = originalPrepare.call(db, sql)
+    const match = Object.entries(task19ReaderSites).find(([, [, suffix]]) => sql.startsWith('SELECT ') && sql.endsWith(suffix))
+    if (!match) { trace.unrelatedPrepares.push(sql); return statement }
+    const [site, [projection, suffix, fields]] = match
+    const kind = sql === 'SELECT ' + projection + suffix ? 'original' : 'generated'
+    const event = { site, kind, sql, prepare: 1, columns: 0, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [], transport: [] }
+    trace.events.push(event)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...args) => { event.columns++; return columns(...args) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...args) => {
+        event[method]++; event.bindings.push({ method, args: [...args] })
+        const result = read(...args)
+        if (kind === 'generated' && (method === 'get' || method === 'all')) {
+          const rows = method === 'all' ? result : result === undefined ? [] : [result]
+          event.rows.push(rows.length)
+          for (const row of rows) {
+            assert.equal(Object.getPrototypeOf(row), null)
+            event.transport.push(Object.fromEntries(fields.map(field => [field, row[field]])))
+          }
+          onRow?.({ site, method, args, rows, db })
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  try { trace.value = action() } finally {
+    db.prepare = originalPrepare
+    t.diagnostic('Task19 public reader lifecycle ' + JSON.stringify({
+      prepares: trace.allPrepares.length, unrelatedPrepares: trace.unrelatedPrepares.length,
+      events: trace.events.map(event => ({ site: event.site, kind: event.kind,
+        ...(event.kind === 'original' ? { sql: event.sql } : { sqlBytes: Buffer.byteLength(event.sql) }),
+        prepare: event.prepare, columns: event.columns, get: event.get, all: event.all,
+        iterate: event.iterate, run: event.run, bindings: event.bindings, rows: event.rows })),
+    }))
+  }
+  return trace
+}
+function task19AssertTrace(trace, expected) {
+  assert.equal(trace.events.length, expected.length * 2, 'every invocation has exactly one original/generated pair')
+  assert.equal(trace.allPrepares.length, trace.events.length + trace.unrelatedPrepares.length)
+  expected.forEach(([site, method, args, rows, values], index) => {
+    for (const [offset, kind] of [[0, 'original'], [1, 'generated']]) {
+      const event = trace.events[index * 2 + offset]
+      assert.equal(event.site, site); assert.equal(event.kind, kind)
+      assert.deepEqual(Object.fromEntries(['prepare', 'columns', 'get', 'all', 'iterate', 'run'].map(key => [key, event[key]])),
+        { prepare: 1, columns: 1, get: Number(kind === 'generated' && method === 'get'),
+          all: Number(kind === 'generated' && method === 'all'), iterate: 0, run: 0 })
+      assert.deepEqual(event.bindings, kind === 'original' ? [] : [{ method, args }])
+      assert.deepEqual(event.rows, kind === 'original' ? [] : [rows])
+      if (kind === 'generated' && values) assert.deepEqual(event.transport, values.map(task19Transport))
+    }
+  })
+}
+function task19LosslessRows(store) {
+  const db = store.open(), quote = value => '"' + value.replaceAll('"', '""') + '"'
+  return db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(({ name }) => {
+    const columns = db.prepare('PRAGMA table_info(' + quote(name) + ')').all().map(row => row.name)
+    const pairs = columns.flatMap(column => ["'" + column.replaceAll("'", "''") + "'", quote(column)]).join(',')
+    return [name, db.prepare('SELECT json_object(' + pairs + ') AS row_json FROM ' + quote(name) + ' ORDER BY rowid').all()
+      .map(row => JSON.parse(row.row_json))]
+  })
+}
+
+test('Task19 G1-G6 public lifecycle counts metadata and real reads for empty, absent, single and multiple rows', t => {
+  const { store, governor: g } = setup(t), scope = 'counts\0run', owner = 'counts\0worker'
+  const actor = { role: 'worker', sessionId: owner }
+  g.snapshot(scope) // Initialize lazy services before measured invocations.
+  let trace = task19Observe(t, store, () => g.snapshot(scope))
+  task19AssertTrace(trace, [['G4', 'all', [scope], 0, []], ['G5', 'all', [scope], 0, []], ['G6', 'all', [scope], 0, []]])
+  assert.deepEqual(trace.value.reservations, []); assert.deepEqual(trace.value.holds, []); assert.deepEqual(trace.value.audit, [])
+  trace = task19Observe(t, store, () => assert.throws(() => g.bind({ reservation_id: 'absent-reservation', generation: 1, session_id: owner }, scope, actor), code('E_GOVERNOR_CONFLICT')))
+  task19AssertTrace(trace, [['G1', 'get', ['absent-reservation', scope], 0, []]])
+  const firstArgs = input(task(store, scope, owner), 'count-first', { resources: ['resource\0first'] })
+  trace = task19Observe(t, store, () => g.reserve(firstArgs, scope, actor))
+  const first = trace.value
+  assert.equal(first.run_id, scope); assert.equal(first.session_id, null)
+  task19AssertTrace(trace, [['G2', 'get', [scope, firstArgs.operation_key], 0, []], ['G3', 'get', [first.reservation_id], 1, [{ run_id: scope }]]])
+  trace = task19Observe(t, store, () => g.snapshot(scope))
+  task19AssertTrace(trace, [['G4', 'all', [scope], 1, [{ run_id: scope, session_id: null }]],
+    ['G5', 'all', [scope], 1, [{ resource_key: 'resource\0first' }]], ['G6', 'all', [scope], 1, [{ run_id: scope, session_id: owner }]]])
+  assert.equal(trace.value.reservations[0].session_id, null)
+  trace = task19Observe(t, store, () => g.bind(ref(first, { session_id: owner }), scope, actor))
+  task19AssertTrace(trace, [['G1', 'get', [first.reservation_id, scope], 1, [{ owner_session: owner, session_id: null, run_id: scope }]]])
+  const bound = trace.value
+  assert.equal(bound.session_id, owner); assert.equal(bound.run_id, scope)
+  trace = task19Observe(t, store, () => g.reserve(firstArgs, scope, actor))
+  task19AssertTrace(trace, [['G2', 'get', [scope, firstArgs.operation_key], 1, [{ owner_session: owner, run_id: scope, session_id: owner }]]])
+  assert.deepEqual(trace.value, bound)
+  const secondArgs = input(task(store, scope, owner), 'count-second', { resources: ['resource\0second'] })
+  trace = task19Observe(t, store, () => g.reserve(secondArgs, scope, actor))
+  const second = trace.value
+  task19AssertTrace(trace, [['G2', 'get', [scope, secondArgs.operation_key], 0, []], ['G3', 'get', [second.reservation_id], 1, [{ run_id: scope }]]])
+  trace = task19Observe(t, store, () => g.snapshot(scope))
+  // Holds sort by generated reservation ID, so derive only their documented ordering.
+  const held = [[first.reservation_id, 'resource\0first'], [second.reservation_id, 'resource\0second']]
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, resource_key]) => ({ resource_key }))
+  task19AssertTrace(trace, [['G4', 'all', [scope], 2, [{ run_id: scope, session_id: owner }, { run_id: scope, session_id: null }]],
+    ['G5', 'all', [scope], 2, held], ['G6', 'all', [scope], 3, Array(3).fill({ run_id: scope, session_id: owner })]])
+  assert.deepEqual(trace.value.reservations, [bound, second])
+})
+
+for (const site of ['G1', 'G2', 'G3', 'G4', 'G5', 'G6']) {
+  test('Task19 ' + site + ' faults exactly one generated public row without returning or persisting partial state', t => {
+    const { store, governor: g } = setup(t), scope = 'fault\0run', owner = 'fault\0worker'
+    const actor = { role: 'worker', sessionId: owner }
+    const args = input(task(store, scope, owner), 'fault-existing', { resources: ['resource\0held'] })
+    const reserved = g.reserve(args, scope, actor), bound = g.bind(ref(reserved, { session_id: owner }), scope, actor)
+    const freshArgs = input(task(store, scope, owner), 'fault-new', { kind: 'retry', resources: ['resource\0new'] })
+    g.snapshot(scope)
+    const before = task19LosslessRows(store), db = store.open()
+    const beforeChanges = db.prepare('SELECT total_changes() AS n').get().n
+    const expectedValues = {
+      G1: { owner_session: owner, session_id: owner, run_id: scope },
+      G2: { owner_session: owner, run_id: scope, session_id: owner }, G3: { run_id: scope },
+      G4: { run_id: scope, session_id: owner }, G5: { resource_key: 'resource\0held' },
+      G6: { run_id: scope, session_id: owner },
+    }
+    const field = { G1: 'run_id', G2: 'session_id', G3: 'run_id', G4: 'session_id', G5: 'resource_key', G6: 'session_id' }[site]
+    const invoke = () => site === 'G1' ? g.markUnknown(ref(bound, { reason: 'delivery unknown' }), scope, actor)
+      : site === 'G2' ? g.reserve(args, scope, actor) : site === 'G3' ? g.reserve(freshArgs, scope, actor) : g.snapshot(scope)
+    const unreturned = Symbol('no partial public result'); let result = unreturned, injections = 0, insertedId
+    const trace = task19Observe(t, store, () => assert.throws(() => { result = invoke() },
+      { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' }), event => {
+      if (event.site !== site) return
+      assert.equal(event.rows.length, site === 'G6' ? 2 : 1)
+      const row = event.rows[0]
+      for (const [key, value] of Object.entries(task19Transport(expectedValues[site]))) assert.equal(row[key], value)
+      if (site === 'G3') { assert.equal(row.task_id, freshArgs.task_id); assert.equal(row.state, 'reserved'); insertedId = row.reservation_id }
+      else if (site !== 'G6') assert.equal(row.reservation_id, reserved.reservation_id)
+      assert.equal(event.db.isTransaction, true)
+      row[field] = 'J"invalid transport without NUL"'; injections++
+    })
+    assert.equal(result, unreturned); assert.equal(injections, 1); assert.equal(db.isTransaction, false)
+    const g4 = ['G4', 'all', [scope], 1], g5 = ['G5', 'all', [scope], 1], g6 = ['G6', 'all', [scope], 2]
+    const expected = site === 'G1' ? [['G1', 'get', [reserved.reservation_id, scope], 1]]
+      : site === 'G2' ? [['G2', 'get', [scope, args.operation_key], 1]]
+      : site === 'G3' ? [['G2', 'get', [scope, freshArgs.operation_key], 0], ['G3', 'get', [insertedId], 1]]
+      : site === 'G4' ? [g4] : site === 'G5' ? [g4, g5] : [g4, g5, g6]
+    task19AssertTrace(trace, expected)
+    assert.deepEqual(task19LosslessRows(store), before)
+    // SQLite total_changes includes rolled-back writes; only assert equality for paths that wrote nothing.
+    if (site !== 'G3') assert.equal(db.prepare('SELECT total_changes() AS n').get().n, beforeChanges)
+    if (site === 'G3') {
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM governor_reservation WHERE reservation_id = ?').get(insertedId).n, 0)
+      assert.equal(g.reserve(freshArgs, scope, actor).state, 'reserved')
+    }
+  })
+}

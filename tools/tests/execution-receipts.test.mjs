@@ -1016,3 +1016,132 @@ for (const task19E1FaultRoute of ['board', 'boardPage']) {
     })
   }
 }
+
+// Count the real public reader pair; oracle/setup reads occur outside this hook.
+function task19ReceiptLifecycle(t, db, originalSql, match, args, rowCount, work, mutate) {
+  const originalPrepare = db.prepare, prepare = originalPrepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if (!match(sql)) return statement
+    const record = { kind: sql === originalSql ? 'original' : 'generated', columns: 0,
+      get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] }
+    records.push(record)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...values) => { record.columns++; return columns(...values) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...values) => {
+        record[method]++; record.bindings.push(values)
+        const result = read(...values)
+        if (method === 'all') {
+          assert.equal(Array.isArray(result), true); record.rows.push(result.length)
+          if (record.kind === 'generated' && mutate) mutate(result)
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  let result
+  try { result = work() } finally { db.prepare = originalPrepare }
+  t.diagnostic('public SQL lifecycle ' + JSON.stringify({ originalSql, records }))
+  assert.deepEqual(records, rowCount === null ? [] : [
+    { kind: 'original', columns: 1, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] },
+    { kind: 'generated', columns: 1, get: 0, all: 1, iterate: 0, run: 0, bindings: [args], rows: [rowCount] },
+  ])
+  return result
+}
+
+for (const site of ['E1', 'E2']) {
+  test(`Task19 ${site} public lifecycle preserves full-run fields with zero, one and multiple rows before and after reopen`, t => {
+    const f = fixture(t), scope = 'receipt-lifecycle\0run', owner = 'worker\0owner'
+    const actor = { sessionId: owner, isRoot: false }, lead = { sessionId: 'root\0audit', isRoot: true }
+    const fixed = 'echo never executed\0fixed', source = readFileSync(join(f.cwd, 'source.js'))
+    const id = f.store.openTask({ ...f.input, verification_command: fixed }, scope,
+      { ...f.context, sessionId: scope }).task_id
+    const claim = () => f.store.claimTask({ task_id: id, child_id: 'display' }, scope, actor, owner)
+    claim()
+    const table = site === 'E1' ? 'execution_receipt' : 'execution_waiver'
+    const fields = site === 'E1'
+      ? ['run_id', 'owner_session', 'actor_session', 'command', 'call_id', 'root_call_id', 'parent_call_id']
+      : ['reason', 'actor_session', 'run_id']
+    const suffix = ' FROM ' + table + ' WHERE task_id = ? AND run_id IS ? ORDER BY id DESC LIMIT 10'
+    const expected = [], creationHandle = f.store.open()
+    const check = (reader, phase) => {
+      const oracle = new DatabaseSync(f.store.dbPath, { readOnly: true })
+      let stored
+      try {
+        stored = oracle.prepare('SELECT id, receipt_id, evidence_generation,'
+          + (site === 'E1' ? 'status, logs, outcome, ended_at,' : 'created_at,')
+          + fields.map(field => 'typeof(' + field + ') AS ' + field + '_type, json_quote(' + field + ') AS ' + field + '_json').join(',')
+          + ' FROM ' + table + ' WHERE task_id=? AND run_id IS ? ORDER BY id DESC').all(id, scope)
+        assert.equal(stored.length, expected.length)
+        stored.forEach((row, index) => {
+          const wanted = expected.at(-1 - index)
+          for (const field of fields) {
+            assert.equal(row[field + '_type'], wanted[field] === null ? 'null' : 'text')
+            assert.equal(JSON.parse(row[field + '_json']), wanted[field])
+          }
+          if (site === 'E1') {
+            assert.equal(row.receipt_id, wanted.receipt_id); assert.equal(row.status, 'pending')
+            assert.equal(row.logs, null); assert.equal(row.outcome, null); assert.equal(row.ended_at, null)
+          } else {
+            assert.equal(row.receipt_id, null); assert.equal(row.evidence_generation, wanted.evidence_generation)
+            assert.equal(row.created_at, wanted.created_at)
+          }
+        })
+        assert.equal(oracle.prepare('SELECT total_changes() AS n').get().n, 0)
+      } finally { oracle.close() }
+      const db = reader.open(), changes = db.prepare('SELECT total_changes() AS n').get().n
+      assert.equal(db === creationHandle, phase === 'creation')
+      for (const route of ['board', 'boardPage']) {
+        const result = task19ReceiptLifecycle(t, db, 'SELECT *' + suffix,
+          sql => sql.startsWith('SELECT ') && sql.endsWith(suffix), [id, scope], expected.length,
+          () => reader[route]({ task_id: id }, scope))
+        assert.equal(result.task.id, id); assert.equal(result.task.run_id, scope)
+        assert.equal(result.task.status, site === 'E1' || expected.length === 0 ? 'claimed' : 'accepted')
+        assert.equal(result.task.evidence_generation, site === 'E1' ? 0 : Math.max(0, expected.length - 1))
+        const rows = site === 'E1' ? result.receipts : result.execution_waivers
+        assert.deepEqual(rows.map(row => row.id), stored.map(row => row.id))
+        rows.forEach((row, index) => {
+          const wanted = expected.at(-1 - index)
+          for (const field of fields) assert.equal(row[field], wanted[field])
+          if (site === 'E1') {
+            assert.equal(row.receipt_id, wanted.receipt_id); assert.equal(row.task_id, id)
+            assert.equal(row.status, 'pending'); assert.equal(row.logs, null)
+            assert.equal(Object.hasOwn(row, 'verified'), false); assert.equal(Object.hasOwn(row, 'outcome'), false)
+          } else { assert.equal(row.receipt_id, null); assert.deepEqual(result.receipts, []) }
+        })
+      }
+      assert.equal(db.isTransaction, false)
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+      assert.deepEqual(readFileSync(join(f.cwd, 'source.js')), source)
+      assert.equal(existsSync(join(f.store.root, 'receipts')), false)
+    }
+    check(f.store, 'creation')
+    for (let index = 0; index < 2; index++) {
+      if (site === 'E1') {
+        const coordinates = { call_id: 'call\0' + index, root_call_id: 'root\0' + index,
+          parent_call_id: index === 0 ? null : 'parent\0full' }
+        const pending = f.store.recordExecution({ task_id: id, status: 'pending', command: fixed,
+          timeout_ms: 60000, ...coordinates }, scope, actor)
+        assert.equal(pending.task_id, id); assert.equal(pending.status, 'pending'); assert.equal(pending.verified, false)
+        expected.push({ ...coordinates, receipt_id: pending.receipt_id, run_id: scope,
+          owner_session: owner, actor_session: owner, command: fixed })
+      } else {
+        if (index > 0) { f.store.rejectTask({ task_id: id, reason: 'rework' }, scope, lead); claim() }
+        f.store.submitTask({ task_id: id }, scope, actor, owner)
+        const reason = 'manual\0exception ' + index
+        const accepted = f.store.acceptTask({ task_id: id, waiver_reason: reason }, scope, lead)
+        assert.equal(accepted.execution_verified, false); assert.equal(accepted.execution_receipt, null)
+        assert.equal(accepted.waiver.reason, reason)
+        expected.push({ reason, actor_session: lead.sessionId, run_id: scope,
+          evidence_generation: index, created_at: accepted.accepted_at })
+      }
+      check(f.store, 'creation')
+    }
+    f.store.close()
+    const reopened = new TaskforceStore(f.store.root)
+    try { check(reopened, 'reopened') } finally { reopened.close() }
+  })
+}

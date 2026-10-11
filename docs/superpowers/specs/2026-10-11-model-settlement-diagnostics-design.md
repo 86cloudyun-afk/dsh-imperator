@@ -1,0 +1,15 @@
+# 有界模型验收的结算进度诊断设计（草案）
+
+用户已授权继续研究、修复遗漏、升级并在全部实际验收与独立审核后合并。当前唯一真实候选 d389984 的实际80请求/8192输出容量/180000ms每阶段样本 FAILED：readonly3请求5246ms；repair21请求180010ms timeout，虽有1accepted任务和4依据，runStage未完成，independentChecks=0。所有已知runtime计数为零仅表示未观察到已记录错误，不能区分仍running、whenIdle pending、缺结算notice或稳定性窗口变动。本轮不保存原始对话，SDK spill为空，故缺少必要定位证据；没有已证明的确定性生产hang。
+
+比较三种办法：提高时间/请求额度不会定位等待边界；在task accepted后提前结束会绕过真实树结算；采用有界、固定字段的结算进度观察。第三种不改变运行控制流、工作负载、persona、时间/请求/容量边界、grader次序或验收条件，也不修改SDK/生产runtime组件。
+
+只修改 tools/verify-model.mjs、tools/tests/model-regression.test.mjs、tools/tests/host-boundaries.test.mjs。Root独占研究账本、README和设计/计划。输出为报告中每stage新增有界progress和timeoutProgress；既有字段/失败原因不变。progress包含lastRequestElapsedMs（本stage最近真正获准请求时间，相对stage开始，未请求为null）和settlement（缺少snapshot接口、读取失败或字段非法时为null；具有接口的custom harness可提供相同严格白名单观察，但其既有custom-harness-unverified标志不变）；timeoutProgress于deadline callback取消前同步冻结，后续cancel/dispose/snapshot不能改写。正常stage timeoutProgress=null。所有阶段只保存固定enum、计数、null，不保存任意ID/名字/路径/工具参数/文本/原始事件/凭据/reasoning。
+
+settlement固定phase区分not-started、waiting-idle、waiting-notices、checking-stability、settled；固定安全非负整数包括trackedAgents、idleAgents、runningAgents、unknownAgents、pendingIdleWaits、requiredNotices、deliveredNotices、missingNotices。即时状态来自真实tracked Agents及实际session notice计数，phase只说明当前等待代码位置，不推定业务结果。每个child-parent配对独立计算needed=max(0,activationDelta)、delivered=min(needed,max(0,noticeDelta))、missing=needed-delivered，之后才分别求和；A重复notice不能遮盖B缺失，父缺失时该配对delivered=0、missing=needed。三个聚合值自然满足missing=required-delivered，不以聚合总notice相减替代配对。cold reuse使用各stage beforeCounts/beforeNotices基线，每个新activation都仍需自己的notice。完整tree/idle/notice/两次stable tick门槛保持。
+
+具体小接口由实现者确定：可提供native harness.settlementSnapshot()，由waiter内部维护phase/原始Promise完成观察。不要用异步wrapper替换native whenIdle Promise；原Promise仍传入原Promise.all，额外成功/拒绝观察不能创造未处理拒绝或干扰当前cohort计数。不可用统一保存settlement=null，不以零计数冒充观测。所有正常采样、phase更新、Promise成功/拒绝观察及timeout读取均隔离诊断异常；不能改变原wait/Promise.all行为、产生未处理rejection、吞掉cancel/cleanup、抛任意错误到报告或把timeout替换成功。原safeSnapshot的invalid-observation以及原cleanup-error覆盖规则不变；观察缺失本身既不新增也不覆盖这些主失败。custom harness旧接口兼容，snapshot只接受同步primitive投影，Promise/thenable不得await而按非法null处理；对其返回的诊断严格白名单/类型校验，不接受任意新增键或unsafe计数。诊断是附加观察，不能作为通过判据。
+
+先用原代码行为RED证明实际报告缺before-cancel诊断，并用受控waiter场景证明缺notice/挂起idle/parent reawake/cold reuse时无法区分。禁止仅缺import/helper构成唯一RED。GREEN离线覆盖time-before-cancel冻结、未知字段和throwing getter/不安全数字不泄露、report失败及cleanup保留、normal stage结算、pending Promise不会假settled和late cohort回调不污染。两固定SDK用现有本地llm/stream seam驱动真实native loop；inspectNative只登记sentinel/barrier，child创建及cold复用必须在runStage捕获beforeCounts/beforeNotices之后由mounted工具/公开subagent service触发。实际断言requiredNotices>0、直接父真实notice delta、cold同session且不同Agent对象、父唤醒与最终stable，不能用基线前create/resume导致needed=0的真空证明。对真实root/child/冷复用/结算/取消诊断时点与实际Agent/notice状态交叉核验，provider paid calls=0，并确实shutdown/fixture清理。保留所有旧门槛测试，再sole npm test。
+
+独立task SPEC先PASS再QUALITY；失败修复另起fresh重审。工具product字节变更使d389实际本地PASS仅属旧候选，须新source/oneCPU/npm/native两pins验收及一次有明确诊断目的的有界真实模型样本。原24请求timeout与80请求基线失败均保留，不静默反复重试、提高限额、修改prompt或用mock代替实际模型通过。无原始生产logs，不推定历史执行者停止根因；最终PR、额外复审、actual六CI作业、expectedheadmerge/main读回仍全部必需。

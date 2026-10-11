@@ -6,7 +6,7 @@
 
 | 范围 | 实测结果 | 本轮处理 |
 | --- | --- | --- |
-| 工作流终态 | 取消等终态仍可被新批准、产物或审核操作推进；精确旧键重放应保留 | 在重放后、版本和写入前拒绝新终态操作 |
+| 工作流终态 | 取消后的首次批准或迟到审核仍可推进工作流；精确旧键重放应保留 | 在重放后、版本和写入前统一拒绝所有新的普通终态变更 |
 | 控制回执 | 效果与 accepted 结果已持久化，未使用的第二次目录查询仍可阻塞回包；明确 stop 拒绝的文案声称已接受 | 删除效果后的无用等待，以独立同步活动表观测；文案依据实际接受结果 |
 | fork 观测归属 | 父事件被计为子会话失败、未结算派发及生命周期；两个固定 Session 版本均复现 | 使用持久 inheritedEventCount，仅活动观测取 own 后缀，完整可见上下文和 TODO 保留 |
 | H01 身份准备 | 普通 fork 的 seed 血缘被误当委派；运行时深度被忽略 | 按实际 live 委派链和两种声明深度准备身份，adapter 仍关闭 |
@@ -74,3 +74,17 @@ fixture 最终串行记录绑定 `8e1f8e7…` / tree `f97d2fdf4ce902a307a4362ebe
 ## 0.4.2 集成候选
 
 九项任务已分别通过独立 spec 与 quality 审核；第九项原 quality FAIL 保留，修正后由新角色重审。版本更新为 0.4.2，README 与交付指南采用当前版本，同时保留历史迁移、模型样本和失败范围。本轮没有新增 DDL / runtime 依赖；队列撤回仍要求同库调度写入者协调使用同版本。最终候选身份、不可变包、单 CPU、两 pins 全量 native 和真实模型结果将在实际执行后追加。PR 尚为草稿、未合并。
+
+## 首次冻结包的实际验收与后续遗漏
+
+候选 `d389984425fd092137bd62f769f90b5143bddf9f` / tree `0f06c6a1bde226c3b63932f53e4972be8727a0d4`：完整 Git source 194 文件；npm 包 186 文件、834360 bytes，SHA256 `96f98ef00aef2110475fa43279e62cef98affb3908c6f9f8830151a841405fc2`；产品 fingerprint `d0346a7e8c5ce456f6f4b278d3efc8f6710fb5afbb3af1c92cf749e7499f3082`。独立审查逐字节核对 Git、source tar、npm 声明清单、tgz、解包和原始日志/报告摘要。包权限为 185 个 0600 与唯一 executable 0700，Git 为 0644/0755，执行位一致；之后 CI 归档差异须分别解释文档内容和权限元数据，不能统称文档变化。
+
+本地四道检查实际完成：source offline 1670 tests /1650 pass/20 host skip/0 fail，17.585s；隔离 Git source 单 CPU 同计数，35.177s；同一精确解包在 Node24.19 / rc.2 和 alpha.2 分别 fullchain 59.845s 与 61.026s，packed offline 各 1670/1644/26/0，随后 native 99/99/0skip、HOST17、ISOLATION13。fullchain 总时长不是单 child 超过60000ms。两 native 各保留一条 stripTypeScriptTypes ExperimentalWarning，0 MaxListenersExceededWarning。额外六项 packed repository-only skip 不作为 native coverage。原 TMPDIR 各有 SDK 空 spill root、native loader 和 Node compile cache；实际 taskforce home/workspace 已移除，不能称全部临时目录为空。
+
+同一包唯一真实模型样本 **FAILED**，CLI exit1，186.890s / report186838ms；cap80、输出容量8192、阶段180000ms、rc.2/deepseek-official/deepseek-flash 保持。readonly 3请求5246ms通过；repair 21请求180010ms timeout，虽有1 accepted任务/4依据且closure.ok，独立grader尚未执行（checks0），reuse/strict未执行。总24请求；usage input34810、output19572、cacheRead417280、cacheWrite0；记录的runtime/usage/route错误计数均0，不证明运行树已结束。原始CLI/report/命令与失败退出保留，独立验收checker实际exit1。不能把此样本记为真实模型通过或推定生产崩溃。
+
+只读 SDK 契约审计未找到确定的死锁：真实 notice envelope 匹配现有读取，SDK status=idle还包括maintenance，不能替代whenIdle。取消前无法区分 pending idle、缺结算notice和稳定性变动，timeout先cancel后snapshot使原等待条件无法还原；这是确定的诊断遗漏，尚非timeout因果归属。追加 [结算诊断设计](../specs/2026-10-11-model-settlement-diagnostics-design.md) / [计划](../plans/2026-10-11-model-settlement-diagnostics.md)：仅有界phase/计数和取消前不可变观察，不保存原始转录、不放宽门槛。
+
+整轮 source 审查另确认原main已存在成功回包误导：legacy依据无pointer可合法accepted，warning却建议继续补证，而普通fact/artifact将被终态闸拒绝E_TERMINAL。追加 [验收指引设计](../specs/2026-10-11-acceptance-advice-design.md) / [计划](../plans/2026-10-11-acceptance-advice.md)：仅将建议指向后续任务在提交/验收前补齐指针，保留原policy和terminalguard。实际paid报告未保存warning/with_pointer，不能证明这分支触发或导致timeout。
+
+两项追加任务尚待实现与 fresh SPEC→QUALITY 审核。产品工具/库字节改变后，首次冻结包验收仅属旧候选；最终新包必须重新完成 source、oneCPU、两pins native及有明确诊断目的的真实模型样本，再整轮审核、实际最终PR CI和额外复审。PR69仍草稿、未合并。

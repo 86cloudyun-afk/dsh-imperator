@@ -692,12 +692,190 @@ function settlementCounts(sessions) {
  * are not authority; the live host projection remains readable after disposal. */
 export function nativeSubagentMode(host, agent) {
   try {
-    const identity = host.sessionProjections.snapshot(agent.session, ['subagent']).values.subagent
+    const projection = host.sessionProjections.snapshot(agent.session, ['subagent'])
+    if (!projection || types.isProxy(projection)) return 'unknown'
+    const values = Object.getOwnPropertyDescriptor(projection, 'values')?.value
+    if (!values || types.isProxy(values)) return 'unknown'
+    const identity = Object.getOwnPropertyDescriptor(values, 'subagent')?.value
+    if (!identity || types.isProxy(identity)) return 'unknown'
     const mode = Object.getOwnPropertyDescriptor(identity, 'mode')?.value
     const seq = Object.getOwnPropertyDescriptor(identity, 'seq')?.value
     return (mode === 'one-shot' || mode === 'continuable') && count(seq)
       && agent.session.isOwnSeq(seq) === true ? mode : 'unknown'
   } catch { return 'unknown' }
+}
+
+// Negative evidence has its own private bounds, independent of report budgets.
+const lifecycleCreationLimit = 256
+const lifecycleHistoryLimit = 4096
+const lifecycleCount = value => count(value) && !Object.is(value, -0)
+const lifecycleObject = value => value !== null && typeof value === 'object' && !types.isProxy(value)
+const lifecycleId = value => typeof value === 'string' && value.length > 0 && value.length <= 256 && Buffer.byteLength(value, 'utf8') <= 256
+function lifecycleField(object, key) {
+  if (!lifecycleObject(object)) throw new Error('unavailable lifecycle evidence')
+  const descriptor = Object.getOwnPropertyDescriptor(object, key)
+  if (!descriptor || !Object.hasOwn(descriptor, 'value')) throw new Error('unavailable lifecycle field')
+  return descriptor.value
+}
+function nativeSessionReader(Session) {
+  const prototype = Session.prototype
+  const keys = ['id', 'seq', 'isOwnSeq', 'snapshotEvents']
+  const descriptors = Object.fromEntries(keys.map(key => [key, Object.getOwnPropertyDescriptor(prototype, key)]))
+  return session => {
+    if (!lifecycleObject(session) || Object.getPrototypeOf(session) !== prototype) throw new Error('untrusted Session')
+    for (const key of keys) {
+      const current = Object.getOwnPropertyDescriptor(prototype, key), original = descriptors[key]
+      if (Object.hasOwn(session, key) || !current || !original
+        || ['get', 'set', 'value', 'writable', 'enumerable', 'configurable'].some(field => current[field] !== original[field])) throw new Error('changed Session API')
+    }
+    const header = lifecycleField(session, 'header')
+    if (!lifecycleObject(header) || ![Object.prototype, null].includes(Object.getPrototypeOf(header))) throw new Error('invalid Session header')
+    const id = lifecycleField(header, 'id'), parent = Object.getOwnPropertyDescriptor(header, 'parentSession')
+    if (parent && !Object.hasOwn(parent, 'value')) throw new Error('invalid parent identity')
+    const cut = lifecycleField(session, 'inheritedEventCount'), firstLive = lifecycleField(session, 'firstLiveSeq')
+    const seq = Reflect.apply(descriptors.seq.get, session, [])
+    if (!lifecycleId(id) || (parent?.value != null && !lifecycleId(parent.value))
+      || ![cut, firstLive, seq].every(lifecycleCount) || cut > firstLive || firstLive > seq
+      || Reflect.apply(descriptors.id.get, session, []) !== id) throw new Error('invalid Session boundary')
+    return { id, parent: parent?.value ?? null, header, cut, firstLive, seq,
+      isOwn: position => Reflect.apply(descriptors.isOwnSeq.value, session, [position]) === true }
+  }
+}
+
+/** Private weak lifetimes; the exported constructor is an unpaid boundary-test seam.
+ * Only complete public evidence can reject. Unknown evidence never grants success. */
+export function createNativeLifecycleTracker({ Session, rootId, tracked, agents, sessions, classifyMode, readCreation }) {
+  const readSession = nativeSessionReader(Session), records = new WeakMap(), bySession = new WeakMap()
+  let active, stopping = false
+  const invalidate = record => { if (record) record.valid = false; else if (active) active.complete = false }
+  const lineage = (id, parent) => {
+    const visited = new Set([id])
+    while (parent !== null && visited.size <= lifecycleCreationLimit) {
+      if (visited.has(parent)) return false
+      visited.add(parent)
+      const agent = tracked.get(parent)
+      if (!agent || agents.get(parent) !== agent) return false
+      const session = lifecycleField(agent, 'session'), value = readSession(session)
+      if (lifecycleField(agent, 'id') !== parent || value.id !== parent || sessions.get(parent) !== session) return false
+      if (parent === rootId) return value.parent === null
+      parent = value.parent
+    }
+    return false
+  }
+  const current = record => {
+    if (lifecycleField(record.agent, 'id') !== record.id || lifecycleField(record.agent, 'session') !== record.session) throw new Error('replaced Agent identity')
+    const value = readSession(record.session)
+    if (value.id !== record.id || value.header !== record.header || value.parent !== record.parent
+      || value.cut !== record.cut || value.firstLive !== record.firstLive) throw new Error('changed lifetime identity')
+    return value
+  }
+  async function created(payload) {
+    let record
+    try {
+      const agent = lifecycleField(payload, 'agent')
+      if (!lifecycleObject(agent)) throw new Error('invalid Agent')
+      record = records.get(agent)
+      if (record) { invalidate(record); return }
+      const session = lifecycleField(agent, 'session'), value = readSession(session)
+      if (value.id === rootId || !active || stopping) return
+      if (++active.creations > lifecycleCreationLimit || value.seq > lifecycleHistoryLimit) return
+      if (lifecycleField(agent, 'id') !== value.id || agents.get(value.id) !== agent || sessions.get(value.id) !== session
+        || !lineage(value.id, value.parent)) return
+      const previous = bySession.get(session)
+      if (previous) { invalidate(previous); return }
+      record = { ...value, agent, session, stage: active, next: value.seq, valid: true, ready: false, started: false, closed: false }
+      records.set(agent, record); bySession.set(session, record)
+      // The native adapter returns only after releasing its exact live lease.
+      // Publications during this await continue advancing this record's cursor.
+      const proof = await readCreation(session, value)
+      if (!record.valid || record.closed || agents.get(value.id) !== agent || sessions.get(value.id) !== session
+        || current(record).seq !== record.next || lifecycleField(proof, 'source') !== 'live'
+        || lifecycleField(proof, 'header') !== value.header || lifecycleField(proof, 'inheritedEventCount') !== value.cut
+        || lifecycleField(proof, 'cursor') !== value.seq - 1) { invalidate(record); return }
+      const events = lifecycleField(proof, 'events')
+      if (!Array.isArray(events) || types.isProxy(events) || events.length !== value.seq) { invalidate(record); return }
+      for (let seq = 0; seq < value.seq; seq++) {
+        const event = lifecycleField(events, String(seq)), type = lifecycleField(event, 'type')
+        if (lifecycleField(event, 'seq') !== seq || typeof type !== 'string'
+          || (seq >= value.firstLive && value.isOwn(seq) && type === 'turn/start')) { invalidate(record); return }
+      }
+      record.ready = true
+    } catch { invalidate(record) }
+    // agent/created is serial; neither evidence nor an observation failure vetoes creation.
+  }
+  function published(session, event) {
+    const record = lifecycleObject(session) ? bySession.get(session) : undefined
+    if (!record || !record.valid || record.closed) return
+    try {
+      const value = current(record), seq = lifecycleField(event, 'seq'), type = lifecycleField(event, 'type')
+      if (!lifecycleCount(seq) || typeof type !== 'string' || seq !== record.next || value.seq !== seq + 1
+        || sessions.get(record.id) !== session || agents.get(record.id) !== record.agent) { invalidate(record); return }
+      record.next++
+      if (type === 'turn/start' && seq >= record.firstLive && value.isOwn(seq)) record.started = true
+    } catch { invalidate(record) }
+  }
+  function disposed(payload) {
+    let record
+    try {
+      const agent = lifecycleField(payload, 'agent')
+      record = lifecycleObject(agent) ? records.get(agent) : undefined
+      if (!record || record.closed) return
+      record.closed = true
+      if (!record.valid || !record.ready || record.started || stopping || record.stage !== active
+        || !active.complete || active.failure || current(record).seq !== record.next
+        || agents.get(record.id) !== undefined || sessions.get(record.id) !== record.session
+        || tracked.get(record.id) !== agent || !lineage(record.id, record.parent)) return
+      if (classifyMode(agent) !== 'continuable') return
+      active.failure = Object.assign(new Error('unsettled-tree'), { verificationCode: 'unsettled-tree' })
+      active.resolve(active.failure)
+    } catch { invalidate(record) }
+  }
+  return {
+    created, published, disposed,
+    beginStage() {
+      const { promise, resolve } = Promise.withResolvers()
+      const token = Object.freeze({ failure: promise })
+      active = { token, resolve, creations: 0, complete: true, failure: null }
+      return token
+    },
+    endStage(token) { if (active?.token === token) active = undefined },
+    cancel() { stopping = true },
+  }
+}
+
+// The official mounted service is trusted. Invoke its captured public native
+// method, never an arbitrary method/accessor from callback evidence. No cold
+// query, projection registration, flush or direct deprecated Session read.
+export function nativeCreationReader({ Session, SessionQueryEngine, host, sessions }) {
+  const readSession = nativeSessionReader(Session)
+  const observe = Object.getOwnPropertyDescriptor(SessionQueryEngine.prototype, 'observeSession').value
+  const service = host.get('sessionQuery')
+  return async (session, expected) => {
+    let lease, release
+    try {
+      const value = readSession(session)
+      if (value.seq > lifecycleHistoryLimit || value.seq !== expected.seq || sessions.get(value.id) !== session) return null
+      lease = await Reflect.apply(observe, service, [value.id, { projectionMode: 'none' }])
+      release = lifecycleField(lease, Symbol.dispose)
+      if (typeof release !== 'function' || types.isProxy(release)) throw new Error('invalid observation release')
+      if (lifecycleField(lease, 'source') !== 'live' || lifecycleField(lease, 'header') !== expected.header
+        || lifecycleField(lease, 'inheritedEventCount') !== expected.cut || lifecycleField(lease, 'cursor') !== expected.seq - 1
+        || sessions.get(value.id) !== session) return null
+      readSession(session) // Revalidate the native lazy reader and reject own shadows.
+      const events = Object.getOwnPropertyDescriptor(lease, 'events')
+      if (typeof events?.get !== 'function' || events.set !== undefined || types.isProxy(events.get)) return null
+      return { source: 'live', header: expected.header, inheritedEventCount: expected.cut, cursor: expected.seq - 1,
+        events: Reflect.apply(events.get, lease, []) }
+    } finally {
+      // Native live leases only release this observation. Release failure makes
+      // the complete read reject, so certified readiness cannot survive it.
+      if (lease !== undefined) {
+        release ??= lifecycleField(lease, Symbol.dispose)
+        if (typeof release !== 'function' || types.isProxy(release)) throw new Error('invalid observation release')
+        Reflect.apply(release, lease, [])
+      }
+    }
+  }
 }
 
 // The compatibility seam without a classifier keeps its original all-notice
@@ -906,11 +1084,24 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
   const fixture = await controlledProfile(anchor, packageRoot)
   const emergency = () => fixture.emergencyDispose()
   process.once('exit', emergency)
-  let app, handle
+  let app, handle, lifecycle
   const tracked = new Map()
   const activationCounts = new Map()
+  const settlements = new Set()
   let disposed = false
-  const cancel = () => { for (const agent of tracked.values()) { try { agent.cancel({ kind: 'user' }) } catch { /* continue cancellation of other descendants */ } } }
+  const cancel = () => {
+    lifecycle?.cancel()
+    for (const agent of tracked.values()) { try { agent.cancel({ kind: 'user' }) } catch { /* continue cancellation of other descendants */ } }
+  }
+  const drainSettlements = async () => {
+    const failures = []
+    for (const work of [...settlements]) {
+      await work.completion
+      settlements.delete(work)
+      if (work.error && work.error.verificationCode !== 'unsettled-tree') failures.push(work.error)
+    }
+    if (failures.length) throw new AggregateError(failures, 'native settlement cleanup failed')
+  }
   const dispose = async () => {
     if (disposed) return
     disposed = true
@@ -918,8 +1109,20 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     const failures = []
     cancel()
     try {
-      try { await deadline(() => fixture.teardown(() => handle?.dispose()), 10000, cancel) } catch (error) { failures.push(error) }
-      try { await deadline(() => fixture.shutdown(1), 10000, cancel) } catch (error) { failures.push(error) }
+      try {
+        await deadline(() => fixture.teardown(async () => {
+          const results = await Promise.allSettled([handle?.dispose(), drainSettlements()])
+          const errors = results.filter(result => result.status === 'rejected').map(result => result.reason)
+          if (errors.length) throw new AggregateError(errors, 'native teardown failed')
+        }), 10000, cancel)
+      } catch (error) { failures.push(error) }
+      try {
+        await deadline(async () => {
+          const results = await Promise.allSettled([fixture.shutdown(1), drainSettlements()])
+          const errors = results.filter(result => result.status === 'rejected').map(result => result.reason)
+          if (errors.length) throw new AggregateError(errors, 'native shutdown failed')
+        }, 10000, cancel)
+      } catch (error) { failures.push(error) }
     } finally {
       try { fixture.dispose() } catch (error) { failures.push(error) }
       finally {
@@ -937,6 +1140,19 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     const boundary = createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure })
     app.ctx.on('llm/stream', (options, next) => boundary.intercept(options, next), { global: true, prepend: true })
     const rootId = `taskforce-model-${randomUUID()}`
+    const { Session } = await nativeModule(anchor, '@deepseek-ai/dsh-session')
+    const { SessionQueryEngine } = await nativeModule(anchor, '@deepseek-ai/dsh-session-query')
+    const agents = app.ctx.get('agents'), sessionStore = app.ctx.get('sessions')
+    const classifyMode = agent => nativeSubagentMode(app.ctx, agent)
+    lifecycle = createNativeLifecycleTracker({ Session, rootId, tracked, agents, sessions: sessionStore, classifyMode,
+      readCreation: nativeCreationReader({ Session, SessionQueryEngine, host: app.ctx, sessions: sessionStore }) })
+    app.ctx.on('agent/created', lifecycle.created, { global: true, prepend: true })
+    app.ctx.on('session/event', lifecycle.published, { global: true, prepend: true })
+    app.ctx.on('agent/disposed', lifecycle.disposed, { global: true, prepend: true })
+    const applicationFiber = app.ctx.fiber
+    app.ctx.on('internal/status', fiber => {
+      if (fiber === applicationFiber && fiber.state === 5) lifecycle.cancel()
+    }, { global: true, prepend: true })
     let taskCollector
     try {
       taskCollector = createTaskToolDiagnosticsCollector({ rootId, agents: app.ctx.get('agents') })
@@ -960,20 +1176,33 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     tracked.set(rootId, handle.agent)
     // Native unpaid verification seam: inspect SDK wiring or drive genuine
     // lifecycles behind a local stream sentinel. Not exposed by the CLI.
-    await inspectNative?.({ ctx: app.ctx, root: handle.agent, handle })
+    await inspectNative?.({ ctx: app.ctx, root: handle.agent, handle, shutdown: code => fixture.shutdown(code) })
     // A reused cold child has the same session id but a fresh Agent. Keep its latest
     // live object; its durable session history contains prior usage and notices.
     const sessions = () => nativeSessions(tracked)
     let settled = true
-    const classifyMode = agent => nativeSubagentMode(app.ctx, agent)
     let settlementSnapshot = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, classifyMode, beforeCounts: new Map(activationCounts), beforeNotices: settlementCounts(sessions()) }, { phase: 'not-started', pending: new Set() })
     async function runStage(stage) {
       settled = false
       const beforeNotices = settlementCounts(sessions())
       const beforeCounts = new Map(activationCounts)
-      handle.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: stage.prompt }] }))
-      await waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
-      settled = true
+      const token = lifecycle.beginStage()
+      let work
+      try {
+        handle.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: stage.prompt }] }))
+        const original = waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
+        work = { early: false, error: null }
+        work.completion = original.then(() => {}, error => { work.error = error })
+        settlements.add(work)
+        const failure = await Promise.race([original, token.failure])
+        if (failure) { work.early = true; throw failure }
+        settled = true
+      } finally {
+        lifecycle.endStage(token)
+        // An early negative result owns the original waiter until disposal.
+        // The normal success/error path already awaited that exact work.
+        if (work && !work.early) settlements.delete(work)
+      }
     }
 
     function snapshot() {

@@ -1818,3 +1818,241 @@ test('native task action diagnostics distinguish registered business outcomes an
     }
   }
 })
+
+test('native unstarted disposal rejects early and a real same-session cold retry cannot erase the failure', options, async t => {
+  const { createNativeHarness, nativeSubagentMode } = await import('../verify-model.mjs')
+  const { createUserMessage, isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+  await native('@deepseek-ai/dsh-subprocess-local')
+  const listenerNames = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT', 'exit']
+  const baseline = listenerNames.map(name => process.rawListeners(name))
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-unstarted-'))
+  const scopeEntered = nativeGate(), scopeRelease = nativeGate(), scopeFinished = nativeGate()
+  const children = [], agentDisposals = [], sessionDisposals = [], fibers = [], observerWork = [], streams = []
+  let harness, root, ctx, agents, sessions, fixtureRoot, childId, pending, fault = false, stage = 'initial', rootRequests = 0
+  let outcome = 'pending', rejected, retryRestoredTail = false, scopeHeld = false
+  const notices = () => root.session.snapshotEvents().filter(event => event.type === 'user/message'
+    && event.data?.source?.kind === 'subagent-settled' && event.data.source.senderSessionId === childId).length
+  const ownStarts = agent => agent.session.snapshotEvents().filter(event => event.type === 'turn/start'
+    && event.seq >= agent.session.firstLiveSeq && agent.session.isOwnSeq(event.seq)).length
+  try {
+    harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+      workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+    }, { inspectNative: state => {
+      root = state.root; ctx = state.ctx; agents = ctx.agents; sessions = ctx.sessions; fixtureRoot = dirname(process.env.DSH_HOME)
+      fibers.push(root.ctx.fiber)
+      const background = Object.hasOwn(root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent').parameters.properties, 'run_in_background')
+        ? { run_in_background: true } : {}
+      ctx.on('agent/created', ({ agent, source }) => {
+        if (agent.session.header.parentSession !== root.id) return
+        childId = agent.id; children.push(agent); fibers.push(agent.ctx.fiber)
+        assert.equal(nativeSubagentMode(ctx, agent), 'continuable')
+        assert.equal(agents.get(agent.id), agent)
+        if (children.length === 3) {
+          assert.equal(source, 'resume')
+          assert.notEqual(agent, children[1]); assert.notEqual(agent.session, children[1].session)
+          const failed = children[1].session, restored = agent.session.snapshotEvents(0, agent.session.firstLiveSeq)
+          assert.equal(agent.session.firstLiveSeq, failed.seq)
+          assert.deepEqual(restored, failed.snapshotEvents())
+          retryRestoredTail = true
+        }
+        if (fault && source === 'resume') {
+          fault = false
+          agent.ctx.effect(() => async () => {
+            scopeHeld = true; scopeEntered.resolve()
+            await scopeRelease.promise
+            scopeHeld = false; scopeFinished.resolve()
+          }, 'unstarted-disposal-cleanup-oracle')
+          throw new Error('LOCAL_UNSTARTED_PUBLICATION_FAULT')
+        }
+      }, { global: true })
+      ctx.on('agent/disposed', ({ agent }) => {
+        if (agent !== root && !children.includes(agent)) return
+        // The SDK emits without awaiting observers: retain and join our work.
+        observerWork.push((async () => {
+          agentDisposals.push(agent)
+          assert.equal(agents.get(agent.id), undefined)
+        })())
+      }, { global: true })
+      ctx.on('session/disposed', session => {
+        const agent = [root, ...children].find(item => item.session === session)
+        if (!agent) return
+        observerWork.push((async () => {
+          assert.ok(agentDisposals.includes(agent))
+          assert.equal(sessions.get(session.id), undefined)
+          sessionDisposals.push(session)
+        })())
+      }, { global: true })
+      ctx.on('llm/stream', request => (async function* () {
+        const record = { ended: false }; streams.push(record)
+        try {
+          assert.equal(isAgentLoopRequest(request), true); assert.equal(request.maxTokens, 8192)
+          let block = { type: 'text', text: '137' }
+          if (request.sessionId === root.id && ++rootRequests === 1) block = stage === 'initial'
+            ? { type: 'tool-call', id: 'unstarted-spawn', name: 'subagent', arguments: JSON.stringify({ description: 'local lifecycle worker', prompt: 'Return 137.', ...background }) }
+            : { type: 'tool-call', id: `unstarted-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Return 137.' }) }
+          yield { type: 'block-end', index: 0, block }
+          yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+          yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+        } finally { record.ended = true }
+      })(), { global: true })
+    } })
+    // No optional diagnostic begin hook: runStage owns the activation baseline.
+    await harness.runStage({ name: 'initial', prompt: 'Create the local worker.' })
+    assert.equal(notices(), 1); assert.equal(children.length, 1)
+    assert.equal(ownStarts(children[0]), 1)
+    stage = 'fault'; rootRequests = 0; fault = true
+    pending = harness.runStage({ name: 'fault', prompt: 'Resume the same worker.' })
+    const observed = pending.then(() => { outcome = 'resolved' }, error => { outcome = 'rejected'; rejected = error })
+    await scopeEntered.promise
+    assert.equal(outcome, 'pending'); assert.equal(scopeHeld, true)
+    assert.equal(agents.get(childId), children[1])
+    assert.equal(agentDisposals.includes(children[1]), false)
+    assert.equal(sessionDisposals.includes(children[1].session), false)
+    scopeRelease.resolve(); await scopeFinished.promise
+    await nativeCondition(() => agentDisposals.includes(children[1]) && sessionDisposals.includes(children[1].session)
+      && root.status === 'idle' && harness.settlementSnapshot().phase === 'waiting-notices')
+    assert.equal(ownStarts(children[1]), 0)
+    assert.ok(children[1].session.snapshotEvents().some(event => event.type === 'turn/start' && event.seq < children[1].session.firstLiveSeq), 'a restored historical own turn does not start this Agent')
+    const afterFault = harness.settlementSnapshot()
+    assert.equal(afterFault.missingNotices, 1); assert.equal(afterFault.pendingIdleWaits, 0)
+    stage = 'retry'; rootRequests = 0
+    root.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Try a fresh continuation of the same child.' }] }))
+    await nativeCondition(() => children.length === 3 && sessionDisposals.includes(children[2].session)
+      && notices() === 2 && root.status === 'idle' && harness.settlementSnapshot().phase === 'waiting-notices')
+    const afterRetry = harness.settlementSnapshot()
+    assert.equal(afterRetry.requiredNotices, 2); assert.equal(afterRetry.deliveredNotices, 1); assert.equal(afterRetry.missingNotices, 1)
+    assert.equal(ownStarts(children[2]), 1); assert.equal(retryRestoredTail, true)
+    assert.ok(children.every(agent => agent.id === childId)); assert.equal(new Set(children).size, 3)
+    const sendResults = root.session.snapshotEvents().filter(event => event.type === 'tool/result' && ['unstarted-fault', 'unstarted-retry'].includes(event.data.message?.source?.callId))
+      .map(event => ({ isError: event.data.message.isError === true, value: JSON.parse(event.data.message.content[0].text) }))
+    assert.equal(sendResults.length, 2); assert.equal(sendResults[0].isError, false)
+    assert.equal(sendResults[0].value.ok, false); assert.equal(sendResults[0].value.code, 'NOT_RESUMABLE')
+    assert.equal(sendResults[0].value.operation.status, 'unknown'); assert.equal(sendResults[1].value.ok, true)
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), afterFault, afterRetry, outcome,
+      failure: rejected?.verificationCode ?? null, ownStarts: children.map(ownStarts), retryRestoredTail, providerCalls: 0 }))
+    // On unchanged production the original waiter is still pending after both
+    // genuine rollback and retry; this is a behavioral RED, not a missing seam.
+    assert.equal(outcome, 'rejected', 'disposed unstarted native instance must reject before the stage deadline')
+    assert.equal(rejected.verificationCode, 'unsettled-tree'); await observed
+  } finally {
+    scopeRelease.resolve()
+    let cleanupTimer
+    try {
+      await Promise.race([(async () => {
+        harness?.cancel(); await harness?.dispose(); await pending?.catch(() => {})
+        await Promise.all(observerWork)
+        for (const fiber of fibers) { await fiber.await(); assert.equal(fiber.uid, null) }
+      })(), new Promise((_, reject) => { cleanupTimer = setTimeout(() => reject(new Error('FIXTURE_CLEANUP_DEADLINE_12S')), 12000) })])
+      if (ctx) {
+        assert.equal(agents.list().length, 0)
+        assert.ok([root, ...children].every(agent => agentDisposals.includes(agent) && sessionDisposals.includes(agent.session)))
+        assert.ok(streams.every(record => record.ended)); assert.ok(harness.streamSnapshot().records.every(record => record.ended))
+        await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+      }
+    } finally { clearTimeout(cleanupTimer); await rm(workspace, { recursive: true, force: true }) }
+    await assert.rejects(access(workspace), { code: 'ENOENT' })
+    for (const [index, name] of listenerNames.entries()) assert.deepEqual(process.rawListeners(name), baseline[index], `exact ${name} callback references/order/multiplicity`)
+    t.diagnostic(JSON.stringify({ nativeUnstartedCleanup: true, scopesQuiescent: fibers.length,
+      agentDisposals: agentDisposals.length, sessionDisposals: sessionDisposals.length, streamsDrained: streams.length,
+      retryWriterOwnershipAndCheckedTail: retryRestoredTail, everyOldCloseSucceeded: 'not observable', providerCalls: 0 }))
+  }
+})
+
+for (const boundary of ['cancel', 'dispose', 'application-shutdown']) {
+  test(`native unstarted disposal excludes intentional ${boundary} before the first child turn`, options, async t => {
+    const { createNativeHarness, nativeSubagentMode } = await import('../verify-model.mjs')
+    await native('@deepseek-ai/dsh-subprocess-local')
+    const listenerNames = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT', 'exit']
+    const baseline = listenerNames.map(name => process.rawListeners(name)), previousExit = process.exitCode
+    const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-unstarted-cancel-'))
+    const entered = nativeGate(), release = nativeGate()
+    const fibers = [], observers = [], streamEnds = [], abortListeners = []
+    let root, child, ctx, agents, sessions, fixtureRoot, shutdown, harness, stageWork, cleanupWork
+    let stageOutcome = 'pending', observedCode, appUnloading = false, aborts = 0, abortSawAppUnloading = false, childRemoved = false, sessionRemoved = false, rootRequests = 0
+    try {
+      harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+        workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+      }, { inspectNative: state => {
+        root = state.root; ctx = state.ctx; agents = ctx.agents; sessions = ctx.sessions
+        fixtureRoot = dirname(process.env.DSH_HOME); shutdown = state.shutdown; fibers.push(root.ctx.fiber)
+        const applicationFiber = ctx.fiber
+        ctx.on('internal/status', fiber => { if (fiber === applicationFiber && fiber.state === 5) appUnloading = true }, { global: true, prepend: true })
+        ctx.on('agent/created', ({ agent, signal }) => {
+          if (agent.session.header.parentSession !== root.id) return
+          child = agent; fibers.push(agent.ctx.fiber)
+          assert.equal(nativeSubagentMode(ctx, agent), 'continuable')
+          const aborted = () => { aborts++; abortSawAppUnloading = appUnloading }
+          signal.addEventListener('abort', aborted, { once: true })
+          abortListeners.push(() => signal.removeEventListener('abort', aborted))
+          entered.resolve()
+          return release.promise.then(() => { throw new Error('LOCAL_CANCELLED_CREATION') })
+        }, { global: true })
+        ctx.on('agent/disposed', ({ agent }) => {
+          if (agent !== child) return
+          observers.push((async () => {
+            assert.equal(agents.get(agent.id), undefined)
+            if (boundary === 'application-shutdown') assert.equal(appUnloading, true, 'real app root starts unload before child disposal')
+            childRemoved = true
+          })())
+        }, { global: true })
+        ctx.on('session/disposed', session => {
+          if (session !== child?.session) return
+          observers.push((async () => { assert.equal(childRemoved, true); assert.equal(sessions.get(session.id), undefined); sessionRemoved = true })())
+        }, { global: true })
+        const background = Object.hasOwn(root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent').parameters.properties, 'run_in_background')
+          ? { run_in_background: true } : {}
+        ctx.on('llm/stream', request => (async function* () {
+          const record = { ended: false }; streamEnds.push(record)
+          try {
+            assert.equal(request.sessionId, root.id, 'cancelled child never starts a local stream')
+            const block = ++rootRequests === 1
+              ? { type: 'tool-call', id: 'cancelled-create', name: 'subagent', arguments: JSON.stringify({ description: 'local cancelled worker', prompt: 'Return 137.', ...background }) }
+              : { type: 'text', text: '137' }
+            yield { type: 'block-end', index: 0, block }
+            yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+            yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+          } finally { record.ended = true }
+        })(), { global: true })
+      } })
+      stageWork = harness.runStage({ name: 'cancellation-boundary', prompt: 'Start a local child.' })
+      const observed = stageWork.then(() => { stageOutcome = 'resolved' }, error => { stageOutcome = 'rejected'; observedCode = error.verificationCode })
+      await entered.promise
+      assert.equal(stageOutcome, 'pending')
+      if (boundary === 'cancel') harness.cancel()
+      if (boundary === 'dispose') cleanupWork = harness.dispose()
+      if (boundary === 'application-shutdown') cleanupWork = shutdown(0)
+      release.resolve()
+      if (cleanupWork) await cleanupWork
+      if (boundary === 'application-shutdown') {
+        assert.equal(appUnloading, true); assert.ok(aborts > 0)
+        assert.equal(abortSawAppUnloading, true, 'real application UNLOADING precedes the creation signal abort')
+      }
+      await nativeCondition(() => agents.get(child.id) === undefined && root.status === 'idle')
+      assert.equal(child.session.snapshotEvents().some(event => event.type === 'turn/start' && event.seq >= child.session.firstLiveSeq), false)
+      if (boundary === 'dispose') { await observed; assert.equal(stageOutcome, 'rejected'); assert.equal(observedCode, 'unsettled-tree') }
+      else {
+        await new Promise(resolve => setTimeout(resolve, 25))
+        assert.equal(stageOutcome, 'pending', 'intentional teardown cannot invent the early unstarted-disposal failure')
+      }
+      t.diagnostic(JSON.stringify({ boundary, stageOutcome, appUnloading, aborts, abortSawAppUnloading, childUnstarted: true,
+        actualChildAbsent: agents.get(child.id) === undefined, providerCalls: 0 }))
+    } finally {
+      release.resolve()
+      let timer
+      try {
+        await Promise.race([(async () => {
+          await cleanupWork
+          harness?.cancel(); await harness?.dispose(); await stageWork?.catch(() => {})
+          await Promise.all(observers)
+          for (const fiber of fibers) { await fiber.await(); assert.equal(fiber.uid, null) }
+        })(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('FIXTURE_CLEANUP_DEADLINE_12S')), 12000) })])
+        assert.equal(agents?.list().length, 0)
+        assert.ok(streamEnds.every(record => record.ended)); assert.ok(harness.streamSnapshot().records.every(record => record.ended))
+        await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+      } finally { clearTimeout(timer); for (const remove of abortListeners) remove(); process.exitCode = previousExit; await rm(workspace, { recursive: true, force: true }) }
+      for (const [index, name] of listenerNames.entries()) assert.deepEqual(process.rawListeners(name), baseline[index])
+      t.diagnostic(JSON.stringify({ boundary, cleanup: true, childDisposedObserver: childRemoved, sessionDisposedObserver: sessionRemoved,
+        scopesQuiescent: fibers.length, localStreamsDrained: streamEnds.length, providerCalls: 0 }))
+    }
+  })
+}

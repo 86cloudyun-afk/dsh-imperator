@@ -1918,3 +1918,227 @@ for (const shape of ['subclass', 'foreign', 'own-native-constructor']) {
     assert.equal(report.stages[0].taskToolDiagnostics, null)
   })
 }
+
+async function unstartedFixture(overrides = {}) {
+  const { createNativeLifecycleTracker } = await api()
+  class Session {
+    constructor(id, parent = 'root', { cut = 0, firstLive = 0, prefix = [] } = {}) {
+      this.header = Object.freeze({ id, parentSession: parent }); this.inheritedEventCount = cut
+      this.firstLiveSeq = firstLive; this.history = prefix
+    }
+    snapshotEvents() { return [...this.history] }
+    get id() { return this.header.id }
+    get seq() { return this.history.length }
+    isOwnSeq(seq) { return seq >= this.inheritedEventCount && seq < this.seq }
+  }
+  const agents = new Map(), sessions = new Map(), tracked = new Map()
+  let mode = 'continuable', failRead = false
+  const tracker = createNativeLifecycleTracker({ Session, rootId: 'root', tracked,
+    agents: { get: id => agents.get(id) }, sessions: { get: id => sessions.get(id) },
+    classifyMode: () => { if (mode === 'throws') throw new Error('unavailable'); return mode },
+    async readCreation(session) { if (failRead) throw new Error('unavailable'); return { header: session.header,
+      inheritedEventCount: session.inheritedEventCount, cursor: session.seq - 1, source: 'live', events: [...session.history] } },
+    ...overrides,
+  })
+  const create = async (id = 'child', fields) => {
+    const session = new Session(id, id === 'root' ? null : 'root', fields)
+    const agent = { id, session }; agents.set(id, agent); sessions.set(id, session)
+    await tracker.created({ agent }); tracked.set(id, agent)
+    return agent
+  }
+  const main = await create('root')
+  const publish = (agent, type = 'agent-preset/selected') => {
+    const event = Object.freeze({ seq: agent.session.seq, type })
+    agent.session.history.push(event); tracker.published(agent.session, event); return event
+  }
+  const dispose = agent => { agents.delete(agent.id); tracker.disposed({ agent }); sessions.delete(agent.id) }
+  return { Session, tracker, create, main, agents, sessions, tracked, publish, dispose,
+    mode: value => { mode = value }, failRead: () => { failRead = true } }
+}
+
+for (const boundary of ['plain', 'historical-turn', 'seed-turn', 'same-id-retry', 'current-mode']) {
+  test(`unstarted lifecycle: exact disposed lifetime rejects the stage (${boundary})`, async () => {
+    const f = await unstartedFixture(), stage = f.tracker.beginStage()
+    const prefix = boundary === 'historical-turn' || boundary === 'seed-turn'
+      ? [{ seq: 0, type: 'turn/start' }, { seq: 1, type: 'turn/end' }, { seq: 2, type: 'session/end-seed' }] : []
+    if (boundary === 'current-mode') f.mode('one-shot')
+    const child = await f.create('child', { prefix, firstLive: prefix.length, cut: boundary === 'seed-turn' ? 2 : 0 })
+    f.publish(child)
+    if (boundary === 'current-mode') f.mode('continuable')
+    f.dispose(child)
+    const failure = await settlementDeadline(stage.failure)
+    assert.equal(failure.verificationCode, 'unsettled-tree')
+    if (boundary === 'same-id-retry') {
+      const retry = await f.create(); f.publish(retry, 'turn/start'); f.dispose(retry)
+      assert.equal(await stage.failure, failure, 'same ID cannot replace a failed actual Agent lifetime')
+    }
+    f.tracker.endStage(stage)
+  })
+}
+
+for (const boundary of ['pending', 'started', 'one-shot', 'unknown-mode', 'mode-throws', 'cancel', 'out-of-stage', 'late-stage',
+  'unmatched', 'replaced-session', 'missing-publication', 'precreated-turn', 'bad-offset', 'read-failure', 'foreign-agent', 'foreign-parent', 'own-seq-shadow', 'seq-getter', 'proxy-session', 'malformed-event']) {
+  test(`unstarted lifecycle: incomplete or excluded evidence cannot reject (${boundary})`, async () => {
+    const f = await unstartedFixture()
+    let stage = boundary === 'out-of-stage' ? null : f.tracker.beginStage()
+    if (boundary === 'read-failure') f.failRead()
+    const child = await f.create('child', boundary === 'precreated-turn' ? { prefix: [{ seq: 0, type: 'turn/start' }] } : undefined)
+    if (!stage) stage = f.tracker.beginStage()
+    if (boundary === 'late-stage') { f.tracker.endStage(stage); stage = f.tracker.beginStage() }
+    let rejected = false
+    stage.failure.then(() => { rejected = true })
+    if (boundary === 'started') f.publish(child, 'turn/start')
+    if (boundary === 'one-shot') f.mode('one-shot')
+    if (boundary === 'unknown-mode') f.mode('unknown')
+    if (boundary === 'mode-throws') f.mode('throws')
+    if (boundary === 'cancel') f.tracker.cancel()
+    if (boundary === 'replaced-session') child.session = new f.Session('child')
+    if (boundary === 'bad-offset') child.session.firstLiveSeq = -1
+    if (boundary === 'missing-publication') child.session.history.push({ seq: 0, type: 'turn/start' })
+    if (boundary === 'foreign-parent') f.tracked.set('root', { id: 'root', session: f.main.session })
+    if (boundary === 'own-seq-shadow') child.session.isOwnSeq = () => true
+    let reads = 0
+    if (boundary === 'seq-getter') Object.defineProperty(child.session, 'seq', { get() { reads++; return 0 } })
+    if (boundary === 'proxy-session') child.session = new Proxy(child.session, { get() { reads++; throw new Error('foreign trap') } })
+    if (boundary === 'malformed-event') f.tracker.published(child.session, Object.defineProperty({}, 'seq', { get() { reads++; return 0 } }))
+    if (boundary === 'unmatched' || boundary === 'foreign-agent') f.tracker.disposed({ agent: { ...child } })
+    else if (boundary !== 'pending') f.dispose(child)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(rejected, false); assert.equal(reads, 0)
+    f.tracker.endStage(stage)
+  })
+}
+
+for (const primary of ['request-cap', 'usage-or-runtime-error', 'cleanup-error', 'unsettled-tree']) {
+  test(`unstarted lifecycle rejection preserves ${primary} failure priority`, async t => {
+    const { runModelVerification } = await api(), h = setup(t)
+    h.options.requestCap = 1
+    let cancelled = 0
+    const report = await runModelVerification(h.options, { createHarness: async args => {
+      const harness = await h.factory(args)
+      harness.runStage = async () => {
+        if (primary === 'request-cap') {
+          args.onRequest({ agentId: 'root', turn: 1, step: 1 })
+          try { args.onRequest({ agentId: 'root', turn: 1, step: 2 }) } catch {}
+        }
+        if (primary === 'usage-or-runtime-error') args.onFailure()
+        throw Object.assign(new Error('unsettled-tree'), { verificationCode: 'unsettled-tree' })
+      }
+      harness.cancel = () => { cancelled++ }
+      if (primary === 'cleanup-error') harness.dispose = async () => { throw new Error('original native cleanup failure') }
+      return harness
+    } })
+    assert.equal(report.ok, false); assert.equal(report.failure, primary); assert.ok(cancelled > 0)
+  })
+}
+
+test('unstarted lifecycle: a certified negative never changes the original native wait or grants success', async () => {
+  const { waitForNativeSettlement } = await api(), f = await unstartedFixture()
+  const stage = f.tracker.beginStage(), child = await f.create()
+  const originalGate = deferred(), rootGate = deferred(), counts = new Map([['child', 1]])
+  f.main.status = 'idle'; child.status = 'idle'
+  f.main.whenIdle = () => rootGate.promise; child.whenIdle = () => originalGate.promise
+  f.main.session.snapshotEvents = () => []; child.session.snapshotEvents = () => []
+  let disposed = false, originalSettled = false
+  const original = waitForNativeSettlement({ tracked: f.tracked, rootId: 'root', activationCounts: counts,
+    beforeCounts: new Map(), beforeNotices: new Map(), classifyMode: () => 'continuable', isDisposed: () => disposed })
+  const observed = original.then(() => { originalSettled = true }, error => { originalSettled = true; assert.equal(error.verificationCode, 'unsettled-tree') })
+  try {
+    // Restore the trusted Session prototype before lifetime checks; the waiter
+    // above has already consumed the exact two controlled native promises.
+    delete f.main.session.snapshotEvents; delete child.session.snapshotEvents
+    f.dispose(child)
+    assert.equal((await settlementDeadline(stage.failure)).verificationCode, 'unsettled-tree')
+    assert.equal(originalSettled, false)
+  } finally {
+    disposed = true; rootGate.resolve(); originalGate.resolve(); await observed; f.tracker.endStage(stage)
+  }
+})
+
+for (const boundary of ['missing-during-read', 'published-start-during-read', 'published-nonturn-during-read', 'gap-during-read', 'read-rejection', 'history-over-bound', 'creation-over-bound']) {
+  test(`unstarted lifecycle: bounded asynchronous certification (${boundary})`, async () => {
+    const entered = deferred(), release = deferred()
+    let reads = 0, result
+    const f = await unstartedFixture({ async readCreation(session) {
+      reads++
+      const proof = { source: 'live', header: session.header, inheritedEventCount: session.inheritedEventCount,
+        cursor: session.seq - 1, events: session.snapshotEvents() }
+      entered.resolve(); await release.promise
+      if (boundary === 'read-rejection') throw new Error('reader failed')
+      return proof
+    } })
+    const stage = f.tracker.beginStage(); stage.failure.then(error => { result = error })
+    let child
+    if (boundary === 'history-over-bound') {
+      child = await f.create('child', { firstLive: 4097, prefix: Array.from({ length: 4097 }, (_, seq) => ({ seq, type: 'agent-preset/selected' })) })
+      assert.equal(reads, 0)
+    } else if (boundary === 'creation-over-bound') {
+      release.resolve()
+      for (let index = 0; index < 257; index++) child = await f.create(`child-${index}`)
+      assert.equal(reads, 256)
+    } else {
+      const creation = f.create()
+      await entered.promise; child = f.agents.get('child')
+      if (boundary === 'missing-during-read') f.sessions.delete('child')
+      if (boundary === 'published-start-during-read') f.publish(child, 'turn/start')
+      if (boundary === 'published-nonturn-during-read') f.publish(child)
+      if (boundary === 'gap-during-read') child.session.history.push({ seq: 0, type: 'turn/start' })
+      release.resolve(); await creation
+    }
+    f.dispose(child)
+    await new Promise(resolve => setImmediate(resolve))
+    assert.equal(result?.verificationCode ?? null, boundary === 'published-nonturn-during-read' ? 'unsettled-tree' : null)
+    f.tracker.endStage(stage)
+  })
+}
+
+for (const fault of ['none', 'read', 'prepared', 'header', 'cursor', 'events-getter', 'release', 'shadow-reader']) {
+  test(`unstarted lifecycle: public live observation owns and releases its lease (${fault})`, async () => {
+    const { nativeCreationReader } = await api(), f = await unstartedFixture()
+    const child = await f.create(), session = child.session
+    let released = 0, eventReads = 0, shadowReads = 0, methodReads = 0
+    const lease = { source: fault === 'prepared' ? 'prepared' : 'live', header: fault === 'header' ? { ...session.header } : session.header,
+      inheritedEventCount: 0, cursor: fault === 'cursor' ? 2 : -1,
+      get events() { eventReads++; if (fault === 'events-getter') throw new Error('native read failed'); return [] },
+      [Symbol.dispose]() { released++; if (fault === 'release') throw new Error('native release failed') },
+    }
+    class Query {
+      observeSession(id, options) {
+        assert.equal(id, 'child'); assert.deepEqual(options, { projectionMode: 'none' })
+        if (fault === 'read') return Promise.reject(new Error('native observation failed'))
+        if (fault === 'shadow-reader') session.snapshotEvents = () => { shadowReads++; return [] }
+        return Promise.resolve(lease)
+      }
+    }
+    const service = Object.defineProperty({}, 'observeSession', { get() { methodReads++; throw new Error('foreign method getter') } })
+    const reader = nativeCreationReader({ Session: f.Session, SessionQueryEngine: Query,
+      host: { get: () => service }, sessions: { get: id => f.sessions.get(id) } })
+    const expected = { seq: 0, header: session.header, cut: 0 }
+    let value, error
+    try { value = await reader(session, expected) } catch (caught) { error = caught }
+    assert.equal(released, fault === 'read' ? 0 : 1)
+    assert.equal(eventReads, ['none', 'events-getter', 'release'].includes(fault) ? 1 : 0)
+    assert.equal(shadowReads, 0); assert.equal(methodReads, 0)
+    if (fault === 'none') { assert.equal(error, undefined); assert.equal(value.source, 'live') }
+    else assert.ok(error || value === null)
+  })
+}
+
+for (const fault of ['identity-proxy', 'values-proxy', 'snapshot-proxy', 'identity-accessor', 'values-accessor']) {
+  test(`unstarted lifecycle: live mode proof refuses ${fault} without reflection side effects`, async () => {
+    const { nativeSubagentMode } = await api()
+    let reads = 0
+    const trap = { get(target, key) { reads++; return Reflect.get(target, key) },
+      getOwnPropertyDescriptor(target, key) { reads++; return Reflect.getOwnPropertyDescriptor(target, key) } }
+    let identity = { mode: 'continuable', seq: 0 }
+    if (fault === 'identity-proxy') identity = new Proxy(identity, trap)
+    let values = { subagent: identity }
+    if (fault === 'values-proxy') values = new Proxy(values, trap)
+    if (fault === 'identity-accessor') Object.defineProperty(values, 'subagent', { get() { reads++; return identity } })
+    let snapshot = { values }
+    if (fault === 'snapshot-proxy') snapshot = new Proxy(snapshot, trap)
+    if (fault === 'values-accessor') Object.defineProperty(snapshot, 'values', { get() { reads++; return values } })
+    const mode = nativeSubagentMode({ sessionProjections: { snapshot: () => snapshot } }, { session: { isOwnSeq: () => true } })
+    assert.equal(mode, 'unknown'); assert.equal(reads, 0)
+  })
+}

@@ -252,3 +252,18 @@ fresh SPEC report `7b1ceb268610873b18dd5115c67b616b51e9f1a6f9853220968ac12eee1ea
 正式采用 [Task19 output-fidelity规范](../specs/2026-10-11-sqlite-output-fidelity-design.md)、[75字段cohort](../specs/2026-10-11-sqlite-output-fidelity-cohort.tsv) 与 [计划](../plans/2026-10-11-sqlite-output-fidelity.md)，绑定完整接受16/17及actual helper接口。actual7e静态准备323输出/191输入已root全文/rehash，单E1七字段、15star机制仍UNEXECUTED。独立静态机制审查正在检查中断后无界wait及保留证据路径；修订通过与完整采用源码重新绑定前无mechanismGO，完整15x6/legalMAX PASS root复核前无CODEGO。全部12失去canonical路径仍缺失、Task16archives仅历史；未来public seeds新建/关闭/封存，不能恢复或借用旧receipt路径。
 
 Task20设计与有限CPU收集器仅静态准备；fresh formal review发现中断/尝试登记/完整post-child环境绑定缺口，未执行benchmark、未主张性能收益。最终Node22补充收集器V2两个原阻断已静态解决，P3初始inventory诊断恢复丢失正在最小V3修正；三原commands/四Node24 prerequisite/60s child门槛不变。Task18三旧stress FAIL与8237 paid FAILED均保留。PR69仍草稿、尚未合并；整候选/原模型60检查/whole/实际PR六CI/额外fresh合并前审核/match-head merge/actualmain六CI仍须完成。
+
+
+### 20:07 UTC：Task19 完整接受，Task20 正式采用
+
+Task19 最终 `7930c35165f874337766e98588a2d5478f0e5b79` / tree `e52cbc49fde710ca4f5b7127f1ece0541319503f`、213 tracked，111产品 fingerprint `b854b1dd75a9d9d3bf62069d579ae49e491853a36ca14eda8b99321cff1adc3c`。五产品读取模块与八既有测试文件，25记录/75字段/24 adapted reads，helper与写入、DDL、输入政策、分页快照及所有原预算保持。a866最初缺少实际star计数、G/Q/R真实generated-row故障/rollback、E1 full-NUL-run即时/reopen闭环；7930仅追加20测试，三证据缺口由新实测和独立审核关闭，不改写最初评估。
+
+最终两准确pin各580/580目标、214/214保护测试PASS，0 skip/cancel/todo；Node24原offline2127total/2107PASS/20existing host SKIP/0FAIL，六scripts+node:test七阶段，host仍UNVERIFIED。实际15star每pin65诊断/82 exact original/generated pairs；real G3/Q2 postinsert与Q1 bind/markUnknown故障后无partial result，lossless all-table/sequence oracle证明rollback。E1 pending-only完整run/owner/actor/command/七坐标同创建handle与reopen保真，不执行命令、不伪造completion。六新public closed seeds最终24串行copy/consume、56/56各pin两轮，112actual equality/160 storage cells，canonical67与source213均未变。
+
+泛用V4机制六pin/encoding组合PASS、27138events/808artifacts/15120groups/25272oracles/756SQL，运行在旧1f且helper不变；不冒充最终整产品实测。V3 optional named-bag夹具FAIL、初始baseline six unarmed E1与Node22 genuine63语义失配、旧readers/collector准备错误均保留；最终证据追加不覆盖旧失败。SDK完整60771条目/53987正规文件/6762目录/22links、937989197filebytes一直一致，adapter CLOSED；此不证明全局进程静止或实际原生/模型验收。
+
+fresh SPEC `f69a96efbe45d3209b261a3ba2c8c733f0b12beb12c33d9eba9ba13ea99014ad` 保存STOP后root全文/22审核制品/1909输入/213source复核，再明确新QUALITY GO。fresh QUALITY `67129c26dd8e91e1e15f29510fcb7deca37e7fbe6045e38159d3be8ada955aaf` 保存STOP，root全文与所有封存bindings再次复核后接受，receipt `39e27d1b2b7290f802dd5e00e02f3f4f1c489835390613a6064f4472167a6bc1`。任务接受不表示整版、native或paid PASS，也不解释历史生产停止。
+
+正式采用 [Task20设计](../specs/2026-10-11-repeated-frozen-event-cursor-design.md) / [计划](../plans/2026-10-11-repeated-frozen-event-cursor.md)。全部13 touched/relevant源码、native tests与cost docs对frozen706字节相同，accepted16/17/19接口重新绑定；独立设计、保留测试草稿和cursor draft静态审核通过。root追加一条严格event-reference身份断言，两variant使用相同15新实例，先两pin baseline PASS再唯一模块优化。CPU preparation V2和final Node22 supplement V3独立静态审核/root read完成，但actual20代码、preservation、有限12-child CPU和全部final gates仍待执行。
+
+所有原cap/pins/CLI/default concurrency/reporters/graders/gates不变；paid8237 FAILED不可重解释或同candidate重试，历史生产停止仍未归因。PR69仍draft/unmerged、remote da50；整候选原四Node24/三Node22全量source/npm/native、ONEpurposeful新paid、whole SPEC→root→QUALITY、实际PR六CI、额外fresh合并前审核、match-head merge和actualmain parents/tree/fingerprint/version/六CI仍须全部完成。

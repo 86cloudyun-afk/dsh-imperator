@@ -4,7 +4,14 @@ import { STORE_CODES, PENDING_STATUSES } from '../../lib/store/index.js'
 import { tempStore } from './helpers.mjs'
 
 const run = 'run-a'
+const worker = { sessionId: 'evidence-worker', isRoot: false }
+const lead = { sessionId: run, isRoot: true }
 function open(store, title = '核对') { return store.openTask({ title }, run).task_id }
+function owned(store) {
+  const id = open(store)
+  store.claimTask({ task_id: id, child_id: '证据执行者' }, run, worker, worker.sessionId)
+  return id
+}
 function fact(store, id, kind, confidence = 'PLAUSIBLE', extra = {}) {
   return store.recordFact({ task_id: id, kind, confidence, statement: `${kind} ${confidence}`, ...extra }, run).fact_id
 }
@@ -13,6 +20,67 @@ function rawResolution(store, id, blocker, kind, confidence, resolutionRun = run
   store.handle.prepare('INSERT INTO fact (task_id, kind, statement, confidence, run_id, resolves_fact_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(id, kind, 'legacy invalid resolution', confidence, resolutionRun, blocker, '2026-01-01T00:00:00.000Z')
 }
+
+for (const kind of ['fact', 'artifact']) test(`accepted legacy ${kind} without a pointer gives future-task advice while evidence stays frozen`, t => {
+  const store = tempStore(t), id = owned(store)
+  const recorded = store.recordFact({ task_id: id, kind, confidence: 'PLAUSIBLE', statement: '已完成现场核对' }, run, worker)
+  assert.equal(store.submitTask({ task_id: id }, run, worker).status, 'submitted')
+  const accepted = store.acceptTask({ task_id: id }, run, lead)
+  assert.equal(accepted.status, 'accepted')
+  assert.equal(accepted.waiver, null)
+  assert.equal(accepted.fact_count, 1)
+  assert.equal(accepted.resolved_blockers, 0)
+  assert.deepEqual(accepted.evidence_basis, { count: 1, fact_ids: [recorded.fact_id], with_pointer: 0, unattributed: 0 })
+
+  const snapshot = () => ({
+    task: store.handle.prepare('SELECT * FROM task WHERE id = ?').get(id),
+    facts: store.handle.prepare('SELECT * FROM fact WHERE task_id = ? ORDER BY id').all(id),
+  })
+  const before = snapshot()
+  assert.equal(before.task.status, 'accepted')
+  assert.equal(before.task.evidence_policy, 'legacy')
+  assert.equal(before.task.owner_session, worker.sessionId)
+  assert.equal(before.task.evidence_generation, 0)
+  for (const lateKind of ['fact', 'artifact']) {
+    assert.throws(() => store.recordFact({ task_id: id, kind: lateKind, confidence: 'PLAUSIBLE',
+      statement: '尝试事后补充产物指针', evidence_path: 'verification.log', evidence_line: 12 }, run, worker),
+    { code: STORE_CODES.terminal })
+    assert.deepEqual(snapshot(), before, 'terminal refusal must preserve the task, generation and all fact rows')
+  }
+
+  assert.equal(accepted.warnings.length, 1)
+  const warning = accepted.warnings[0]
+  assert.match(warning, /本次验收已完成/)
+  assert.match(warning, /可核查性弱/)
+  assert.match(warning, /后续任务.*提交.*验收前.*evidence_path.*可用.*行号/)
+  assert.doesNotMatch(warning, /建议补|当前任务.*(?:补|追加)|task_(?:fact|reject)|轮询|重新(?:打开|开启|认领|复核)|自动重开|waiver_reason|豁免/)
+})
+
+test('legacy evidence recorded with a pointer before submission accepts without weak-traceability advice', t => {
+  const store = tempStore(t), id = owned(store)
+  const recorded = store.recordFact({ task_id: id, kind: 'artifact', confidence: 'PLAUSIBLE',
+    statement: '核对结果', evidence_path: 'verification.log', evidence_line: 12 }, run, worker)
+  store.submitTask({ task_id: id }, run, worker)
+  const accepted = store.acceptTask({ task_id: id }, run, lead)
+  assert.equal(accepted.status, 'accepted')
+  assert.equal(accepted.waiver, null)
+  assert.deepEqual(accepted.evidence_basis, { count: 1, fact_ids: [recorded.fact_id], with_pointer: 1, unattributed: 0 })
+  assert.deepEqual(accepted.warnings, [])
+})
+
+test('explicit legacy waiver retains waiver advice instead of future-task pointer advice', t => {
+  const store = tempStore(t), id = owned(store)
+  const recorded = store.recordFact({ task_id: id, kind: 'fact', confidence: 'PLAUSIBLE', statement: '人工核对记录' }, run, worker)
+  store.submitTask({ task_id: id }, run, worker)
+  const accepted = store.acceptTask({ task_id: id, waiver_reason: '人工审阅原始材料' }, run, lead)
+  assert.equal(accepted.status, 'accepted')
+  assert.equal(accepted.waiver.reason, '人工审阅原始材料')
+  assert.deepEqual(accepted.evidence_basis, { count: 1, fact_ids: [recorded.fact_id], with_pointer: 0, unattributed: 0 })
+  assert.equal(accepted.warnings.length, 1)
+  assert.match(accepted.warnings[0], /人工豁免.*人工审阅原始材料/)
+  assert.match(accepted.warnings[0], /不构成"已验证事实"/)
+  assert.doesNotMatch(accepted.warnings[0], /可核查性弱|后续任务/)
+})
 
 test('REFUTED-only evidence cannot pass acceptance, but a confirmed counterfinding can', (t) => {
   const store = tempStore(t)

@@ -107,3 +107,13 @@ fixture 最终串行记录绑定 `8e1f8e7…` / tree `f97d2fdf4ce902a307a4362ebe
 重新专项审查用户此前提及的 mutable pagination 漏读及事实计数口径：历史修复 `82e3f9ad07706f9812e926f4f8cb5b9b5889d59a`（PR54）已是原 main 的祖先。固定2d8 source的相关store/paging/count代码与main完全相同，未确认新的同类缺陷；本轮task11之后整份store仅上述字符串不同。NULL域、成员变动、晚到/高 resolver、软字节裁剪及分母语义均核对，不把已合入的修复再次计作本轮新修复。独立复查报告摘要 `4bc13f9d4c659e65de0f4439abd4d2d5cac6dd6ff19c582d0d9c7a17abf3e7d4`。
 
 当前十一项任务通过；原main cap80及首个0.4.2包repair timeout仍FAILED，warning触发与timeout因果未知。新不可变包、source/oneCPU/两pins native、一次有诊断目的的固定额度模型样本、全轮SPEC→QUALITY、实际PR六项CI、额外fresh合并前复审、expected-head merge及actual-main读回仍待controller实际完成并记录。
+
+## 第二冻结包结果与派发契约遗漏
+
+候选 `2c7593197467bba611044dbfc7f368e04529f375` / tree `d6df5a9a08412d15596a525af71e06541cd28d74`，source198/npm190，包852229 bytes，SHA256 `2830771837f54ebf40a6c27b54204bb748bb886eab5f3014c4cad019b7f08bec`，产品 fingerprint 仍 `266c26208f972b296db1e921d8cb15cb1ce42836a8b4031727ea65b934456553`。实际 source1699/1679pass/20skip/0fail、17.590s；单 CPU 同计数、wall37.095s/child36.432116s；rc.2/alpha.2 同一解包 fullchain62.238/62.241s，packed offline1699/1673/26/0，实际 native101/101/0skip、HOST17/ISOLATION13。每个 child 保持60000ms上限；总 fullchain 不能等同单 child。全量文件/字节、原日志及包元数据已独立核验；0 MaxListeners，各一条已知 stripTypeScriptTypes ExperimentalWarning。190文件 post-native 未改变；SDK空 spill/loader/compile cache保留，taskforce临时home/workspace移除。
+
+该包唯一实际模型样本仍 **FAILED**：CLI exit1、wall185.743581s/report185695ms，29请求；readonly2/4151ms通过，repair27/180011ms timeout，任务accepted/owner匹配/evidence2/no-waiver/closure.ok但checks0，后两阶段未执行。usage input37844/output14580/cacheRead489856/cacheWrite0；记录的runtime/usage/route错误均0。report SHA256 `fd80fabf549e8df656f1f7fff60045880b75bea683785d39ea60bf5480d5acb2`，原命令、日志、退出码、checker实际FAIL1均保留，cap80/8192/stage180000ms未改。
+
+新不可变 timeoutProgress 为 waiting-notices、tracked2/idle2/running0/unknown0/pendingIdleWaits0、required1/delivered0/missing1，最近获准请求在本阶段83472ms；这只确定取消前等待条件。两份独立源码审查确认此前覆盖遗漏：rc.2 mounted subagent/subagent_fork 允许显式 run_in_background:false，真实 one-shot 完成 result/dispose 后返回前台结果，根本不产生 continuable settlement notice；验证器却对所有 child activation 要求该通知。alpha.2 mounted schema 没有该参数，始终 parent-delivery continuable，不能泛化前台分支。实际付费报告没有模式/工具参数，不能将该源码 bug 直接归为此次或历史生产停止根因。
+
+另一个任务契约遗漏：repair 未预告下一阶段必须复用同一 childId，合法 one-shot 已无法 cold resume，后续却不允许换执行者。新增 [派发结算设计](../specs/2026-10-11-delegation-settlement-contract-design.md) / [计划](../plans/2026-10-11-delegation-settlement-contract.md)：先真实原生 RED，再按公开 current-cut own-session mode 区分通知义务，unknown fail closed，保留全树 idle/dispose/稳定检查；repair 首次披露 continuable 与后两阶段同人要求，参数指导只在工具实际提供时使用。此为新 prompt/product 样本，原 grader、金额要求、后两阶段、安全/额度不变，不称原受控性能比较。截至08:20尚待设计审核、实现、fresh任务SPEC→QUALITY及新完整验收，PR69仍草稿未合并。

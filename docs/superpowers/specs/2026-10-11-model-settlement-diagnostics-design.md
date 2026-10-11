@@ -1,4 +1,4 @@
-# 有界模型验收的结算进度诊断设计（草案）
+# 有界模型验收的结算进度诊断设计
 
 用户已授权继续研究、修复遗漏、升级并在全部实际验收与独立审核后合并。当前唯一真实候选 d389984 的实际80请求/8192输出容量/180000ms每阶段样本 FAILED：readonly3请求5246ms；repair21请求180010ms timeout，虽有1accepted任务和4依据，runStage未完成，independentChecks=0。所有已知runtime计数为零仅表示未观察到已记录错误，不能区分仍running、whenIdle pending、缺结算notice或稳定性窗口变动。本轮不保存原始对话，SDK spill为空，故缺少必要定位证据；没有已证明的确定性生产hang。
 

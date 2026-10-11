@@ -2,7 +2,7 @@
 
 ## 交付目标
 
-本版修复终态任务被迟到工作流操作推进、已提交控制回执被无用查询阻塞、fork 继承事件误计本会话活动，以及 H01 / 每步工作上下文的真实委派身份遗漏。新增显式计划与审核意见读取、可信宿主撤回未准入队列意图和本次原生执行 promotion 的短期 job 定位。隔离验证器仅清理自己的 SDK 启动回调，并保留实际清理未结算及多重错误的失败状态；不修改生产 SDK。
+本版修复终态任务被迟到工作流操作推进、已提交控制回执被无用查询阻塞、fork 继承事件误计本会话活动，以及 H01 / 每步工作上下文的真实委派身份遗漏。新增显式计划与审核意见读取、可信宿主撤回未准入队列意图和本次原生执行 promotion 的短期 job 定位。已验收的 legacy 任务提示明确本次验收已完成，把补齐证据指针的建议放到后续任务提交前。隔离验证器仅清理自己的 SDK 启动回调，并保留实际清理未结算及多重错误的失败状态；模型报告增加取消前的有界结算观察。生产 SDK 保持原样。
 
 包版本为 0.4.2，固定包名、preset、显示名和数据库位置不变。本轮没有新增运行时依赖或 DDL，原生全树 adapter 仍关闭；队列撤回要求同库调度写入者协调升级到同一版本。Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2 / 0.2.1-alpha.2（预发布版），版本范围不代表所有未来版本均已测试。逐项 RED/GREEN、审核和精确最终验收状态见 [本轮记录](superpowers/research/2026-10-11-imperator-iteration-ledger.md)。
 
@@ -80,6 +80,8 @@ node tools/verify-model.mjs --model-calls \
 ```
 
 可选 `--package-sha256 <64位小写SHA256>` 绑定实际交付 tarball 的摘要；调用者应先独立计算该摘要。报告 `report.json` 绑定包版本、完整 git commit（源码树可取时）、产品源码 SHA256、可选包摘要、宿主/Node 版本与 provider/model。每阶段给出请求、输入/输出/缓存 tokens、时长、新建/复用/返工、事实和验收数量、固定独立断言数量；失败阶段仍保留已知计数。只有四阶段独立判据、真实任务闭环、完整 usage 与清理全部通过，`ok` 才为 true，CLI 才退出 0。
+
+每阶段 `progress` 给出最近一次获准请求的阶段内时间 `lastRequestElapsedMs`（无请求时为 null），以及 `settlement`：固定阶段位置和八项计数，无法读取时为 null。计数来自实际 tracked Agents 的状态、原始 `whenIdle` 等待和本阶段各父子对的结算通知；单独的 idle 或 accepted 不表示运行树已结束。阶段达到限时才记录独立的 `timeoutProgress`，在取消前复制；后续取消、清理和普通 progress 更新不改写它。仅保存固定枚举和数字，不保存会话身份或原始内容，原等待条件、两次稳定性检查、独立 grader 与有限额度保持。
 
 原生验证器固定每个获准请求输出容量为8192 tokens，同时配置 provider 默认值与 root agent；官方子会话继承此配置，不降低 reasoning effort。在全局公开 `llm/stream` waterfall 消费边界，以 SDK `isAgentLoopRequest` 的精确对象标记、真实 agent/request 的 agent/turn/step/signal 和受控 root 子树核对归属，只对匹配的一次实际流消费计请求。SDK prepared call 已解析的 provider/model/maxTokens 必须匹配固定路由与8192，错误路由或65536等容量在派发前拒绝。报告 `outputCapacity.source=native-stream-boundary`；自定义离线 harness 为 `custom-harness-unverified`。报告 `auxiliaryPolicy=reject-before-dispatch`：本固定回归不支持辅助 LLM 调用，包括自动 compaction；尝试即拒绝并锁存失败，不能捕获异常后继续获准。生产 preset compaction 保持 auto=true 及其原配置，未被禁用或更改。历史 `native-configuration` 仅证明普通 agent 配置，不能证明辅助请求容量；8192与历史4096不能作同额度性能比较。
 

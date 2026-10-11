@@ -15,6 +15,8 @@
 | 原生执行诊断 | foreground 请求也可能 timeout promotion；严格回执正确拒绝，但丢失本次 job 定位 | 本次结果返回白名单诊断，原调用者权限不随任务重分配转移 |
 | 每步上下文身份 | 原有解析器遗漏 runtime-only 当前/祖先委派，且拒绝非空 padded ID，隐藏正确 run 的任务/事实 | 追加轻量 resolver 修复，保留身份未知不读 legacy 与现有观察边界 |
 | 原生验证资源 | SDK profile shutdown 保留四类进程监听器，native-only 与加载本插件结果相同 | 隔离验证器清理其确切启动回调；不改 SDK、不关闭警告 |
+| 结算可观测性 | 旧超时先取消后观察，无法区分 pending idle、通知缺失与稳定性等待 | 增加固定 phase/计数和取消前独立快照，保留原结算条件 |
+| 验收成功指引 | legacy 无 pointer 已 accepted，提示却建议当前任务继续补证，而终态拒绝新 fact/artifact | 明确本次验收已完成，建议后续任务在提交/验收前记录指针 |
 | store / governor | 定向事务、读写及故障对照未确认其他新缺陷 | 保留正反控制，不宣称全面无缺陷 |
 
 fork 的复现使用真实固定 SDK Session、纯 fork 历史准备、实际插件 hook 和 SQLite，加显式 preset scope fixture，没有运行完整 agent loop。错误 ECHO 是指导消息，不能解释为已复现实际中止；旧错误归属 audit 行保留，不猜测迁移。native-only 四组监听器对照各 12 次启动、共 192 个注册堆栈均来自 SDK；Session/Agent/插件构造未增加其他监听器。这也不证明历史长任务停止的原因。
@@ -40,6 +42,8 @@ Node 24.19.0，四 CPU 配额。离线 `npm test`：1326 项，1315 pass、11 sk
 | context identity | `2a2800c3233822829fbe7a36178bfa48a30fbeaf` | unit 69、每 pin native 8（七子例及父项） | unit 135、每 pin native 27；full 1608/1597/11/0，22.394s | spec PASS、quality PASS；全部来源与七个原始日志独立核验 |
 | promotion | `78e1581fdf5a7528378ec34331c09c53a9d85f71` | unit 38、每 pin native 1；保留早期 harness 修正样本 | unit 92、每 pin native 6；full 1656/1645/11/0，17.445s | spec PASS、quality PASS；193 个源码文件及日志独立核验 |
 | fixture cleanup | `8e1f8e7…` + `1ba2ebb6d2dd597812fc58eb762d20f1227df374` | 两 pins 各 12 次真实启动回调残留；失败启动、竞争、强制退出、close/错误保留及 boot continuation 均复现；追加三类 scheduler setup RED | 每 pin runtime 15、boundaries 45、scheduler 31、HOST 17、ISOLATION 13；followup full 1670/1650 pass/20 skip/0 fail，17.741s | 原 quality FAIL 保留；修正提交 fresh spec PASS、quality PASS |
+| settlement diagnostics | `8cebb8ef72a8609053229dcaf6cd5be1fbf32178` | 原 waiter/report 的 20 个行为失败；补充 inherited thenable/async observer 两个失败 | model 126/126、每 pin boundaries 47/47；full 1695/1675 pass/20 skip/0 fail | fresh spec PASS 07:39:04、quality PASS 07:41:15；全部 198 文件与 21 制品独立核验 |
+| acceptance advice | `247a4514509d271082992a9066c2f0f1d526f38b` | real SQLite 17/15 pass/2 旧文字失败，终态拒绝及完整行快照先通过 | focused 109/109；full 1699/1679 pass/20 skip/0 fail；仅一个生产字符串改变 | fresh spec PASS 07:51:54、quality PASS 07:53:55；全部 198 文件与 20 制品独立核验 |
 
 控制回执独立审核另以真实 SQL commit 后立即同步 abort 的六个场景核对 accepted 结果、原键重放和 effects=1；没有把已提交测试的迟到取消等同于暂停修复后的同步 handler。fork native GREEN 保留真实 child seq `[3,4]`、cut 2、restore firstLiveSeq 5，40,000 个继承槽未被扫描为活动；scope/ACK/unknown/reset/可变历史和完整可见状态均有对照。
 
@@ -87,4 +91,19 @@ fixture 最终串行记录绑定 `8e1f8e7…` / tree `f97d2fdf4ce902a307a4362ebe
 
 整轮 source 审查另确认原main已存在成功回包误导：legacy依据无pointer可合法accepted，warning却建议继续补证，而普通fact/artifact将被终态闸拒绝E_TERMINAL。追加 [验收指引设计](../specs/2026-10-11-acceptance-advice-design.md) / [计划](../plans/2026-10-11-acceptance-advice.md)：仅将建议指向后续任务在提交/验收前补齐指针，保留原policy和terminalguard。实际paid报告未保存warning/with_pointer，不能证明这分支触发或导致timeout。
 
-两项追加任务尚待实现与 fresh SPEC→QUALITY 审核。产品工具/库字节改变后，首次冻结包验收仅属旧候选；最终新包必须重新完成 source、oneCPU、两pins native及有明确诊断目的的真实模型样本，再整轮审核、实际最终PR CI和额外复审。PR69仍草稿、未合并。
+两项追加任务已实现并分别通过 fresh SPEC→QUALITY 审核，详见下段。产品工具/库字节已改变，首次冻结包验收仅属旧候选；新包必须重新完成 source、oneCPU、两pins native及有明确诊断目的的真实模型样本，再整轮审核、实际最终PR CI和额外复审。以下状态截至 2026-10-11 07:54 UTC，PR69仍草稿、未合并。
+
+
+## 两项追加实现与新候选冻结准备
+
+结算诊断提交 `8cebb8ef72a8609053229dcaf6cd5be1fbf32178` / tree `3a534dc666e8102b94b928af665b8ce5d1c283d6`，仅 verifier 与两项已有测试文件。每阶段 `progress` 保留最近获准请求的阶段内毫秒数、固定 phase 和八项计数（不可用为 null）；`timeoutProgress` 在取消前复制，不被随后清理与最终用量重写。SDK status=idle 与 pending whenIdle 分开观察，通知按父子对限制再汇总，cold activation 使用真实阶段基线。原 whenIdle Promise、Promise.all、通知要求、两次稳定性检查、grader 和有限额度未改。
+
+真实两 pins 追加路径均由阶段基线之后的原生 root loop 调 mounted subagent / live continuation / cold continuation；每阶段 required=1 的实际 child flush 被持有至 release，真实 parent notice +1 后再持有父流，不能用 notice 或 accepted 提前完成。正常 fixture 每 pin 10 个本地流、0 paid；另一个真实 AbortSignal 流在取消前观察 waiting-idle/running1/pending1，实际 abort/drain 和 Agent/home 清理均检查。中间原生 fixture timeout、卸载后 ctx service 断言失败保留，不能归为生产挂死。最终 model126、每 pin boundaries47 与 full1695/1675/20/0 的实际字节一致。任务独立审核摘要 `eeefb934bf330a9a7102cda1857645e49fb295ceca4b234372a0de6dbbde6667`，SPEC 07:39:04 先于 QUALITY 07:41:15。
+
+验收指引提交 `247a4514509d271082992a9066c2f0f1d526f38b` / tree `387519cc84f8780b08157de1f1378b2d4a0fee50`，只改一个生产 warning 字符串并增加 real SQLite 68 行测试。真实绑定 owner 的 pathless PLAUSIBLE fact 与 artifact 均完成 submit/root accept，当前任务补写两种 evidence 仍 E_TERMINAL，完整 task/fact 行及 generation 不变；pointer、waiver 与既有 strict 控制保留。RED 17/15 pass/2 行为失败发生在生产修改前，GREEN109/109，唯一记录的 full1699/1679 pass/20 host skip/0 fail；六项 scripts382 assertions通过、1 native compiler skip，offline host仍 UNVERIFIED。独立审核摘要 `67903bad8689f5f697721e29c0fcb32224de4070f1889275005d276c56651bc4`，SPEC07:51:54先于QUALITY07:53:55。
+
+全部198 tracked源文件逐字节核对测试、提交与工作树。该提交的产品 fingerprint 为 `266c26208f972b296db1e921d8cb15cb1ce42836a8b4031727ea65b934456553`（111 runtime/verification paths）；`679bf624fec8c1e6fdfc7cfed91bca549c54e46c86a04a5eb0e5dd281f5e72d5` 是不同算法的198文件tested-tree摘要，不能混用。root随后仅更新文档，产品字节须保持同一指纹；最终包及所有后续实际验收另行绑定其完整提交/tree/archive，不以此处任务通过代替。
+
+重新专项审查用户此前提及的 mutable pagination 漏读及事实计数口径：历史修复 `82e3f9ad07706f9812e926f4f8cb5b9b5889d59a`（PR54）已是原 main 的祖先。固定2d8 source的相关store/paging/count代码与main完全相同，未确认新的同类缺陷；本轮task11之后整份store仅上述字符串不同。NULL域、成员变动、晚到/高 resolver、软字节裁剪及分母语义均核对，不把已合入的修复再次计作本轮新修复。独立复查报告摘要 `4bc13f9d4c659e65de0f4439abd4d2d5cac6dd6ff19c582d0d9c7a17abf3e7d4`。
+
+当前十一项任务通过；原main cap80及首个0.4.2包repair timeout仍FAILED，warning触发与timeout因果未知。新不可变包、source/oneCPU/两pins native、一次有诊断目的的固定额度模型样本、全轮SPEC→QUALITY、实际PR六项CI、额外fresh合并前复审、expected-head merge及actual-main读回仍待controller实际完成并记录。

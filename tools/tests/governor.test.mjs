@@ -35,6 +35,57 @@ function never(governor, reservation, run = 'run', authority = lead) {
 function ref(r, extra = {}) { return { reservation_id: r.reservation_id, generation: r.generation, ...extra } }
 const code = value => ({ code: value })
 
+for (const action of ['bind', 'settle']) test('Task16 governor ' + action + ' rejects a prefix without changing holds or audit', t => {
+  const { store, governor: g } = setup(t), full = 'worker\0suffix'
+  const id = task(store, 'run', full), args = input(id, 'operation\0suffix', { mode: 'write', resources: ['resource\0suffix'] })
+  const row = g.reserve(args, 'run', lead)
+  const snapshot = () => ({ rows: ['governor_reservation', 'governor_hold', 'governor_audit'].map(table =>
+    store.open().prepare('SELECT * FROM ' + table).all()), exact: store.open().prepare('SELECT json_quote(run_id) AS run, json_quote(owner_session) AS owner, json_quote(session_id) AS session FROM governor_reservation').all() })
+  const before = snapshot()
+  const invoke = sessionId => action === 'bind'
+    ? g.bind(ref(row, { session_id: sessionId }), 'run', { role: 'worker', sessionId })
+    : g.settle(ref(row, { proof: { kind: 'never_started' } }), 'run', { role: 'worker', sessionId })
+  assert.throws(() => invoke('worker'), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(snapshot(), before)
+  assert.equal(g.reserve(args, 'run', { role: 'worker', sessionId: full }).reservation_id, row.reservation_id)
+  assert.equal(invoke(full).state, action === 'bind' ? 'running' : 'settled')
+  if (action === 'bind') assert.equal(invoke(full).session_id, full)
+})
+
+test('Task16 leading NUL bound governor session is not an unbound reservation', t => {
+  const { store, governor: g } = setup(t), sessionId = '\0suffix'
+  const row = g.reserve(input(task(store, 'run', sessionId)), 'run', lead)
+  g.bind(ref(row, { session_id: sessionId }), 'run', { role: 'worker', sessionId })
+  const before = g.snapshot('run')
+  assert.throws(() => never(g, row), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(g.snapshot('run'), before)
+})
+
+for (const side of ['current', 'captured']) test('Task16 governor independently rejects different full ' + side + ' owner', t => {
+  const { store, governor: g } = setup(t), a = 'worker\0first', b = 'worker\0second'
+  const captured = side === 'current' ? b : a, current = side === 'current' ? a : b
+  const id = task(store, 'run', captured), args = input(id)
+  g.reserve(args, 'run', lead)
+  store.submitTask({ task_id: id }, 'run', { sessionId: captured, isRoot: false })
+  store.rejectTask({ task_id: id, reason: 'reassign' }, 'run', { sessionId: 'root', isRoot: true })
+  store.claimTask({ task_id: id, child_id: 'replacement' }, 'run', { sessionId: 'root', isRoot: true }, current)
+  const before = g.snapshot('run')
+  assert.throws(() => g.reserve(args, 'run', { role: 'worker', sessionId: b }), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(g.snapshot('run'), before)
+})
+
+test('Task16 governor SQL resource and operation selectors keep NUL keys distinct', t => {
+  const { store, governor: g } = setup(t), id = task(store)
+  const first = g.reserve(input(id, 'op\0suffix', { mode: 'write', resources: ['resource\0suffix'] }), 'run', lead)
+  const second = g.reserve(input(task(store), 'op', { resources: ['resource'] }), 'run', lead)
+  assert.notEqual(second.reservation_id, first.reservation_id)
+  const third = task(store), before = g.snapshot('run')
+  assert.throws(() => g.reserve(input(third, 'third', { resources: ['resource\0suffix'] }), 'run', lead), code('E_RESOURCE_BUSY'))
+  assert.deepEqual(g.snapshot('run'), before)
+  assert.throws(() => g.reserve(input(id, 'op\0suffix', { resources: ['resource\0suffix'] }), 'run', lead), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(g.snapshot('run'), before)
+})
+
 test('six active across nested callers and reuse does not debit new count', t => {
   const { store, governor: g } = setup(t)
   for (let i = 0; i < 6; i++) {
@@ -455,6 +506,67 @@ test('legacy reservations acquire additive retry accounting without erasing expl
   g2.extendBudget({ max_retries: 4, reason: 'reviewed conservative legacy overlap' }, 'run', lead)
   g2.reserve(input(id, 'after-migration', { generation: 3 }), 'run', worker)
   assert.equal(g2.snapshot('run').retries[id], 3)
+})
+
+for (const hidden of [null, 'task_run', 'evidence_generation']) test('Task16 legacy joined projection preserves legal width and hidden native conversion: ' + hidden, t => {
+  const store = tempStore(t), full = 'root\0suffix', id = store.openTask({ title: 'legacy width' }, full).task_id, db = store.open()
+  // Compatibility characterization: public task plus an old schema with extension columns.
+  // The two original joined columns consume the remaining SQLite result slots.
+  const extra = ['task_run', 'evidence_generation', '', '__proto__', '12', '2', 'odd"列', ...Array.from({ length: 1979 }, (_, i) => 'extra_' + i)]
+  const quote = name => '"' + name.replaceAll('"', '""') + '"'
+  db.exec(`CREATE TABLE governor_reservation (
+    reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id INTEGER NOT NULL,
+    operation_key TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL,
+    mode TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+    owner_session TEXT, session_id TEXT, settlement TEXT, ${extra.map(quote).join(',')},
+    UNIQUE(run_id, operation_key), UNIQUE(task_id, generation));
+    CREATE TABLE governor_retry_charge (reservation_id TEXT PRIMARY KEY, rework_generation INTEGER NOT NULL, retry_charge INTEGER NOT NULL, source TEXT NOT NULL)`)
+  db.prepare('INSERT INTO governor_reservation(reservation_id,run_id,task_id,operation_key,payload,generation,mode,kind,state,owner_session,task_run,evidence_generation,"","__proto__","12","2","odd""列") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('legacy', full, id, 'op', JSON.stringify({ resources: [] }), 1, 'read', 'retry', 'settled', 'safe',
+      hidden === 'task_run' ? 9007199254740993n : 'hidden\0old', hidden === 'evidence_generation' ? 9007199254740993n : 73,
+      'empty', 'prototype', 'twelve', 'two', 'quoted')
+  const sql = `SELECT r.*, t.evidence_generation, t.run_id AS task_run
+          FROM governor_reservation r LEFT JOIN task t ON t.id = r.task_id
+          LEFT JOIN governor_retry_charge c USING(reservation_id)
+          WHERE c.reservation_id IS NULL ORDER BY r.task_id, r.generation DESC`
+  const original = db.prepare(sql)
+  assert.equal(original.columns().length, 2000)
+  let native, nativeError
+  try { native = original.all()[0] } catch (error) { nativeError = error }
+  if (hidden) assert.equal(nativeError?.code, 'ERR_OUT_OF_RANGE')
+  else { assert.equal(nativeError, undefined); assert.equal(Object.keys(native).length, 1998) }
+  const prepare = db.prepare.bind(db), calls = { original: { get: 0, all: 0, iterate: 0, run: 0 }, generated: { get: 0, all: 0, iterate: 0, run: 0 } }
+  let returned
+  const preparations = { original: 0, generated: 0 }, names = original.columns().map(column => column.name)
+  db.prepare = query => {
+    const statement = prepare(query)
+    if (query.includes('WHERE c.reservation_id IS NULL ORDER BY r.task_id, r.generation DESC')) {
+      const kind = query.startsWith('SELECT r.*') ? 'original' : 'generated'
+      preparations[kind]++
+      assert.equal(statement.columns().length, 2000)
+      assert.deepEqual(statement.columns().map(column => column.name), names)
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const read = statement[method].bind(statement)
+        statement[method] = (...args) => { calls[kind][method]++; const result = read(...args); if (kind === 'generated' && method === 'all') returned = result[0]; return result }
+      }
+    }
+    return statement
+  }
+  const g = new TaskforceGovernor(store)
+  if (hidden) {
+    assert.throws(() => g.snapshot(full), error => error.code === nativeError.code && error.message === nativeError.message)
+    assert.equal(db.prepare('SELECT count(*) AS n FROM governor_retry_charge').get().n, 0)
+    assert.equal(db.isTransaction, false)
+  } else {
+    assert.equal(g.snapshot(full).retries[id], 1)
+    assert.equal(returned.run_id, full); assert.equal(returned.task_run, full); assert.equal(returned.evidence_generation, 0)
+    const descriptors = Object.getOwnPropertyDescriptors(native); descriptors.run_id.value = full; descriptors.task_run.value = full
+    assert.deepEqual(Object.getOwnPropertyDescriptors(returned), descriptors)
+    assert.deepEqual(Object.keys(returned), Object.keys(native)); assert.equal(Object.getPrototypeOf(returned), null)
+    assert.equal(db.prepare('SELECT retry_charge FROM governor_retry_charge').get().retry_charge, 1)
+  }
+  assert.deepEqual(calls, { original: { get: 0, all: 0, iterate: 0, run: 0 }, generated: { get: 0, all: 1, iterate: 0, run: 0 } })
+  assert.deepEqual(preparations, { original: 1, generated: 1 })
 })
 
 test('rejection after reservation fences bind until rework is admitted and charged', t => {

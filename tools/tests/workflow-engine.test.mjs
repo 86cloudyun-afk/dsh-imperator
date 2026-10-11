@@ -21,7 +21,8 @@ const module = await import('../../lib/workflow/index.js').catch(error => {
 const run = ' workflow-run ', lead = { sessionId: run, isRoot: true }
 const worker = { sessionId: ' worker ', isRoot: false }
 const reviewer = { sessionId: ' reviewer ', isRoot: false }
-function fixture(t, options = {}) {
+function fixture(t, options = {}, identities = { run, lead, worker, reviewer }) {
+  const { run, lead, worker, reviewer } = identities
   assert.equal(typeof module.TaskforceWorkflow, 'function', 'workflow core must be implemented')
   let store
   t.after(() => store?.close())
@@ -61,6 +62,21 @@ function fixture(t, options = {}) {
   }
   return { get store() { return store }, get flow() { return flow }, actor, create, change, claim, open, verify, artifact, review, accept, key, reopen, executions: () => executions }
 }
+
+test('Task16 workflow carries complete run, owner and independent reviewer through real evidence and replay', async t => {
+  const full = 'root\0suffix', owner = { sessionId: 'writer\0suffix', isRoot: false }
+  const f = fixture(t, {}, { run: full, lead: { sessionId: full, isRoot: true }, worker: owner,
+    reviewer: { sessionId: 'writer\0independent', isRoot: false } })
+  const id = f.open(); await f.artifact(id); f.review(id)
+  assert.equal(f.store.taskOf(id, full).task.owner_session, owner.sessionId)
+  assert.throws(() => f.flow.state({ task_id: id }, 'root'), { code: 'E_CROSS_RUN' })
+  f.store.submitTask({ task_id: id }, full, owner)
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, full).row_version, request_key: f.key() }
+  const accepted = f.store.acceptTask(args, full, { sessionId: full, isRoot: true })
+  assert.equal(accepted.status, 'accepted'); assert.equal(accepted.execution_verified, true)
+  assert.deepEqual(f.store.acceptTask(args, full, { sessionId: full, isRoot: true }), accepted)
+  assert.equal(f.executions(), 1)
+})
 
 for (const route of ['artifact metadata', 'review metadata', 'latest review']) {
   test(`SQLite TEXT workflow ${route} preserves complete persisted identities`, async t => {
@@ -1236,18 +1252,35 @@ for (const damage of ['source', 'log']) for (const budget of [0, 1]) {
     const f = fixture(t), id = f.open({ max_reworks: budget }); await f.artifact(id); f.review(id)
     f.store.submitTask({ task_id: id }, run, worker)
     const before = deliveryRows(f, id), call = workflowToolCaller(f), db = f.store.open(), prepare = db.prepare
-    let receiptReads = 0
+    let receiptReads = 0, originalExecutions = 0, injections = 0
+    const generatedCalls = { get: 0, all: 0, iterate: 0, run: 0 }
     // Inject an actual file mutation precisely between the two real strict reads;
     // every statement still executes on the real SQLite connection.
     db.prepare = function(sql) {
-      if (sql === 'SELECT * FROM execution_receipt WHERE task_id = ? AND run_id IS ? ORDER BY id DESC LIMIT 1' && ++receiptReads === 2) damageEvidence(f, id, damage)
-      return prepare.call(this, sql)
+      const statement = prepare.call(this, sql)
+      if (sql.endsWith(' FROM execution_receipt WHERE task_id = ? AND run_id IS ? ORDER BY id DESC LIMIT 1')) {
+        const original = sql.startsWith('SELECT *')
+        for (const method of ['get', 'all', 'iterate', 'run']) {
+          const read = statement[method].bind(statement)
+          statement[method] = (...args) => {
+            if (original) originalExecutions++
+            else {
+              generatedCalls[method]++
+              if (method === 'get' && ++receiptReads === 2) { damageEvidence(f, id, damage); injections++ }
+            }
+            return read(...args)
+          }
+        }
+      }
+      return statement
     }
     let response
     try {
       response = await call('task_accept', { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() })
     } finally { db.prepare = prepare }
     assert.equal(receiptReads, 2, 'retain both real strict evidence checks')
+    assert.equal(originalExecutions, 0); assert.equal(injections, 1)
+    assert.deepEqual(generatedCalls, { get: 2, all: 0, iterate: 0, run: 0 })
     assert.equal(response.ok, false); assertWorkflowRecovery(response, 'E_WORKFLOW_EVIDENCE', budget)
     assert.deepEqual(deliveryRows(f, id), before)
     assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
@@ -1406,7 +1439,7 @@ test('explicit workflow context keeps its authorization and payload in one SQLit
   let fired = false
   db.prepare = sql => {
     const statement = prepare(sql)
-    if (sql === 'SELECT * FROM workflow WHERE task_id=?') {
+    if (sql.endsWith(' FROM workflow WHERE task_id=?') && sql.includes("THEN 'J'||json_quote(")) {
       const get = statement.get.bind(statement)
       statement.get = (...args) => {
         const result = get(...args)

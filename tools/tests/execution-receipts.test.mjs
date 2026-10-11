@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { createHash } from 'node:crypto'
-import { cpSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { TaskforceStore } from '../../lib/store/index.js'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -8,6 +8,7 @@ import { test } from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import { apply as applyTools } from '../../lib/tools/index.js'
 import { tempStore } from './helpers.mjs'
+import { latestExecution } from '../../lib/store/execution.js'
 
 const run = 'receipt-run'
 const identity = { sessionId: 'worker', runId: run, isRoot: false }
@@ -25,6 +26,40 @@ function fixture(t) {
   const accept = (id, extra = {}) => store.acceptTask({ task_id: id, ...extra }, run, 'lead', run)
   return { cwd, store, context, input, open, claim, submit, accept }
 }
+
+test('Task16 verification target preserves complete owner and fixed command before pending receipt writes', t => {
+  const f = fixture(t), full = 'worker\0suffix', actor = { sessionId: full, isRoot: false }, fixed = 'echo ok\0suffix'
+  const id = f.store.openTask({ ...f.input, verification_command: fixed }, run, f.context).task_id
+  f.store.claimTask({ task_id: id, child_id: 'display' }, run, actor, full)
+  const db = f.store.open(), changes = db.prepare('SELECT total_changes() AS n').get().n
+  assert.throws(() => f.store.verificationTarget(id, run, { sessionId: 'worker', isRoot: false }), { code: 'E_TASK_CONFLICT' })
+  const target = f.store.verificationTarget(id, run, actor)
+  assert.equal(target.owner_session, full); assert.equal(target.verification_command, fixed)
+  assert.throws(() => f.store.recordExecution({ task_id: id, status: 'pending', command: 'echo ok',
+    timeout_ms: 60000, call_id: 'call', root_call_id: 'root' }, run, actor), { code: 'E_VERIFICATION_COMMAND' })
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  assert.equal(db.prepare('SELECT count(*) AS n FROM execution_receipt').get().n, 0)
+  assert.equal(existsSync(join(f.store.root, 'receipts')), false)
+})
+
+test('Task16 receipt completion independently checks complete actor and never promotes unknown evidence', t => {
+  const f = fixture(t), full = 'worker\0suffix', actor = { sessionId: full, isRoot: false }, fixed = 'echo ok\0suffix'
+  const id = f.store.openTask({ ...f.input, verification_command: fixed }, run, f.context).task_id
+  f.store.claimTask({ task_id: id, child_id: 'display' }, run, actor, full)
+  const pending = f.store.recordExecution({ task_id: id, status: 'pending', command: fixed,
+    timeout_ms: 60000, call_id: 'call', root_call_id: 'root' }, run, actor)
+  const db = f.store.open(), before = db.prepare('SELECT * FROM execution_receipt').all(), source = readFileSync(join(f.cwd, 'source.js'))
+  const completion = { task_id: id, receipt_id: pending.receipt_id,
+    native_result: { isError: true, error: { message: 'fixture observation', info: { code: 'E_TEST_OBSERVATION' } } } }
+  assert.throws(() => f.store.recordExecution(completion, run, { sessionId: 'worker', isRoot: false }), { code: 'E_VERIFICATION_RECEIPT' })
+  assert.deepEqual(db.prepare('SELECT * FROM execution_receipt').all(), before)
+  assert.equal(existsSync(join(f.store.root, 'receipts')), false)
+  assert.deepEqual(readFileSync(join(f.cwd, 'source.js')), source)
+  const latest = latestExecution(db, { id, run_id: run })
+  for (const [field, expected] of Object.entries({ run_id: run, owner_session: full, actor_session: full, command: fixed })) assert.equal(latest[field], expected)
+  const completed = f.store.recordExecution(completion, run, actor)
+  assert.equal(completed.status, 'unknown'); assert.equal(completed.verified, false)
+})
 
 // Losing strictPolicy validation or using fact basis for execution would make these fail.
 test('execution creation rejects missing manifest, trusted cwd, fixed command or root authority', t => {

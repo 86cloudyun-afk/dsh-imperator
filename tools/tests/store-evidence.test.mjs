@@ -6,6 +6,17 @@ import { tempStore } from './helpers.mjs'
 const run = 'run-a'
 const worker = { sessionId: 'evidence-worker', isRoot: false }
 const lead = { sessionId: run, isRoot: true }
+
+test('Task16 blocker resolution uses the complete fact run after task scope validation', t => {
+  const store = tempStore(t), full = 'root\0suffix'
+  const id = store.openTask({ title: 'exact resolution' }, full).task_id
+  const blocker = store.recordFact({ task_id: id, kind: 'blocker', statement: 'blocked', confidence: 'CONFIRMED' }, full).fact_id
+  const result = store.recordFact({ task_id: id, kind: 'decision', statement: 'resolved', confidence: 'CONFIRMED', resolves_fact_id: blocker }, full)
+  assert.equal(result.resolves_fact_id, blocker)
+  assert.equal(store.taskOf(id, full).blockers, 0)
+  const stored = store.open().prepare('SELECT json_quote(run_id) AS run FROM fact WHERE id=?').get(result.fact_id)
+  assert.equal(JSON.parse(stored.run), full)
+})
 function open(store, title = '核对') { return store.openTask({ title }, run).task_id }
 function owned(store) {
   const id = open(store)

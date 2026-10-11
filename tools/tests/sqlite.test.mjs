@@ -34,8 +34,10 @@ test('SQLite TEXT primitives preserve native values, row shape, and integer conv
     wildcard.setReadBigInts(true)
     assert.equal(restore(wildcard.get()).integer_value, 9007199254740993n)
     assert.equal(restore(wildcard.get()).constructor, 27n)
+    db.prepare('UPDATE text_read SET integer_value=?').run(42)
     db.prepare('UPDATE text_read SET value=?').run(9007199254740993n)
     const integers = prepareSqliteTextProjection(db, 'value', 'text_read', (projection = '*') => 'SELECT ' + projection + ' FROM text_read')
+    assert.throws(() => nativeStatement.get(), { code: 'ERR_OUT_OF_RANGE' })
     assert.throws(() => integers.statement.get(), { code: 'ERR_OUT_OF_RANGE' })
     integers.statement.setReadBigInts(true)
     assert.equal(integers.restore(integers.statement.get()).value, 9007199254740993n)
@@ -43,6 +45,97 @@ test('SQLite TEXT primitives preserve native values, row shape, and integer conv
     assert.equal(restore(wildcard.get()), undefined)
     assert.deepEqual(wildcard.all().map(restore), [])
     assert.equal(restoreSqliteText(projected.get(), 'value', '__text'), undefined)
+  }
+})
+
+test('Task16 target lists reject holes before factory or native calls and keep empty identifiers valid', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  db.exec('CREATE TABLE source(value, other, ""); INSERT INTO source VALUES(1,2,3)')
+  const inherited = new Array(1), proto = Object.create(Array.prototype)
+  proto[0] = 'value'; Object.setPrototypeOf(inherited, proto)
+  for (const fields of [new Array(1), ['value', ,], [, 'value'], inherited, ['value', undefined], [], ['value', 'value'], null, 1]) {
+    let factories = 0, prepares = 0, metadata = 0
+    const calls = { get: 0, all: 0, iterate: 0, run: 0 }
+    const tracked = { prepare(sql) {
+      prepares++; const statement = db.prepare(sql), columns = statement.columns.bind(statement)
+      statement.columns = () => { metadata++; return columns() }
+      for (const method of Object.keys(calls)) { const read = statement[method].bind(statement); statement[method] = (...args) => { calls[method]++; return read(...args) } }
+      return statement
+    } }
+    for (const suffix of ['', ' WHERE 0']) {
+      assert.throws(() => prepareSqliteTextProjection(tracked, fields, 'source', (projection = '*') => {
+        factories++; return 'SELECT ' + projection + ' FROM source' + suffix
+      }), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+      assert.equal(factories, 0); assert.equal(prepares, 0); assert.equal(metadata, 0)
+      assert.deepEqual(calls, { get: 0, all: 0, iterate: 0, run: 0 })
+    }
+  }
+  for (const fields of ['value', ['value'], ['value', 'other'], '', ['']]) {
+    const { statement, restore } = prepareSqliteTextProjection(db, fields, 'source', (projection = '*') => 'SELECT ' + projection + ' FROM source')
+    assert.deepEqual({ ...restore(statement.get()) }, { value: 1, other: 2, '': 3 })
+  }
+})
+
+test('Task16 multi-target projection keeps maximum native width and per-call empty result accounting', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  const names = ['value', 'other', '', '__proto__', '12', '2', 'odd"列', ...Array.from({ length: 1993 }, (_, i) => 'extra_' + i)]
+  const quote = name => '"' + name.replaceAll('"', '""') + '"'
+  db.exec('CREATE TABLE source(' + names.map(quote).join(',') + ')')
+  db.prepare('INSERT INTO source(value,other,"","__proto__","12","2","odd""列") VALUES(?,?,?,?,?,?,?)')
+    .run('left\0right', 'Jordinary', 'empty', 'prototype', 'twelve', 'two', 'quoted')
+  const original = db.prepare('SELECT * FROM source'), native = original.get()
+  assert.equal(original.columns().length, 2000); assert.equal(Object.keys(native).length, 2000)
+  for (const [method, suffix] of [['get', ''], ['all', ''], ['iterate', ''], ['get', ' WHERE 0'], ['all', ' WHERE 0']]) {
+    const observations = []
+    const tracked = { prepare(sql) {
+      const statement = db.prepare(sql), calls = { get: 0, all: 0, iterate: 0, run: 0 }; observations.push(calls)
+      for (const name of Object.keys(calls)) { const read = statement[name].bind(statement); statement[name] = (...args) => { calls[name]++; return read(...args) } }
+      return statement
+    } }
+    const { statement, restore } = prepareSqliteTextProjection(tracked, ['value', 'other'], 'source', (projection = '*') => 'SELECT ' + projection + ' FROM source' + suffix)
+    assert.equal(statement.columns().length, 2000)
+    const result = statement[method](), rows = method === 'get' ? [result] : [...result]
+    if (suffix) assert.deepEqual(rows.map(restore), method === 'get' ? [undefined] : [])
+    else for (const encoded of rows) {
+      assert.equal(restore(encoded), encoded); assert.equal(encoded.value, 'left\0right'); assert.equal(encoded.other, 'Jordinary')
+      const descriptors = Object.getOwnPropertyDescriptors(native); descriptors.value.value = 'left\0right'
+      assert.deepEqual(Object.getOwnPropertyDescriptors(encoded), descriptors)
+      assert.deepEqual(Object.keys(encoded), Object.keys(native)); assert.equal(Object.getPrototypeOf(encoded), null)
+    }
+    assert.deepEqual(observations, [{ get: 0, all: 0, iterate: 0, run: 0 }, { get: 0, all: 0, iterate: 0, run: 0, [method]: 1 }])
+  }
+})
+
+test('Task16 multi-target faults reject each transported field with exact native call and injection counts', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  db.exec('CREATE TABLE source(value, other); INSERT INTO source VALUES(1,2)')
+  for (const field of ['value', 'other']) for (const fault of ['metadata', 'missing', 'tag', 'descriptor']) {
+    const calls = [{ get: 0, all: 0, iterate: 0, run: 0 }, { get: 0, all: 0, iterate: 0, run: 0 }]
+    let prepares = 0, injections = 0
+    const tracked = { prepare(sql) {
+      const index = prepares++, statement = db.prepare(sql), columns = statement.columns.bind(statement)
+      statement.columns = () => { const result = columns(); if (index === 1 && fault === 'metadata') { result.find(c => c.name === field).name = 'wrong'; injections++ } return result }
+      for (const method of Object.keys(calls[index])) {
+        const read = statement[method].bind(statement)
+        statement[method] = (...args) => {
+          calls[index][method]++; const row = read(...args)
+          if (index === 1 && method === 'get') {
+            injections++
+            if (fault === 'missing') delete row[field]
+            if (fault === 'tag') row[field] = 'J"no NUL"'
+            if (fault === 'descriptor') Object.defineProperty(row, field, { writable: false })
+          }
+          return row
+        }
+      }
+      return statement
+    } }
+    assert.throws(() => {
+      const { statement, restore } = prepareSqliteTextProjection(tracked, ['value', 'other'], 'source', (projection = '*') => 'SELECT ' + projection + ' FROM source')
+      restore(statement.get())
+    }, { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
+    assert.deepEqual(calls, [{ get: 0, all: 0, iterate: 0, run: 0 }, { get: fault === 'metadata' ? 0 : 1, all: 0, iterate: 0, run: 0 }])
   }
 })
 
@@ -123,11 +216,13 @@ for (const companion of [undefined, 7, false, {}, 'bad JSON', 'null', '[]', '"pl
     const store = tempStore(t), id = store.openTask('text', 'run').task_id
     store.recordFact({ task_id: id, statement: 'private\0sentinel' }, 'run')
     const db = store.open(), prepare = db.prepare.bind(db)
+    let injections = 0
     db.prepare = sql => {
       const statement = prepare(sql)
       if (sql.startsWith('SELECT id, task_id, kind, statement,')) {
         const all = statement.all.bind(statement)
         statement.all = (...args) => all(...args).map(row => {
+          injections++
           if (companion === undefined) delete row.__imperator_nul_statement
           else row.__imperator_nul_statement = companion
           return row
@@ -136,6 +231,7 @@ for (const companion of [undefined, 7, false, {}, 'bad JSON', 'null', '[]', '"pl
       return statement
     }
     assert.throws(() => store.board({ task_id: id }, 'run'), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
     assert.equal(db.isTransaction, false)
   })
 }
@@ -145,11 +241,16 @@ for (const fault of ['missing column', 'extra column', 'array row', 'wrong name'
     const store = tempStore(t), id = store.openTask('text', 'run').task_id
     store.recordFact({ task_id: id, statement: 'private\0sentinel' }, 'run')
     const db = store.open(), prepare = db.prepare.bind(db)
-    let injections = 0, originalExecutions = 0
+    let injections = 0
+    const calls = { original: { get: 0, all: 0, iterate: 0, run: 0 }, generated: { get: 0, all: 0, iterate: 0, run: 0 } }
     db.prepare = sql => {
       const statement = prepare(sql)
       const original = sql.startsWith('SELECT f.*'), replacement = sql.includes("THEN 'J'||json_quote(")
       if ((original || replacement) && sql.includes('ORDER BY f.id DESC LIMIT')) {
+        for (const method of ['get', 'all', 'iterate', 'run']) {
+          const read = statement[method].bind(statement)
+          statement[method] = (...args) => { calls[original ? 'original' : 'generated'][method]++; return read(...args) }
+        }
         const all = statement.all.bind(statement), columns = statement.columns.bind(statement)
         statement.columns = () => {
           const metadata = columns()
@@ -162,7 +263,6 @@ for (const fault of ['missing column', 'extra column', 'array row', 'wrong name'
           return metadata
         }
         statement.all = (...args) => all(...args).map(row => {
-          if (original) originalExecutions++
           if (replacement && ['missing column', 'extra column', 'array row'].includes(fault)) injections++
           if (replacement && fault === 'missing column') delete row.statement
           if (replacement && fault === 'extra column') row.extra = null
@@ -172,7 +272,9 @@ for (const fault of ['missing column', 'extra column', 'array row', 'wrong name'
       return statement
     }
     assert.throws(() => store.boardPage({ view: 'facts', task_id: id }, 'run'), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
-    assert.equal(injections, 1); assert.equal(originalExecutions, 0)
+    assert.equal(injections, 1)
+    assert.deepEqual(calls, { original: { get: 0, all: 0, iterate: 0, run: 0 },
+      generated: { get: 0, all: ['missing column', 'extra column', 'array row'].includes(fault) ? 1 : 0, iterate: 0, run: 0 } })
     assert.equal(db.isTransaction, false)
   })
 }

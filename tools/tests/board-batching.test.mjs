@@ -111,16 +111,18 @@ for (const route of ['ranked summary', 'late blockers', 'accept blockers']) {
     const matches = sql => route === 'ranked summary' ? sql.startsWith('WITH ranked AS')
       : route === 'late blockers' ? sql.startsWith('SELECT t.id AS task_id, t.title, t.status, t.owner,')
         : sql.startsWith('SELECT b.id, b.statement, b.created_by, b.created_at')
+    let injections = 0
     db.prepare = sql => {
       const statement = prepare(sql)
       if (matches(sql)) {
         const all = statement.all.bind(statement)
-        statement.all = (...args) => all(...args).map(row => { row.__imperator_nul_statement = '"private sentinel"'; return row })
+        statement.all = (...args) => all(...args).map(row => { injections++; row.__imperator_nul_statement = '"private sentinel"'; return row })
       }
       return statement
     }
     assert.throws(() => route === 'accept blockers' ? store.acceptTask({ task_id: id }, 'run', 'lead') : store.board({}, 'run'),
       { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
     assert.equal(db.isTransaction, false)
   })
 }

@@ -21,6 +21,25 @@ function available(recovery) {
   assert.equal(typeof recovery?.beginControl, 'function', 'real store must expose its durable recovery journal')
   return recovery
 }
+
+test('Task16 recovery rejects owner prefix without journal writes and retains its actor input policy', t => {
+  const { store, recovery } = fixture(t), full = 'worker\0suffix'
+  const id = store.openTask({ title: 'inherited owner' }, 'root').task_id
+  store.claimTask({ task_id: id, child_id: 'display' }, 'root', { sessionId: full, isRoot: false }, full)
+  recovery.inspect({}, 'root')
+  const snapshot = () => ['task_event', 'task_checkpoint', 'control_operation'].map(table => store.open().prepare('SELECT * FROM ' + table).all())
+  const before = snapshot()
+  assert.throws(() => recovery.checkpoint({ task_id: id, summary: 'observation' }, 'root', worker), { code: 'E_RECOVERY_SCOPE' })
+  assert.deepEqual(snapshot(), before)
+  assert.throws(() => recovery.beginControl({ ...intent, task_id: id }, { ...worker, runId: 'root' }), { code: 'E_RECOVERY_SCOPE' })
+  assert.deepEqual(snapshot(), before)
+  assert.throws(() => recovery.checkpoint({ task_id: id, summary: 'observation' }, 'root', { sessionId: full, isRoot: false }), { code: 'E_RECOVERY_INPUT' })
+  assert.deepEqual(snapshot(), before)
+  const row = recovery.checkpoint({ task_id: id, summary: 'root observation' }, 'root', root)
+  assert.equal(row.owner_session, full)
+  assert.equal(JSON.parse(store.open().prepare('SELECT json_quote(owner_session) AS owner FROM task_checkpoint WHERE id=?').get(row.checkpoint_id).owner), full)
+  assert.equal(recovery.beginControl({ ...intent, task_id: id }, { ...root, runId: 'root' }).invoke, true)
+})
 function toolsHarness(store, { live, send, stop, parentSession } = {}) {
   const events = [{ type: 'turn/start', data: { turn: 1 } }, { type: 'step/start', data: { turn: 1, step: 1 } }]
   const agent = { id: 'root', session: { events, header: { id: 'root', version: 4, ...(parentSession ? { parentSession, origin: 'subagent', delegationDepth: 2 } : {}) } } }

@@ -29,6 +29,70 @@ function input(id, extra = {}) {
 function admit(scheduler, key = 'admit') { return scheduler.admitNext({ request_key: key }, run, lead) }
 function ref(row, extra = {}) { return { request_id: row.request_id, generation: row.generation, ...extra } }
 
+test('Task16 scheduler withdrawal checks complete owner before replay and preserves decisions on refusal', t => {
+  const { store, scheduler: s } = setup(t), full = 'worker\0suffix', id = task(store, full)
+  const args = input(id), queued = s.enqueue(args, run, lead)
+  const withdraw = sessionId => s.withdraw({ request_id: queued.request_id, request_key: 'withdraw' }, run, { role: 'worker', sessionId })
+  const snapshot = () => ({ rows: ['scheduler_request', 'scheduler_decision'].map(table => store.open().prepare('SELECT * FROM ' + table).all()),
+    exact: store.open().prepare('SELECT json_quote(run_id) AS run, json_quote(owner_session) AS owner FROM scheduler_request').all() })
+  let before = snapshot()
+  assert.throws(() => withdraw('worker'), code('E_SCHEDULER_CONFLICT')); assert.deepEqual(snapshot(), before)
+  assert.equal(s.state({}, run, { role: 'worker', sessionId: 'worker' }).requests.length, 0)
+  assert.equal(s.enqueue(args, run, { role: 'worker', sessionId: full }).request_id, queued.request_id)
+  assert.equal(withdraw(full).status, 'withdrawn')
+  before = snapshot()
+  assert.throws(() => withdraw('worker'), code('E_SCHEDULER_CONFLICT')); assert.deepEqual(snapshot(), before)
+})
+
+test('Task16 full run survives withdrawal response, persisted decision and exact replay', t => {
+  const { store, scheduler: s } = setup(t), full = 'root\0suffix', owner = 'worker\0suffix'
+  const id = task(store, owner, full), queued = s.enqueue(input(id), full, { role: 'lead', sessionId: full })
+  const args = { request_id: queued.request_id, request_key: 'withdraw\0suffix' }, actor = { role: 'worker', sessionId: owner }
+  const result = s.withdraw(args, full, actor)
+  assert.equal(result.request.run_id, full)
+  const saved = store.open().prepare('SELECT result FROM scheduler_decision WHERE run_id=? AND request_key=?').get(full, args.request_key).result
+  assert.equal(JSON.parse(saved).result.request.run_id, full)
+  const changes = store.open().prepare('SELECT total_changes() AS n').get().n
+  const replay = s.withdraw(args, full, actor)
+  assert.equal(replay.replay, true); assert.equal(replay.request.run_id, full)
+  assert.equal(store.open().prepare('SELECT total_changes() AS n').get().n, changes)
+})
+
+test('Task16 full run flows through FIFO admission, queued and admitted state and transition', t => {
+  const { store, scheduler: s } = setup(t), full = 'root\0suffix', owner = 'worker\0suffix'
+  const id = task(store, owner, full), authority = { role: 'lead', sessionId: full }
+  s.enqueue(input(id), full, authority)
+  assert.equal(s.state({}, full, authority).requests[0].run_id, full)
+  const admitted = s.admitNext({ request_key: 'admit' }, full, authority)
+  assert.equal(admitted.status, 'admitted'); assert.equal(admitted.request.run_id, full)
+  assert.equal(s.state({}, full, authority).requests[0].run_id, full)
+  assert.equal(s.bind(ref(admitted.request, { session_id: owner }), full, { role: 'worker', sessionId: owner }).run_id, full)
+})
+
+for (const side of ['current', 'captured']) test('Task16 scheduler independently rejects different full ' + side + ' owner', t => {
+  const { store, scheduler: s } = setup(t), a = 'worker\0first', b = 'worker\0second'
+  const captured = side === 'current' ? b : a, current = side === 'current' ? a : b
+  const id = task(store, captured), args = input(id)
+  s.enqueue(args, run, lead)
+  store.submitTask({ task_id: id }, run, { sessionId: captured, isRoot: false })
+  store.rejectTask({ task_id: id, reason: 'reassign' }, run, { sessionId: run, isRoot: true })
+  store.claimTask({ task_id: id, child_id: 'replacement' }, run, { sessionId: run, isRoot: true }, current)
+  const before = s.state({}, run, lead), decisions = store.open().prepare('SELECT * FROM scheduler_decision').all()
+  assert.throws(() => s.enqueue(args, run, { role: 'worker', sessionId: b }), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(s.state({}, run, lead), before)
+  assert.deepEqual(store.open().prepare('SELECT * FROM scheduler_decision').all(), decisions)
+})
+
+test('Task16 scheduler SQL request keys keep NUL keys distinct', t => {
+  const { store, scheduler: s } = setup(t), id = task(store)
+  const first = s.enqueue(input(id, { request_key: 'queue\0suffix' }), run, lead)
+  const second = s.enqueue(input(id, { request_key: 'queue' }), run, lead)
+  assert.notEqual(first.request_id, second.request_id)
+  const before = s.state({}, run, lead)
+  assert.throws(() => s.enqueue(input(id, { request_key: 'queue\0suffix', mode: 'write' }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(s.state({}, run, lead), before)
+})
+
 test('queue replay, atomic admission, and dispatch-decision replay never consume the next request', t => {
   const { store, scheduler: s, governor: g } = setup(t)
   const a = s.enqueue(input(task(store)), run, worker)

@@ -520,6 +520,159 @@ function deliveryRows(f, id) {
   return Object.fromEntries(['workflow', 'workflow_artifact', 'workflow_review', 'workflow_decision', 'execution_receipt']
     .map(table => [table, f.store.open().prepare('SELECT * FROM ' + table + ' WHERE task_id=? ORDER BY rowid').all(id)]))
 }
+function terminalRows(f, id) {
+  return { task: f.store.open().prepare('SELECT * FROM task WHERE id=?').get(id), ...deliveryRows(f, id),
+    ...Object.fromEntries(['fact', 'task_event', 'task_dependency', 'task_dependency_fence', 'workflow_writer']
+      .map(table => [table, f.store.open().prepare('SELECT * FROM ' + table + ' WHERE task_id=? ORDER BY rowid').all(id)])) }
+}
+
+// Removing the terminal guard must permit these first, correctly versioned
+// decisions after normal cancellation; neither test constructs terminal rows.
+test('cancelled plan refuses a first approval without writes before and after database reopen', t => {
+  const f = fixture(t), id = f.create().task_id
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  assert.equal(f.store.closeTask({ task_id: id, result: 'failed' }, run, lead).status, 'cancelled')
+  const before = terminalRows(f, id)
+  for (const reopen of [false, true]) {
+    if (reopen) f.reopen()
+    assert.equal(f.flow.state({ task_id: id }, run).task_status, 'cancelled')
+    assert.equal(f.flow.ready({}, run).tasks.some(row => row.task_id === id), false)
+    assert.throws(() => f.flow.approvePlan(args, run, f.actor), { code: 'E_TERMINAL' })
+    assert.deepEqual(terminalRows(f, id), before)
+  }
+})
+
+test('cancellation committed on another connection refuses the prepared first review without writes', async t => {
+  const f = fixture(t), id = f.open(), artifact = await f.artifact(id)
+  const peer = new TaskforceStore(f.store.root); t.after(() => peer.close())
+  const peerFlow = new module.TaskforceWorkflow(peer)
+  const args = { task_id: id, expected_version: peerFlow.state({ task_id: id }, run).row_version, request_key: f.key(),
+    revision_id: artifact.revision_id, requirements_result: 'pass', quality_result: 'pass', findings: [] }
+  assert.equal(f.store.closeTask({ task_id: id, result: 'failed' }, run, lead).status, 'cancelled')
+  const before = terminalRows(f, id)
+  assert.equal(peerFlow.state({ task_id: id }, run).row_version, args.expected_version)
+  assert.throws(() => peerFlow.recordReview(args, run, reviewer), { code: 'E_TERMINAL' })
+  assert.deepEqual(terminalRows({ store: peer }, id), before)
+  f.reopen()
+  assert.throws(() => f.flow.recordReview({ ...args, request_key: f.key() }, run, reviewer), { code: 'E_TERMINAL' })
+  assert.deepEqual(terminalRows(f, id), before)
+})
+
+for (const status of ['accepted', 'cancelled', 'done', 'partial', 'failed']) {
+  test(status + ' task refuses every new ordinary workflow mutation before version checks', async t => {
+    const f = fixture(t), id = f.create().task_id
+    if (status === 'accepted') {
+      f.change('approvePlan', id); f.claim(id); await f.artifact(id); f.review(id); f.accept(id)
+    } else if (status === 'cancelled') {
+      f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+    } else {
+      // Persisted compatibility fixture only: today's close(done/partial)
+      // submits, and close(failed) cancels; none creates these legacy statuses.
+      f.store.open().prepare('UPDATE task SET status=? WHERE id=?').run(status, id)
+    }
+    f.reopen()
+    const state = f.flow.state({ task_id: id }, run), before = terminalRows(f, id)
+    assert.equal(state.task_status, status)
+    for (const expected_version of [state.row_version, 0]) {
+      for (const [method, extra, actor] of [
+        ['setDependencies', { prerequisite_task_ids: [] }, f.actor],
+        ['approvePlan', {}, f.actor],
+        ['recordArtifact', {}, worker],
+        ['recordReview', { revision_id: state.revision_id, requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer],
+      ]) {
+        assert.throws(() => f.flow[method]({ task_id: id, expected_version, request_key: f.key(), ...extra }, run, actor),
+          { code: 'E_TERMINAL' }, method + ' on ' + status)
+        assert.deepEqual(terminalRows(f, id), before)
+      }
+    }
+  })
+}
+
+for (const status of ['cancelled', 'accepted']) {
+  test('original workflow requests replay read-only after ' + status + ' and database reopen', async t => {
+    const f = fixture(t), id = f.create().task_id, requests = []
+    const record = (method, extra, actor) => {
+      const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key(), ...extra }
+      const result = f.flow[method](args, run, actor)
+      requests.push({ method, args, actor, result })
+      return result
+    }
+    record('setDependencies', { prerequisite_task_ids: [] }, f.actor)
+    record('approvePlan', {}, f.actor); f.claim(id); await f.verify(id)
+    const artifact = record('recordArtifact', {}, worker)
+    record('recordReview', { revision_id: artifact.revision_id, requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer)
+    let acceptArgs, accepted
+    if (status === 'cancelled') f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+    else {
+      f.store.submitTask({ task_id: id }, run, worker)
+      acceptArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+      accepted = f.store.acceptTask(acceptArgs, run, lead)
+    }
+    f.reopen()
+    const before = terminalRows(f, id)
+    for (const { method, args, actor, result } of requests) {
+      assert.deepEqual(f.flow[method](args, run, actor), result)
+      assert.throws(() => f.flow[method]({ ...args, request_key: f.key() }, run, actor), { code: 'E_TERMINAL' })
+      assert.throws(() => f.flow[method]({ ...args, expected_version: args.expected_version + 1 }, run, actor), { code: 'E_WORKFLOW_REPLAY' })
+      assert.deepEqual(terminalRows(f, id), before)
+    }
+    const review = requests.at(-1)
+    assert.throws(() => f.flow.recordReview(review.args, run, { ...reviewer, sessionId: 'other reviewer' }), { code: 'E_WORKFLOW_REPLAY' })
+    if (accepted) assert.deepEqual(f.store.acceptTask(acceptArgs, run, lead), accepted)
+    assert.deepEqual(terminalRows(f, id), before)
+    const returned = f.change('returnForRework', id, { reason: 'explicit terminal reconsideration' })
+    assert.equal(returned.reopened, true)
+    assert.equal(returned.previous_status, status)
+    const reopened = terminalRows(f, id)
+    assert.equal(reopened.task.status, 'rejected')
+    assert.equal(reopened.task.evidence_generation, 1)
+    assert.equal(reopened.workflow[0].rework_count, 1)
+    for (const { method, args, actor, result } of requests) assert.deepEqual(f.flow[method](args, run, actor), result)
+    if (accepted) assert.deepEqual(f.store.acceptTask(acceptArgs, run, lead), accepted)
+    assert.deepEqual(terminalRows(f, id), reopened)
+  })
+}
+
+test('terminal tasks preserve root role, run and attached-record integrity checks before replay', t => {
+  const f = fixture(t), id = f.create().task_id
+  const args = { task_id: id, expected_version: 1, request_key: f.key() }
+  const approved = f.flow.approvePlan(args, run, f.actor)
+  f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+  const before = terminalRows(f, id)
+  assert.throws(() => f.flow.approvePlan(args, run, worker), { code: 'E_WORKFLOW_ROLE' })
+  assert.throws(() => f.flow.approvePlan(args, run, { sessionId: 'foreign root', isRoot: true }), { code: 'E_WORKFLOW_ROLE' })
+  assert.throws(() => f.flow.approvePlan(args, 'foreign run', { sessionId: 'foreign run', isRoot: true }), { code: 'E_CROSS_RUN' })
+  assert.deepEqual(f.flow.approvePlan(args, run, f.actor), approved)
+  assert.deepEqual(terminalRows(f, id), before)
+  f.store.open().prepare('UPDATE workflow_decision SET run_id=? WHERE task_id=? AND request_key=?').run('private foreign record', id, args.request_key)
+  const damaged = terminalRows(f, id)
+  for (const request_key of [args.request_key, f.key()]) {
+    assert.throws(() => f.flow.approvePlan({ ...args, request_key }, run, f.actor),
+      error => error.code === 'E_STORE_INTEGRITY' && !error.message.includes('private foreign record'))
+    assert.deepEqual(terminalRows(f, id), damaged)
+  }
+})
+
+test('explicit root return reopens a cancelled plan for fresh approval and verified acceptance', async t => {
+  const f = fixture(t), id = f.create({ max_reworks: 1 }).task_id
+  f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+  f.reopen()
+  const before = terminalRows(f, id)
+  assert.throws(() => f.change('returnForRework', id, { reason: 'worker cannot reopen' }, worker), { code: 'E_WORKFLOW_ROLE' })
+  assert.deepEqual(terminalRows(f, id), before)
+  assert.equal(f.change('returnForRework', id, { reason: 'root authorizes another attempt' }).reopened, true)
+  const returned = f.flow.state({ task_id: id }, run)
+  assert.equal(returned.stage, 'plan')
+  assert.equal(returned.evidence_generation, 1)
+  assert.equal(returned.rework_count, 1)
+  assert.throws(() => f.claim(id), { code: 'E_WORKFLOW_STAGE' })
+  f.change('approvePlan', id); f.claim(id); await f.artifact(id); f.review(id)
+  assert.equal(f.accept(id).execution_verified, true)
+  const accepted = terminalRows(f, id)
+  assert.throws(() => f.change('returnForRework', id, { reason: 'budget exhausted' }), { code: 'E_WORKFLOW_BUDGET' })
+  assert.deepEqual(terminalRows(f, id), accepted)
+})
+
 function outcomeReview(f, id, result) {
   return f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
     requirements_result: result, quality_result: 'pass', findings: result === 'pass' ? [] : ['requires root decision'] }, reviewer)

@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import { execFileSync, spawnSync } from 'node:child_process'
 import { createHash } from 'node:crypto'
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -68,6 +68,221 @@ function tableRows(db) {
   const tables = db.prepare("SELECT name FROM sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name").all()
   return Object.fromEntries(tables.map(({ name }) => [name, db.prepare('SELECT * FROM "' + name.replaceAll('"', '""') + '" ORDER BY rowid').all()]))
 }
+
+const quotedIdentifier = name => '"' + name.replaceAll('"', '""') + '"'
+const retainedStatement = 'prefix\u0000before'
+function retainedDefinitions(db) {
+  return db.prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name").all()
+    .map(({ name }) => ({ name,
+      columns: db.prepare('PRAGMA table_info(' + quotedIdentifier(name) + ')').all().map(column => column.name) }))
+}
+function retainedSnapshot(path, definitions) {
+  return database(path, db => {
+    db.exec('PRAGMA query_only=ON')
+    return { encoding: db.prepare('PRAGMA encoding').get().encoding,
+      tables: (definitions ?? retainedDefinitions(db)).map(definition => {
+        // Independent oracle: stable row identities and separate storage class/hex/value observations.
+        const projection = ['rowid AS "__oracle_rowid"']
+        definition.columns.forEach((column, index) => {
+          const ref = 'original.' + quotedIdentifier(column)
+          projection.push(`typeof(${ref}) AS "t${index}"`, `hex(CAST(${ref} AS BLOB)) AS "h${index}"`,
+            `CASE WHEN typeof(${ref})='text' THEN json_quote(${ref}) ELSE NULL END AS "j${index}"`,
+            `CASE WHEN typeof(${ref})='integer' THEN ${ref} ELSE NULL END AS "i${index}"`,
+            `CASE WHEN typeof(${ref})='real' THEN ${ref} ELSE NULL END AS "r${index}"`)
+        })
+        const statement = db.prepare('SELECT ' + projection.join(',') + ' FROM '
+          + quotedIdentifier(definition.name) + ' AS original ORDER BY rowid')
+        statement.setReadBigInts(true)
+        return { ...definition, rows: statement.all().map(row => ({ rowid: row.__oracle_rowid.toString(),
+          cells: definition.columns.map((_, index) => {
+            let realBits = null
+            if (row['r' + index] !== null) {
+              const buffer = Buffer.alloc(8); buffer.writeDoubleBE(row['r' + index]); realBits = buffer.toString('hex')
+            }
+            return { type: row['t' + index], hex: row['h' + index], quoted: row['j' + index],
+              integer: row['i' + index]?.toString() ?? null, realBits }
+          }) })) }
+      }) }
+  })
+}
+function retainedTarget(snapshot, factId) {
+  const table = snapshot.tables.find(table => table.name === 'fact')
+  return table.rows.find(row => row.rowid === String(factId)).cells[table.columns.indexOf('statement')]
+}
+function retainedHex(text, encoding) {
+  if (encoding === 'UTF-8') return Buffer.from(text, 'utf8').toString('hex').toUpperCase()
+  const buffer = Buffer.from(text, 'utf16le')
+  if (encoding === 'UTF-16be') buffer.swap16()
+  return buffer.toString('hex').toUpperCase()
+}
+function retainedFiles(root) {
+  return readdirSync(root).sort().map(name => {
+    const path = join(root, name), info = lstatSync(path)
+    assert.ok(info.isDirectory() || info.isFile())
+    return { name, mode: info.mode & 0o777, ...(info.isDirectory()
+      ? { entries: retainedFiles(path) } : { size: info.size, sha256: bytes(path) }) }
+  })
+}
+function retainedSeed(root, encoding, mode) {
+  mkdirSync(root)
+  const path = join(root, 'taskforce.db'), initial = new DatabaseSync(path)
+  try {
+    initial.exec("PRAGMA encoding='" + encoding + "'")
+    initial.exec('CREATE TABLE fixture_encoding_anchor(marker TEXT)')
+  } finally { initial.close() }
+  const store = new TaskforceStore(root)
+  const edgeRows = [
+    [null, '', new Uint8Array(), 'null', 'a'],
+    ['0', new Uint8Array([0, 255, 128, 1]), ' {"x":1} ', '"literal"', '\u0000leading'],
+    [-9223372036854775808n, -9223372036854775807n, 9223372036854775806n, 9223372036854775807n, 'z'],
+    [0.125, -2.5, 1.2345678901234567, 9007199254740993n, '\n'],
+    ['{"inner":"x\u0000y"}', '{"inner":"x\\u0000y"}', 'prefix\u0000tail', 'two\u0000\u0000nul', '"'],
+    ['emoji 😀 e\u0301', '\u0000', 'trailing\u0000', 'line\nbreak', '\\'],
+    ['{', '[1,', '"unterminated', '[1,{"x":null}]', '{"valid":true}'],
+    ['duplicate', 'same', null, new Uint8Array([0, 42]), 'duplicate'],
+    ['duplicate', 'same', null, new Uint8Array([0, 42]), 'duplicate'],
+  ]
+  let factId
+  try {
+    const db = store.open()
+    assert.equal(db.prepare('PRAGMA encoding').get().encoding, encoding, 'real preexisting encoding after reopen')
+    const actor = { sessionId: 'preflight-safe-actor', isRoot: true }, run = 'preflight-safe-run'
+    const task = store.openTask({ title: SENTINEL }, run, actor)
+    factId = store.recordFact({ task_id: task.task_id, kind: 'fact', statement: retainedStatement }, run, actor).fact_id
+    assert.ok(Number.isSafeInteger(factId))
+    db.exec('CREATE TABLE "extra ""retained" ("__retained_value_0", "0", "constructor", "quote""name", "order text" TEXT COLLATE BINARY)')
+    // Empty BLOB is explicit SQL: an empty native buffer can bind as NULL.
+    db.prepare('INSERT INTO "extra ""retained" VALUES(?,?,zeroblob(0),?,?)')
+      .run(edgeRows[0][0], edgeRows[0][1], edgeRows[0][3], edgeRows[0][4])
+    const insert = db.prepare('INSERT INTO "extra ""retained" VALUES(?,?,?,?,?)')
+    for (const row of edgeRows.slice(1)) insert.run(...row)
+    if (mode.trigger) {
+      // R1: only armed fixtures remove history and compensate for the inserted baseline.
+      db.exec('DELETE FROM task_event')
+      const expression = {
+        'suffix-change': "'prefix' || char(0) || 'after'",
+        'before-nul-change': "'changed' || char(0) || 'before'",
+        'identical-full-text': "'prefix' || char(0) || 'before'",
+        'same-bytes-text-to-blob': 'CAST(statement AS BLOB)',
+      }[mode.name]
+      assert.ok(expression)
+      db.exec(`CREATE TRIGGER fixture_preflight_baseline AFTER INSERT ON task_event
+        WHEN NEW.kind='baseline' BEGIN
+          UPDATE fact SET statement=${expression} WHERE id=${factId};
+          DELETE FROM task_event WHERE id=NEW.id;
+        END`)
+      assert.equal(db.prepare('SELECT count(*) AS n FROM task_event').get().n, 0)
+    } else assert.ok(db.prepare('SELECT count(*) AS n FROM task_event').get().n > 0, 'normal control retains real history')
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE')
+  } finally { store.close() }
+  // R2: all subsequent original-source readers are read-only and never migrate.
+  return { path, factId, edgeRows }
+}
+async function retainedPreflight(root, temporary) {
+  const previous = Object.fromEntries(['TMPDIR', 'TMP', 'TEMP'].map(name => [name, process.env[name]]))
+  try {
+    for (const name of Object.keys(previous)) process.env[name] = temporary
+    assert.deepEqual(retainedFiles(temporary), [])
+    return await api().preflight({ root })
+  } finally {
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+    assert.deepEqual(retainedFiles(temporary), [], 'owned preflight temp endpoint is empty')
+  }
+}
+const retainedModes = [
+  { name: 'suffix-change', trigger: true, changed: true },
+  { name: 'before-nul-change', trigger: true, changed: true },
+  { name: 'identical-full-text', trigger: true, changed: false },
+  { name: 'normal-no-trigger', trigger: false, changed: false },
+  { name: 'same-bytes-text-to-blob', trigger: true, changed: true },
+]
+for (const encoding of ['UTF-8', 'UTF-16le', 'UTF-16be']) for (const mode of retainedModes) {
+  test('preflight retained TEXT ' + encoding + ' ' + mode.name, async () => {
+    const directory = realpathSync(mkdtempSync(join(tmpdir(), 'imperator-operations-retained-')))
+    try {
+      const root = join(directory, 'source'), cloneRoot = join(directory, 'clone'), temporary = join(directory, 'private-temp')
+      mkdirSync(cloneRoot); mkdirSync(temporary)
+      const fixture = retainedSeed(root, encoding, mode), before = retainedSnapshot(fixture.path)
+      const originalFiles = retainedFiles(root), original = retainedTarget(before, fixture.factId)
+      assert.deepEqual(originalFiles.map(file => file.name), ['taskforce.db'], 'closed/checkpointed seed has no sidecars')
+      assert.deepEqual(original, { type: 'text', hex: retainedHex(retainedStatement, encoding),
+        quoted: JSON.stringify(retainedStatement), integer: null, realBits: null })
+      const edge = before.tables.find(table => table.name === 'extra "retained')
+      assert.equal(edge.rows.length, fixture.edgeRows.length)
+      fixture.edgeRows.forEach((row, rowIndex) => row.forEach((value, columnIndex) => {
+        const cell = edge.rows[rowIndex].cells[columnIndex]
+        assert.equal(cell.type, value === null ? 'null' : typeof value === 'bigint' ? 'integer'
+          : typeof value === 'number' ? 'real' : typeof value === 'string' ? 'text' : 'blob')
+        if (typeof value === 'string') {
+          assert.equal(cell.quoted, JSON.stringify(value)); assert.equal(cell.hex, retainedHex(value, encoding))
+        } else if (typeof value === 'bigint') assert.equal(cell.integer, value.toString())
+        else if (value instanceof Uint8Array) assert.equal(cell.hex, Buffer.from(value).toString('hex').toUpperCase())
+      }))
+      copyFileSync(fixture.path, join(cloneRoot, 'taskforce.db'))
+      const clone = new TaskforceStore(cloneRoot)
+      try { clone.open().exec('PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode=DELETE') }
+      finally { clone.close() }
+      const migrated = retainedSnapshot(join(cloneRoot, 'taskforce.db'), before.tables)
+      let text = retainedStatement
+      if (mode.name === 'suffix-change') text = 'prefix\u0000after'
+      if (mode.name === 'before-nul-change') text = 'changed\u0000before'
+      const changed = retainedTarget(migrated, fixture.factId)
+      assert.deepEqual(changed, mode.name === 'same-bytes-text-to-blob'
+        ? { ...original, type: 'blob', quoted: null }
+        : { ...original, hex: retainedHex(text, encoding), quoted: JSON.stringify(text) })
+      assert.equal(JSON.stringify(changed) !== JSON.stringify(original), mode.changed, 'exactly the specified cell changes')
+      const normalized = structuredClone(migrated)
+      Object.assign(retainedTarget(normalized, fixture.factId), original)
+      assert.deepEqual(normalized, before, 'all other original cells, row identities, counts and encoding are unchanged')
+      try {
+        if (mode.changed) await assert.rejects(retainedPreflight(root, temporary), error => {
+          assert.equal(error.code, 'E_OPERATIONS_SCHEMA')
+          assert.equal(error.message, 'E_OPERATIONS_SCHEMA')
+          safe({ code: error.code, message: error.message })
+          return true
+        })
+        else {
+          const result = safe(await retainedPreflight(root, temporary))
+          assert.equal(result.ok, true); assert.equal(result.rows_preserved, true)
+          assert.equal(result.migration_required, false)
+          const tables = before.tables.filter(table => !table.name.startsWith('sqlite_'))
+          assert.equal(result.tables_checked, tables.length)
+          assert.equal(result.rows_checked, tables.reduce((count, table) => count + table.rows.length, 0))
+          assert.doesNotMatch(JSON.stringify(result), /prefix|changed/)
+        }
+      } finally {
+        assert.deepEqual(retainedSnapshot(fixture.path, before.tables), before, 'original source values stay unchanged')
+        assert.deepEqual(retainedFiles(root), originalFiles, 'source bytes, modes and listing stay unchanged')
+      }
+    } finally {
+      rmSync(directory, { recursive: true, force: true })
+      assert.equal(existsSync(directory), false, 'owned fixture is removed')
+    }
+  })
+}
+
+test('preflight rejects a non-database source at the snapshot boundary without source or temp changes', async () => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'imperator-operations-invalid-')))
+  try {
+    const root = join(directory, 'source'), temporary = join(directory, 'private-temp')
+    mkdirSync(root); mkdirSync(temporary)
+    writeFileSync(join(root, 'taskforce.db'), 'not SQLite: ' + SENTINEL)
+    const before = retainedFiles(root)
+    await assert.rejects(retainedPreflight(root, temporary), error => {
+      assert.equal(error.code, 'E_OPERATIONS_DATABASE')
+      assert.equal(error.message, 'E_OPERATIONS_DATABASE')
+      safe({ code: error.code, message: error.message })
+      return true
+    })
+    assert.deepEqual(retainedFiles(root), before)
+  } finally {
+    rmSync(directory, { recursive: true, force: true })
+    assert.equal(existsSync(directory), false)
+  }
+})
 
 test('doctor backup and restore preserve withdrawal decisions and zero-write replay', async t => {
   const ops = api(), f = fixture(t)

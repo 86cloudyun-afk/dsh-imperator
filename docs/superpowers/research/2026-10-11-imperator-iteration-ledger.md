@@ -17,6 +17,7 @@
 | 原生验证资源 | SDK profile shutdown 保留四类进程监听器，native-only 与加载本插件结果相同 | 隔离验证器清理其确切启动回调；不改 SDK、不关闭警告 |
 | 结算可观测性 | 旧超时先取消后观察，无法区分 pending idle、通知缺失与稳定性等待 | 增加固定 phase/计数和取消前独立快照，保留原结算条件 |
 | 验收成功指引 | legacy 无 pointer 已 accepted，提示却建议当前任务继续补证，而终态拒绝新 fact/artifact | 明确本次验收已完成，建议后续任务在提交/验收前记录指针 |
+| 派发结算与复用前提 | rc.2 合法前台 one-shot 不发送 continuable 通知却被验证器要求；首次任务未告知后续同人复用 | 按公开 current-cut own-session 身份计算义务，unknown 阻止通过；首次披露可续作要求，保留全树/通知/grader |
 | store / governor | 定向事务、读写及故障对照未确认其他新缺陷 | 保留正反控制，不宣称全面无缺陷 |
 
 fork 的复现使用真实固定 SDK Session、纯 fork 历史准备、实际插件 hook 和 SQLite，加显式 preset scope fixture，没有运行完整 agent loop。错误 ECHO 是指导消息，不能解释为已复现实际中止；旧错误归属 audit 行保留，不猜测迁移。native-only 四组监听器对照各 12 次启动、共 192 个注册堆栈均来自 SDK；Session/Agent/插件构造未增加其他监听器。这也不证明历史长任务停止的原因。
@@ -44,6 +45,7 @@ Node 24.19.0，四 CPU 配额。离线 `npm test`：1326 项，1315 pass、11 sk
 | fixture cleanup | `8e1f8e7…` + `1ba2ebb6d2dd597812fc58eb762d20f1227df374` | 两 pins 各 12 次真实启动回调残留；失败启动、竞争、强制退出、close/错误保留及 boot continuation 均复现；追加三类 scheduler setup RED | 每 pin runtime 15、boundaries 45、scheduler 31、HOST 17、ISOLATION 13；followup full 1670/1650 pass/20 skip/0 fail，17.741s | 原 quality FAIL 保留；修正提交 fresh spec PASS、quality PASS |
 | settlement diagnostics | `8cebb8ef72a8609053229dcaf6cd5be1fbf32178` | 原 waiter/report 的 20 个行为失败；补充 inherited thenable/async observer 两个失败 | model 126/126、每 pin boundaries 47/47；full 1695/1675 pass/20 skip/0 fail | fresh spec PASS 07:39:04、quality PASS 07:41:15；全部 198 文件与 21 制品独立核验 |
 | acceptance advice | `247a4514509d271082992a9066c2f0f1d526f38b` | real SQLite 17/15 pass/2 旧文字失败，终态拒绝及完整行快照先通过 | focused 109/109；full 1699/1679 pass/20 skip/0 fail；仅一个生产字符串改变 | fresh spec PASS 07:51:54、quality PASS 07:53:55；全部 198 文件与 20 制品独立核验 |
+| delegation contract | `e03a2685718b4b5951fb166cbb3ff1ccc6859a12` | unchanged waiter 三条 mounted 原生行为失败，37 个受控旧语义失败 | focused163；rc.2 boundaries50/50，alpha47pass/3不支持前台skip；full1736/1716pass/20offline skip/0fail | fresh SPEC PASS08:44:35→QUALITY PASS08:48:21；200文件/33制品/35SDK字节独立核验 |
 
 控制回执独立审核另以真实 SQL commit 后立即同步 abort 的六个场景核对 accepted 结果、原键重放和 effects=1；没有把已提交测试的迟到取消等同于暂停修复后的同步 handler。fork native GREEN 保留真实 child seq `[3,4]`、cut 2、restore firstLiveSeq 5，40,000 个继承槽未被扫描为活动；scope/ACK/unknown/reset/可变历史和完整可见状态均有对照。
 
@@ -106,7 +108,7 @@ fixture 最终串行记录绑定 `8e1f8e7…` / tree `f97d2fdf4ce902a307a4362ebe
 
 重新专项审查用户此前提及的 mutable pagination 漏读及事实计数口径：历史修复 `82e3f9ad07706f9812e926f4f8cb5b9b5889d59a`（PR54）已是原 main 的祖先。固定2d8 source的相关store/paging/count代码与main完全相同，未确认新的同类缺陷；本轮task11之后整份store仅上述字符串不同。NULL域、成员变动、晚到/高 resolver、软字节裁剪及分母语义均核对，不把已合入的修复再次计作本轮新修复。独立复查报告摘要 `4bc13f9d4c659e65de0f4439abd4d2d5cac6dd6ff19c582d0d9c7a17abf3e7d4`。
 
-当前十一项任务通过；原main cap80及首个0.4.2包repair timeout仍FAILED，warning触发与timeout因果未知。新不可变包、source/oneCPU/两pins native、一次有诊断目的的固定额度模型样本、全轮SPEC→QUALITY、实际PR六项CI、额外fresh合并前复审、expected-head merge及actual-main读回仍待controller实际完成并记录。
+截至该候选冻结准备时，十一项任务通过；原main cap80及首个0.4.2包repair timeout仍FAILED，warning触发与timeout因果未知。后续新不可变包及新增任务状态见下段，不以这里的历史准备状态代替最终交付。
 
 ## 第二冻结包结果与派发契约遗漏
 
@@ -117,3 +119,17 @@ fixture 最终串行记录绑定 `8e1f8e7…` / tree `f97d2fdf4ce902a307a4362ebe
 新不可变 timeoutProgress 为 waiting-notices、tracked2/idle2/running0/unknown0/pendingIdleWaits0、required1/delivered0/missing1，最近获准请求在本阶段83472ms；这只确定取消前等待条件。两份独立源码审查确认此前覆盖遗漏：rc.2 mounted subagent/subagent_fork 允许显式 run_in_background:false，真实 one-shot 完成 result/dispose 后返回前台结果，根本不产生 continuable settlement notice；验证器却对所有 child activation 要求该通知。alpha.2 mounted schema 没有该参数，始终 parent-delivery continuable，不能泛化前台分支。实际付费报告没有模式/工具参数，不能将该源码 bug 直接归为此次或历史生产停止根因。
 
 另一个任务契约遗漏：repair 未预告下一阶段必须复用同一 childId，合法 one-shot 已无法 cold resume，后续却不允许换执行者。新增 [派发结算设计](../specs/2026-10-11-delegation-settlement-contract-design.md) / [计划](../plans/2026-10-11-delegation-settlement-contract.md)：先真实原生 RED，再按公开 current-cut own-session mode 区分通知义务，unknown fail closed，保留全树 idle/dispose/稳定检查；repair 首次披露 continuable 与后两阶段同人要求，参数指导只在工具实际提供时使用。此为新 prompt/product 样本，原 grader、金额要求、后两阶段、安全/额度不变，不称原受控性能比较。截至08:20尚待设计审核、实现、fresh任务SPEC→QUALITY及新完整验收，PR69仍草稿未合并。
+
+## 第十二项实现与最终新包冻结准备
+
+设计先经独立 SPEC PASS（报告摘要 `342ed442ff5abf4a0f9da203ee3f39d951a1877f3979e15e4114af209d545112`），root仅文档提交 `633e0ae8336b9d9b30d22884cf8fc71e4f9e4533` 后由唯一执行者实现。四文件提交 `e03a2685718b4b5951fb166cbb3ff1ccc6859a12` / tree `0959f5253a8e451465f8bc25b3bfa5906465cccc`，+405/-30；产品 fingerprint `f77766a88e52dace40b59f47ae99f40854a25f5cfccf1df0d859b117f50a334e`（111产品路径）。全部200 tracked文件实测/提交/工作树字节及执行位一致，33证据制品与35SDK源摘要独立核对，SDK未改。
+
+三条真实 rc.2 原生 RED 在 verifier/fixture 原字节上复现：前台 spawn/fork 的子代理已完成实际 scope dispose、unregister、前台结果和父 turn，旧判据仍required1/delivered0；continuable父→前台fork叶在真实父notice后仍required2/delivered1。第一轮测试原型的 toolCallId / seed flush 错误保留但不当行为RED。另有37受控旧语义反例；新classifier缺export时使用旧all-continuable语义fallback，原生行为RED不依赖缺import失败。
+
+实现只用 live host 公开同步 sessionProjections.snapshot 与 Session.isOwnSeq，严格读取own data mode/安全seq，缺失/访问器/继承/非法/throw皆unknown并阻止当前新增activation结算，即使有notice也不能通过。mode在creation后及最终稳定窗口动态重读；判据和原九字段诊断共用配对义务。原whenIdle Promise/Promise.all、全树idle、两次tick保留，窗口末另查Agent对象/activation次数及当前义务。仅明确own one-shot豁免SDK不发送的通知，continuable/cold通知原规则仍必须满足。
+
+实际前台测试独立持有child流、公开ctx.effect的异步真实scope dispose、父后续流，释放前绝不结算；混合树另持有continuable父final flush和收到真实notice后的root流。直接spawn/fork随后实际task_child_send同one-shot id返回E_CHILD_SETTLED，未换worker。GREEN model163/163，rc.2完整boundaries50/50/0skip；alpha完整50total/47pass/3明确不支持的rc.2前台skip，实际compiled schema不含background字段，真实continuable/live/cold、两notice、同session不同Agent、flush/parentwake与cancel/cleanup全部通过。0paid；实际本地模型流存在，不能称0model streams。
+
+唯一full npm为1736total/1716pass/20offline宿主skip/0fail，wall16.844919s/node16.178694s，六scripts通过且offline仍UNVERIFIED。未用alpha不存在的分支替代支持功能检查。生产preset、工具/store/scheduler、version/pins、grader、readonly/reuse/strict/shared boundary字节与有限额度保持；只repair upfront说明continuable＋后两阶段同childId/task_child_send/no new Agent，参数指导依实际schema。新prompt/product样本与旧模型失败非受控性能比较。
+
+fresh实现审核先保存SPEC PASS08:44:35（原snapshot摘要 `8dcfc0a9fbe2ff1a0dfb876f5f2a2dabede28187eb143531a346511735b9e55e`），再QUALITY08:45:02开始、08:48:21 PASS；最终报告摘要 `f342dffa51481d672be351a91d00b47fbf300f2c158e12227181ea4bed665148`。独立整轮source预审核对原main至e03的65路径union，无新增actionable问题；此预审不是whole最终PASS。十二项任务审核现全部通过；root文档整合不改111产品字节，最终NEW包须重新实际跑source/oneCPU/两pins全量native＋一次有修复依据的实际paid，然后whole SPEC→QUALITY、实际PR六CI、额外fresh PR审查、match-head merge和actual main六CI/树/version。旧三个模型FAIL与未知历史因果保留，当前未合并。

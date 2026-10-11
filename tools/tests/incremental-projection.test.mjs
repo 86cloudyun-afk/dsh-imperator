@@ -262,3 +262,140 @@ test('cached flow preserves todo updates, context deduplication and compaction v
   assert.doesNotMatch(changed, /first task/)
   assert.match(changed, /估计 1/)
 })
+
+const failures = (prefix, count = 6) => Array.from({ length: count }, (_, index) =>
+  [call(`${prefix}-${index}`), result(`${prefix}-${index}`)]).flat()
+const decisionText = decision => decision.messages.map(message => message.content[0].text).join('\n')
+
+// Reusing the full fork prefix in either runtime must fail these assertions.
+test('fork guard and dispatch estimates start empty and retain restored own activity', async () => {
+  for (const plugin of [guard, context]) {
+    const h = runtime(plugin, { stallAction: 'observe', stepDownRequests: 0 })
+    const prefix = freeze([...failures('parent'), call('parent-dispatch', 'subagent'), notice('parent-notice')])
+    const a = { session: { header: { id: 'child' }, events: prefix, inheritedEventCount: prefix.length } }
+    assert.deepEqual((await h.pre(a)).messages, [], `${plugin.name}: inherited activity is not owned`)
+    a.session.events = freeze([...prefix, ...failures('own'), call('own-dispatch', 'subagent')])
+    // A dispatch following failures breaks ECHO, so guard gets its own tail.
+    if (plugin === guard) a.session.events = freeze([...prefix, ...failures('own')])
+    const own = await h.pre(a)
+    if (plugin === guard) assert.equal(own.messages[0]?.source.signal, 'echo')
+    else assert.match(decisionText(own), /未结算派发估计 1/)
+    a.session = { ...a.session, firstLiveSeq: a.session.events.length }
+    const restored = await h.pre(a)
+    if (plugin === guard) assert.equal(restored.messages[0]?.source.signal, 'echo')
+    else assert.match(decisionText(restored), /未结算派发估计 1/)
+  }
+})
+
+test('root and unseeded child cuts retain own failures, ACK and unknown barriers', async () => {
+  for (const inheritedEventCount of [undefined, 0]) {
+    const h = runtime(guard, { stallAction: 'observe', stepDownRequests: 0 })
+    const a = { session: { inheritedEventCount, firstLiveSeq: 99, events: freeze(failures('own')) } }
+    const warning = (await h.pre(a)).messages[0]
+    assert.equal(warning.source.signal, 'echo')
+    a.session = { ...a.session, events: freeze([...a.session.events, event('user/message', warning)]) }
+    assert.deepEqual((await h.pre(a)).messages, [], 'persisted own acknowledgment survives restore')
+    const unknown = event('tool/result', { callId: 'barrier', isError: true, error: { code: 'TOOL_OUTCOME_UNKNOWN' } })
+    a.session = { ...a.session, events: freeze([...failures('before'), call('barrier'), unknown, ...failures('after', 4)]) }
+    assert.deepEqual((await h.pre(a)).messages, [], 'unknown effects break the definite failure tail')
+  }
+})
+
+test('inherited STALL is excluded while own reasoning still triggers the configured signal', async () => {
+  const h = runtime(guard, { stallReasoningChars: 200, sensitivity: 'balanced', stepDownRequests: 0 })
+  const a = { session: { inheritedEventCount: 1, events: freeze([reasoning()]) } }
+  assert.deepEqual((await h.pre(a)).messages, [])
+  a.session.events = freeze([...a.session.events, reasoning()])
+  assert.equal((await h.pre(a)).messages[0]?.source.signal, 'stall')
+})
+
+test('invalid and changing inherited cuts clear previously observed activity', async () => {
+  const invalidCuts = [-1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1, '0', null, 1000]
+  for (const plugin of [guard, context]) {
+    const h = runtime(plugin, { stallAction: 'observe', stepDownRequests: 0 })
+    const events = freeze(plugin === guard ? failures('own') : [call('own', 'subagent')])
+    const a = { session: { events, inheritedEventCount: 0 } }
+    assert.equal((await h.pre(a)).messages.length, 1)
+    for (const cut of invalidCuts) {
+      a.session.inheritedEventCount = cut
+      assert.deepEqual((await h.pre(a)).messages, [], `unavailable cut ${String(cut)}`)
+    }
+    Object.defineProperty(a.session, 'inheritedEventCount', { configurable: true, get() { throw new Error('unreadable cut') } })
+    assert.deepEqual((await h.pre(a)).messages, [])
+    Object.defineProperty(a.session, 'inheritedEventCount', { configurable: true, writable: true, value: events.length })
+    assert.deepEqual((await h.pre(a)).messages, [])
+    a.session.inheritedEventCount = 0
+    assert.equal((await h.pre(a)).messages.length, 1, 'changed ownership resets runtime episode and projection')
+  }
+})
+
+test('fork keeps full visible context for inherited TODO, dedup, compaction and unknown supersession', async () => {
+  const h = runtime(context)
+  const todo = event('todo/write', { todos: [{ id: 't', content: 'inherited task', status: 'in_progress' }] })
+  const a = { session: { header: { id: 'child' }, inheritedEventCount: 1,
+    surface: { nodes: [] }, events: freeze([{ seq: 0, ...todo }]) } }
+  const first = (await h.pre(a)).messages[0]
+  assert.match(first.content[0].text, /inherited task/)
+  a.session.events = freeze([...a.session.events, { seq: 1, type: 'user/message', data: first }])
+  a.session.inheritedEventCount = 2
+  a.session.surface.nodes = [1]
+  assert.deepEqual((await h.pre(a)).messages, [], 'visible inherited status deduplicates')
+  a.session.surface.nodes = []
+  assert.equal((await h.pre(a)).messages[0].content[0].text, first.content[0].text, 'compaction republishes')
+  a.session.surface.nodes = [1]
+  a.session.events = freeze([...a.session.events, { seq: 2, ...event('turn/start', { turn: 2 }) }])
+  const superseded = (await h.pre(a)).messages[0]
+  assert.match(superseded.content[0].text, /当前无可确认状态，勿沿用旧投影/)
+  a.session.events = freeze([...a.session.events, { seq: 3, type: 'user/message', data: superseded }])
+  a.session.surface.nodes = [1, 3]
+  assert.deepEqual((await h.pre(a)).messages, [], 'unknown supersession itself deduplicates')
+})
+
+test('owned window preserves references and seq without reading a large inherited prefix', async () => {
+  const module = await import('../../lib/plugins/session-observation.mjs').catch(() => ({}))
+  assert.equal(typeof module.ownedSessionEvents, 'function', 'shared owned window is required')
+  const { ownedSessionEvents } = module
+  const events = new Array(40002)
+  for (let index = 0; index < 40000; index++) Object.defineProperty(events, index, {
+    get() { assert.fail('owned slicing must not inspect inherited events') },
+  })
+  events[40000] = freeze({ seq: 40000, ...call('own', 'subagent') })
+  events[40001] = freeze({ seq: 40001, ...result('own', false) })
+  Object.freeze(events)
+  const session = { inheritedEventCount: 40000, firstLiveSeq: 40002 }
+  const f = context.createFlowProjection()
+  for (let read = 0; read < 2; read++) {
+    const window = ownedSessionEvents(session, events)
+    assert.equal(window.valid, true)
+    assert.equal(window.events.length, 2)
+    assert.equal(window.events[0], events[40000])
+    assert.equal(window.events[0].seq, 40000)
+    assert.equal(f.read(window.events).inFlight, 1)
+  }
+  assert.equal(f.processedEvents, 2, 'only the owned suffix reaches the reducer')
+  const rootEvents = freeze([call('root', 'subagent')])
+  assert.equal(ownedSessionEvents({}, rootEvents).events, rootEvents, 'legacy root retains original history semantics')
+  assert.deepEqual(ownedSessionEvents({ inheritedEventCount: -1 }, events).events, [])
+  assert.equal(ownedSessionEvents({ inheritedEventCount: -1 }, events).valid, false)
+})
+
+test('owned flow replays mutable, accessor, replacement and truncated history', async () => {
+  const h = runtime(context)
+  const inherited = freeze(call('parent', 'subagent'))
+  const mutable = call('own', 'subagent')
+  const a = { session: { inheritedEventCount: 1, events: [inherited, mutable] } }
+  assert.match(decisionText(await h.pre(a)), /估计 1/)
+  mutable.data.name = 'read'
+  assert.deepEqual((await h.pre(a)).messages, [])
+  let current = freeze(call('replacement', 'subagent'))
+  const accessor = [inherited]
+  Object.defineProperty(accessor, 1, { get: () => current })
+  a.session.events = Object.freeze(accessor)
+  assert.match(decisionText(await h.pre(a)), /估计 1/)
+  current = freeze(call('replaced', 'read'))
+  assert.deepEqual((await h.pre(a)).messages, [])
+  a.session.events = freeze([inherited, call('new', 'subagent')])
+  assert.match(decisionText(await h.pre(a)), /估计 1/)
+  a.session.events = freeze([inherited])
+  assert.deepEqual((await h.pre(a)).messages, [])
+})

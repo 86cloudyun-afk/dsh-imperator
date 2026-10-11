@@ -15,6 +15,142 @@ const anchor = process.env.DSH_INSTALL_ANCHOR
 const native = async (name) => import(pathToFileURL(createRequire(anchor).resolve(name)).href)
 const options = { skip: !anchor && 'requires DSH_INSTALL_ANCHOR' }
 
+// Native Session + pure fork preparation with explicitly authorized hook scope.
+// No agent loop, model/provider request or actual delegation runs in this fixture.
+async function forkObservationFixture() {
+  const [{ Session }, { createToolResultMessage }, forkProvider, guard, context] = await Promise.all([
+    native('@deepseek-ai/dsh-session'), native('@deepseek-ai/dsh-llm'), native('@deepseek-ai/dsh-subagent-fork-in-process'),
+    import('../../lib/plugins/guard.mjs'), import('../../lib/plugins/working-context.mjs'),
+  ])
+  let provider
+  forkProvider.apply({ subagents: { registerProvider: value => { provider = value } } }, { providerName: 'fork' })
+  const childHeader = (id, parent, isSeeded) => ({ version: 4, id, createdAt: 0, isSeeded,
+    origin: 'subagent', parentSession: parent.id, delegationDepth: 1 })
+  const fork = async (parent, id) => {
+    const { seed } = await provider.prepareContinuable({ parent: { session: parent } })
+    return Session.create(id, seed, childHeader(id, parent, seed !== undefined), seed?.length ?? 0)
+  }
+  const hook = (apply, session, config) => {
+    const hooks = new Map()
+    apply({ preset: 'taskforce', on: (name, fn) => hooks.set(name, fn),
+      get: name => name === 'agentPresets' ? { composedPreset: scope => scope?.preset } : undefined,
+    }, config)
+    const agent = { session, ctx: { preset: 'taskforce' } }
+    return { agent, pre: () => hooks.get('agent/pre-step')({ agent, turn: 1, step: 1 },
+      async () => ({ kind: 'enter', messages: [] })) }
+  }
+  const calls = (session, prefix, count, { failure = false, unknown = false, offset = 0 } = {}) => {
+    for (let index = 1; index <= count; index++) {
+      const step = offset + index, callId = `${prefix}-${step}`
+      session.append('step/start', { turn: 1, step })
+      const call = session.append('tool/call', { turn: 1, step, callId,
+        name: failure ? 'read_counter' : 'subagent', arguments: '{}' })
+      session.append('tool/result', { turn: 1, step,
+        message: createToolResultMessage({ callId, isError: failure, content: [{ type: 'text', text: 'fixture receipt' }] }),
+        ...(unknown ? { error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' } } : {}),
+      }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+      session.append('step/end', { turn: 1, step })
+    }
+  }
+  const restore = session => Session.fromRestore(session.id, guard.sessionEvents(session), session.header,
+    session.inheritedEventCount, 'shared-frozen')
+  return { Session, guard, context, fork, hook, calls, restore, childHeader,
+    guardOptions: { stallAction: 'observe', stepDownRequests: 0 } }
+}
+
+test('native fork owned observation: completed prefix, dispatch append and restore', options, async () => {
+  const { Session, guard, context, fork, hook, calls, restore, childHeader } = await forkObservationFixture()
+  const text = value => value.messages.map(message => message.content[0].text).join('\n')
+  const parent = Session.create('owned-flow-parent')
+  const fresh = Session.create('owned-flow-fresh', undefined, childHeader('owned-flow-fresh', parent, false), 0)
+  for (const session of [parent, fresh]) {
+    assert.equal(session.inheritedEventCount, 0)
+    assert.deepEqual((await hook(context.apply, session).pre()).messages, [])
+  }
+  parent.append('turn/start', { turn: 1 })
+  assert.equal((await fork(parent, 'owned-no-prefix')).inheritedEventCount, 0)
+  calls(parent, 'parent', 2)
+  parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const completed = parent.seq
+  parent.append('turn/start', { turn: 2 })
+  parent.append('tool/call', { turn: 2, step: 1, callId: 'current-fork', name: 'subagent_fork', arguments: '{}' })
+  const child = await fork(parent, 'owned-flow-child')
+  assert.equal(child.inheritedEventCount, completed)
+  assert.equal(guard.sessionEvents(child)[completed].type, 'session/end-seed')
+  assert.equal(guard.sessionEvents(child).some(event => event.data?.callId === 'current-fork'), false)
+  const h = hook(context.apply, child)
+  assert.deepEqual((await h.pre()).messages, [], 'parent dispatches must not count as child activity')
+  child.append('turn/start', { turn: 1 })
+  calls(child, 'child', 1)
+  assert.match(text(await h.pre()), /未结算派发估计 1/)
+  const restored = restore(child)
+  assert.equal(restored.inheritedEventCount, completed)
+  assert.ok(restored.firstLiveSeq > restored.inheritedEventCount)
+  assert.match(text(await hook(context.apply, restored).pre()), /未结算派发估计 1/)
+})
+
+test('native fork owned observation: ECHO, own acknowledgment and unknown-effect barrier', options, async () => {
+  const { Session, guard, fork, hook, calls, restore, guardOptions } = await forkObservationFixture()
+  const parent = Session.create('owned-guard-parent')
+  parent.append('turn/start', { turn: 1 })
+  calls(parent, 'parent-failure', 6, { failure: true })
+  parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  assert.equal((await hook(guard.apply, restore(parent), guardOptions).pre()).messages[0]?.source.signal, 'echo',
+    'restored root retains its own failures')
+  const child = await fork(parent, 'owned-guard-child')
+  child.append('turn/start', { turn: 1 })
+  const h = hook(guard.apply, child, guardOptions)
+  assert.deepEqual((await h.pre()).messages, [], 'child with zero own calls has no inherited ECHO')
+  calls(child, 'own-failure', 6, { failure: true })
+  const warning = (await h.pre()).messages[0]
+  assert.equal(warning?.source.signal, 'echo')
+  assert.equal((await hook(guard.apply, restore(child), guardOptions).pre()).messages[0]?.source.signal, 'echo')
+  child.append('user/message', warning, { surfaceOp: 'append' })
+  assert.deepEqual((await hook(guard.apply, restore(child), guardOptions).pre()).messages, [], 'own persisted ACK survives restore')
+  const unknown = await fork(parent, 'owned-guard-unknown')
+  unknown.append('turn/start', { turn: 1 })
+  calls(unknown, 'before', 6, { failure: true })
+  calls(unknown, 'unknown', 1, { failure: true, unknown: true, offset: 6 })
+  calls(unknown, 'after', 4, { failure: true, offset: 7 })
+  assert.deepEqual((await hook(guard.apply, unknown, guardOptions).pre()).messages, [])
+})
+
+test('native fork owned observation: real SQLite excludes parent lifecycle and deduplicates restored child', options, async t => {
+  const [{ TaskforceStore }, { attachRecoveryLifecycle }, f] = await Promise.all([
+    import('../../lib/store/index.js'), import('../../lib/plugins/lifecycle.mjs'), forkObservationFixture(),
+  ])
+  const directory = await mkdtemp(join(tmpdir(), 'taskforce-native-owned-'))
+  const store = new TaskforceStore(directory)
+  t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }); await assert.rejects(access(directory), { code: 'ENOENT' }) })
+  const lifecycle = session => f.hook(ctx => attachRecoveryLifecycle(ctx, {
+    identity: () => ({ runId: 'owned-life-root' }), recovery: () => store.recovery,
+  }), session)
+  const rows = session => store.open().prepare("SELECT event_seq FROM lifecycle_event WHERE session_id=? AND source='session_event' ORDER BY id").all(session.id).map(row => row.event_seq)
+  const parent = f.Session.create('owned-life-root')
+  const fresh = f.Session.create('owned-life-fresh', undefined, f.childHeader('owned-life-fresh', parent, false), 0)
+  await lifecycle(parent).pre(); await lifecycle(fresh).pre()
+  assert.deepEqual(rows(parent), []); assert.deepEqual(rows(fresh), [])
+  parent.append('turn/start', { turn: 1 })
+  parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const child = await f.fork(parent, 'owned-life-child')
+  const start = child.append('turn/start', { turn: 1 })
+  const h = lifecycle(child)
+  await h.pre()
+  assert.deepEqual(rows(child), [start.seq], 'parent seq 0 and 1 must never be attributed to child')
+  const end = child.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await h.pre(); await h.pre()
+  const restored = f.restore(child)
+  await lifecycle(restored).pre()
+  assert.equal(restored.inheritedEventCount, 2)
+  assert.ok(restored.firstLiveSeq > end.seq)
+  assert.deepEqual(rows(child), [start.seq, end.seq])
+  await lifecycle(f.restore(parent)).pre()
+  assert.deepEqual(rows(parent), [0, 1])
+  assert.deepEqual([...store.recovery.observationGaps], [])
+  t.diagnostic(JSON.stringify({ host: installationVersion(anchor), inheritedCut: 2, childSeqs: rows(child),
+    firstLiveSeq: restored.firstLiveSeq, modelRequests: 0, fixtureScope: 'native Session and SQLite; explicit preset registry' }))
+})
+
 test('actual native immutable Session appends match full folds; mutable restored seeds replay', options, async () => {
   const [{ Session }, { createToolResultMessage }, projections, guard, flow] = await Promise.all([
     native('@deepseek-ai/dsh-session'), native('@deepseek-ai/dsh-llm'),

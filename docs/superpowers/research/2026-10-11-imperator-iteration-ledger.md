@@ -186,3 +186,20 @@ fresh SPEC `d9acbdeab2c3f329f7c24db2914efd7edca872ec3a31430e2ad84b216cdf90d6` �
 原四native文件在localCPU0,1串行四对照保存：Node22rc2/alpha整stage60sTIMEOUT，Node24两stage实际innerexit0/timedOutfalse；四个目标child均完成原assertions/success/exit，11.659/11.771/11.608/11.600s。Node24rc2外层60.012s含driver/import采集开销，不等于inner timeout。collector65s watchdog均未触发，已退出；所有源码、prep、运行时与SDK anchors重核，root随后补核53987SDK regularfiles及60771entry modes/links未改。此本地双核不等同CI硬件，不能说明原CI timeout是flake；整Node22 stage最后活跃case尚不明。completion seal `9ac282defb9d98e4cef41168601cb15729a79c447db74f9d114adad2d2e31882`。
 
 下一步 [第十五项TEXT读取设计](../specs/2026-10-11-sqlite-text-read-design.md)：十二处业务字段、先做准确22/24与三encoding/类型/碰撞机制验证，保留输入与旧数据，再真实RED/GREEN。第十六项另核身份read-to-compare/rebind，第十七项另核preflight fingerprint，第十八项处理native耗时；均仍待设计/实现审核。最新真实模型8237 FAILED不变，无重试、无新增paid、PR69draft未合并。预算/pin/skip/DDL/依赖/acceptance标准均未放宽。
+
+
+### 12:51 UTC：第十五项等宽修订与新原生阶段定位
+
+Task15 的初版六组合机制（准确 Node22.23.2/24.19.0 × UTF-8/UTF-16le/UTF-16be）已通过；实际编码拼写及存储 hex 已封存。真实公开 API 原始 RED 是 Node22 的语义截断/误接受/完整性检查缺失，Node24 保留语义控制；失败的测试 harness 尝试单独保留。初版修复的 Node22 目标 suite 最后实测 230/230 PASS、0 skip、exit0、8.687s，随后已按 root 指令 STOP。九文件未提交补丁保留，尚无 Node24 GREEN、全 source、实现 SPEC/QUALITY 或最终候选结论。
+
+root 在旧库扩展列上发现初版设计的遗漏。新的独立静态补充确认：满足现有 required-column 约束的合法 fact 表无需预留结果列余量。root 串行 public node:sqlite 实测两准确 binary 均 MAX_COLUMN=2000：原固定 F7 star 返回2000列，追加第2001结果列报 ERR_SQLITE_ERROR；等宽候选对九个普通/标记样式/JSON样式/NUL样本保持2000列、native keys/null prototype 并成功恢复。探针206工作树文件 bytes/modes 全部未变，provider0/SDKboot0；该结果不是公开 store 或四形六编码完成证明。
+
+root 采用新的受限四调用点修订：F5/F7/W4/W5 原查询只 prepare 取公开 columns() 元信息，固定工厂生成同列数投影，所有目标 TEXT 用 T/J 无歧义传输，native object 原地恢复；其余八处明确投影的 NUL-only companion 保持。原 <=4 legacy board、<=7 fresh-empty boardPage 上限不变；增加的准备次数与数据执行次数分别记录。生成 SQL 长度/编译/瞬时表示成本明确披露，不声称所有 SQLite 资源极限等价。新的 DESIGN SPEC 正在独立审查，未发恢复实施 GO；原 PASS 和所有失败/成功历史证据保留。
+
+新原生观测使用 frozen706 的外部派生副本，仅四处 test import 连接固定ID的直接 callback 时间记录；83顶层用例、646断言行、原 callback/hook/嵌套测试、四文件顺序/default reporter/default concurrency 和 60000ms/12000ms 上限均保留。观测额外 Promise/IO 的诊断扰动已明示。这次 Node22 rc2 CPU0,1 的原阶段再次 timedOut=true/exit1；collector60.101s结束、65s watchdog未触发。77个 callback body已结束（8 API、55边界、14runtime）；最后 runtime C015 于52.257s进入，在约7.8s后被阶段截断前未观察到结束；未观察到scheduler file-body进入。callback-end不是测试PASS或hook完成，实际 CI 旧超时的内部阶段仍未观测。
+
+源代码和安装SDK确认本 suite 若完成包含原有10s截止等待及两次5s故意挂起清理等待；累计预算耗尽已观测，死锁未证明，剩余启动成本不能单独归为编译。公开 Node 的阶段专属空编译缓存仅为候选性能假设：尚未执行/选定产品修复，不能增加上限、跳过用例或改变native状态隔离。观测初始temp-after曾出现一个新taskforce-host目录，稍后独立元信息检查已不存在，root未删除；后者不改写初始扫描，也不是全进程树静止证明。root已复核本次421文件seal、408副本源码 bytes/modes，以及SDK53987正规文件 bytes/modes、60771全部条目 modes/links 均未变。
+
+Task16 的等宽多字段与固定joined-star设计仍待独立审核/实施；root补充同一C-Q4withdraw读取的run_id，以防身份修复后将前缀写进scheduler_decision的JSON重放结果。Task17 的既有独立设计PASS已经root全文读取、17输入/4输出复核，R1正常控制保留task_event和R2只在独立克隆执行真实迁移的要求为规范义务；尚未实现或执行该公开preflight RED。准备证据的一个子代理被工具服务内容拦截，未生成/执行harness，由root接管；该服务失败不归因Imperator。
+
+新静态接受文本输出审计包含25个query/field记录（不是25个独立bug），确认任务说明、交接、审计归属、资源快照、恢复历史等还存在单独读取义务；root选择下一独立有界输出保真任务，未把原始SQL/nativehandle/不可能NUL文件路径或恢复已拒绝的输入纳入支持合同。该清单仅源预测，实际RED/GREEN尚待验证。最新8237真实模型FAILED保持不可变，无新增paid调用；PR69仍draft/未合并，后续完整候选/原生/模型/整版审核/实际PR CI/额外PR审核/预期head合并/实际main验证全部仍是门槛。

@@ -123,6 +123,19 @@ restore 时的 `firstLiveSeq` 代替：恢复后此前自己的失败、未知�
 与压缩后的补发，TODO 也保留原有继承语义，由下一条 `turn/start` 清空。不能把所有历史读取
 一律改为 owned 后缀，否则可见的父状态行会漏过替代判断。
 
+每步在下游 `next()` 返回后重新观察 run 身份，不缓存跨步的归属。当前及每个祖先 Agent
+都以 `header.delegationDepth` 与 `options.subagentDepth` 中有效的非负安全整数取最大值；
+非法值忽略，`-0` 按 0。`origin === 'subagent'` 或有效深度大于 0 才沿委派链上溯；
+普通零深度 fork 即使带 seed parent，也以自身 ID 为 run。非空白 ID 原样保留边界空白，
+长度上限为 200 个 JavaScript 字符串代码单元，不能 trim 后改选另一个域。
+
+上溯最多查找 32 次父节点，检查环及实际父 `header.id` 与 `parentSession` 精确相等，
+不从 `agent.id` 补身份。仅父 header 缺席/null 且当前遍历节点有效深度为 1 时保留离线
+父 run 的观察兼容；父身份畸形、不匹配、不可读或深层祖先缺失均使 store 投影不可用。
+当前可读 session 上的 header/ID getter 抛错也只降级观察；未知身份绝不查询 legacy 域，
+可见旧投影按原规则显式替代。此规则只用于可选读投影，不改变工具权限或 H01 的严格
+live-parent、深度预算、64-node 与 full-tree 能力限制。
+
 行形态（字段按可用性出现，空则整行不注入）：
 
 ```

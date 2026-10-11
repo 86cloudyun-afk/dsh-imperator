@@ -20,7 +20,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
   const fixture = await controlledProfile(anchor, root)
   const cleanup = () => fixture.dispose()
   process.once('exit', cleanup)
-  let application, requests = 0
+  let application, workingStore, requests = 0
   const handles = []
   try {
     const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
@@ -113,6 +113,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
       checkPrepared(fork.agent, fork.agent, 1)
       checkPrepared(forkChild.agent, fork.agent, 2)
     })
+    const runtimeAgents = new Map()
     for (const [label, headerDepth, runtimeDepth, expected] of [
       ['runtime-only-one', undefined, 1, 2],
       ['runtime-only-two', undefined, 2, null],
@@ -124,6 +125,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
       const runtime = await create({ sessionId: 'scheduler-' + label, parentAgent: parent.agent,
         meta: { cwd: fixture.root, parentSession: parent.agent.id, ...(headerDepth === undefined ? {} : { delegationDepth: headerDepth }) },
         agentOptions: { subagentDepth: runtimeDepth } })
+      runtimeAgents.set(label, runtime.agent)
       assert.equal(runtime.agent.session.header.delegationDepth, headerDepth)
       assert.equal(runtime.agent.options.subagentDepth, runtimeDepth)
       assert.equal(delegationDepthOf(runtime.agent), Math.max(headerDepth ?? 0, runtimeDepth))
@@ -142,6 +144,76 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
       assert.throws(() => prepare(new Proxy(fork.agent, {})), { code: 'E_SCHEDULER_CAPABILITY' })
     })
     assert.equal(requests, 0)
+    // Exercise the real projection on actual registered Agents/options/get.
+    // Hook registration, optional scope membership and next are controlled;
+    // this is not a native Agent loop or model turn. SQLite is an isolated store.
+    const [{ apply: applyWorkingContext }, { deriveIdentity }, { TaskforceStore }] = await Promise.all([
+      import('../../lib/plugins/working-context.mjs'), import('../../lib/tools/index.js'), import('../../lib/store/index.js'),
+    ])
+    const runtimeGrandchild = await create({ sessionId: 'scheduler-runtime-grandchild',
+      parentAgent: runtimeAgents.get('runtime-only-one'), meta: { cwd: fixture.root,
+        parentSession: runtimeAgents.get('runtime-only-one').id, origin: 'subagent', delegationDepth: 2 } })
+    const paddedRoot = await create({ sessionId: ' scheduler-root ', meta: { cwd: fixture.root } })
+    const paddedChild = await create({ sessionId: ' scheduler-padded-child ', parentAgent: paddedRoot.agent,
+      meta: { cwd: fixture.root, parentSession: paddedRoot.agent.id }, agentOptions: { subagentDepth: 1 } })
+    assert.equal(paddedRoot.agent.session.header.id, ' scheduler-root ')
+    assert.equal(paddedChild.agent.session.header.id, ' scheduler-padded-child ')
+    assert.equal(paddedChild.agent.options.subagentDepth, 1)
+    assert.equal(paddedChild.agent.session.header.delegationDepth, undefined)
+    workingStore = new TaskforceStore(join(fixture.root, 'context-store'))
+    const domains = new Map(), contextRuns = []
+    for (const run of [undefined, parent.agent.id, fork.agent.id, child.agent.id, forkChild.agent.id,
+      ...[...runtimeAgents.values()].map(agent => agent.id), runtimeGrandchild.agent.id,
+      paddedRoot.agent.id, paddedChild.agent.id, paddedChild.agent.id.trim()]) {
+      const title = 'NATIVE_CONTEXT_SCOPE_' + domains.size + '_TASK'
+      const task = workingStore.openTask({ title }, run)
+      const count = domains.size + 1
+      for (let index = 0; index < count; index++) {
+        workingStore.recordFact({ task_id: task.task_id, statement: 'private native fact ' + index }, run)
+      }
+      domains.set(run, { title, count })
+    }
+    const db = workingStore.open(), changes = () => db.prepare('SELECT total_changes() AS n').get().n
+    const workingState = workingStore.workingState.bind(workingStore)
+    workingStore.workingState = run => { contextRuns.push(run); return workingState(run) }
+    const contextHooks = new Map()
+    applyWorkingContext({ on: (name, fn) => contextHooks.set(name, fn),
+      get: name => name === 'agents' ? agents : name === 'taskforceStore' ? workingStore : undefined })
+    const checkContext = async (agent, run) => {
+      assert.equal(agents.get(agent.id), agent, 'actual registered Agent, not a header/options copy')
+      assert.equal(deriveIdentity(agent, agents).runId, run, 'uncached real tool identity')
+      contextRuns.length = 0
+      const before = changes()
+      const result = await contextHooks.get('agent/pre-step')({ agent }, async () => ({ kind: 'enter', messages: [] }))
+      assert.equal(changes(), before, 'native projection reads must not write SQLite')
+      assert.deepEqual(contextRuns, [run], 'native projection must select the exact tool run')
+      const output = result.messages.flatMap(message => message.content ?? []).map(block => block.text ?? '').join('\n')
+      for (const [domain, expected] of domains) {
+        if (domain === run) {
+          assert.ok(output.includes(expected.title), 'missing task for native run ' + JSON.stringify(run))
+          assert.ok(output.includes('事实 ' + expected.count + ' 条'), 'incorrect native fact count')
+        } else assert.ok(!output.includes(expected.title), 'other native/legacy domain must stay isolated')
+      }
+    }
+    for (const [label, agent, run] of [
+      ['ordinary root', parent.agent, parent.agent.id],
+      ['ordinary fork with offline seed', fork.agent, fork.agent.id],
+      ['durable child', child.agent, parent.agent.id],
+      ['child of ordinary fork', forkChild.agent, fork.agent.id],
+      ...[...runtimeAgents].map(([label, agent]) => [label, agent, parent.agent.id]),
+      ['runtime-only ancestor', runtimeGrandchild.agent, parent.agent.id],
+      ['exact padded root', paddedRoot.agent, paddedRoot.agent.id],
+      ['exact padded child and live parent', paddedChild.agent, paddedRoot.agent.id],
+    ]) {
+      await t.test('working context with actual native Agent: ' + label, () => checkContext(agent, run))
+    }
+    await paddedRoot.dispose()
+    assert.equal(agents.get(paddedRoot.agent.id), undefined)
+    await t.test('working context exact padded offline depth-one parent', () => checkContext(paddedChild.agent, paddedRoot.agent.id))
+    assert.equal(requests, 0)
+    console.log('WORKING_CONTEXT_NATIVE_OBSERVED ' + JSON.stringify({ version, exact_live_agents: true,
+      runtime_only_ancestor: true, exact_padded_ids: true, controlled_hook_scope_and_next: true,
+      real_sqlite: true, projection_writes: 0, native_agent_loop: false, model_requests: requests }))
     assert.equal(helpers.nativeSchedulerCapabilities({ version, native_enabled: true }).native_enabled, false)
     assert.ok(helpers.nativeSchedulerCapabilities({ version }).capabilities.every(capability => capability.enabled === false))
     console.log('SCHEDULER_IDENTITY_MATRIX_OBSERVED ' + JSON.stringify({ version, exact_live_agents: true,
@@ -168,7 +240,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
       remaining = application?.ctx.get('agents').list().length
       assert.equal(remaining, 0)
     } finally {
-      try { await application?.shutdown.shutdown(1); shutdown = true }
+      try { workingStore?.close(); await application?.shutdown.shutdown(1); shutdown = true }
       finally {
         process.off('exit', cleanup)
         fixture.dispose()

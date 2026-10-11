@@ -99,7 +99,7 @@ ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”
 
 ## 0.3 不可变历史增量投影
 
-`createEventCursor().read(events)` 返回 `{ reset, events }`；后者是需要重放的全量历史或新增尾部。只有深冻结的 JSON 事件图可以缓存，验证过的不可变对象用 WeakSet 记忆。普通可变数组可以承载不可变事件，但数组引用相同、长度相同、末尾 seq/callId 相同均不构成追加证明：每次逐项比较整个旧前缀的事件引用；中段替换、重排、缩短或非深冻结输入都全量重放。存在 seq 时要求连续；无 seq 的兼容 JSON 历史仍按完整引用前缀判断。访问器、稀疏数组、循环或非 JSON 对象不能进入快速路径。
+`createEventCursor().read(events)` 返回 `{ reset, events }`；后者是需要重放的全量历史或新增尾部。只有深冻结的 JSON 事件图可以缓存，验证过的不可变对象用 WeakSet 记忆。对不同或未认证的容器，仍沿用完整前缀验证与原有 reset / 提前退出规则。只有紧邻的上次成功读取已认证的深冻结稠密数组，本次通过迭代安全检查后，才可用单个可选 WeakRef 复用其相等证明，省去旧前缀引用比较；提示丢失或操作失败时回到原扫描。普通可变数组可以承载不可变事件，但数组引用相同、长度相同、末尾 seq/callId 相同均不构成追加证明；中段替换、重排、缩短或非深冻结输入都全量重放。存在 seq 时要求连续；无 seq 的兼容 JSON 历史仍按完整引用前缀判断。访问器、稀疏数组、循环或非 JSON 对象不能进入快速路径。增量结果的尾部数组每次重新创建，reducer append / snapshot 与原错误、处理计数顺序保持不变。
 
 `createGuardProjection(options).read(events)` 与 `createFlowProjection(delegationTools, settlement).read(events)` 复用纯函数 `foldGuardSignals` / `foldSubagentFlow` 的 append/snapshot reducer，并保持返回形状。`processedEvents` 是累计传入 reducer 的事件数（包含 reset 重放），不是总操作数。冻结 40000 条事件初读处理 40000 条，原历史重读不增加，追加一条后为 40001；结果与全量 fold 相同。阈值或工具集合变化会使该 projection 重新回放；settlement 是创建时固定的值，变更时创建新 projection。
 
@@ -107,7 +107,7 @@ ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”
 
 工具扫描保留 turn/step cursor，以及 native/PTC 命名空间、原始结果坐标、重复与乱序结果、通知 ID 和 ECHO 确认位置。后到的真实 PTC dispatch 可以回溯标记 run_code wrapper。snapshot 不提交未关闭的当前推理步；因此重复读取不会累计虚假的 STALL。仍使用 STALL observe、`stepDownRequests: 0`，store 与工具权限边界不变。
 
-成本边界：每次仍有 O(n) 前缀引用比较及引用数组复制；首次或新增对象的深冻结认证与 JSON 图大小相关。guard snapshot 仍扫描失败调用尾部，最坏 O(调用数)；todo 和可见 context 去重仍读取相应历史，surface compaction 会重新判断可见性。缓存保留事件引用与调用/通知元数据，空间随历史增长。这里只减少可信不可变历史的重复 reducer 处理，不承诺完整 pre-step 为 O(新增事件)，也不把处理计数当作真实模型延迟或成本测量。
+成本边界：不同或未认证输入最坏仍有 O(n) 前缀引用比较；同一个已认证冻结容器的紧邻重复读取只可省去该次比较。已有引用前缀继续保留，新增尾部引用追加其中，reset 时重建；首次或新增对象的深冻结认证与 JSON 图大小相关。guard snapshot 仍扫描失败调用尾部，最坏 O(调用数)；todo 和可见 context 去重仍读取相应历史，surface compaction 会重新判断可见性。缓存保留事件引用与调用/通知元数据，空间随历史增长；可选弱提示不强持有调用者的外层数组，也不承诺 GC 时机。这里只减少可信不可变历史的重复 reducer 处理和特定同容器的前缀比较，不承诺完整 pre-step 为 O(新增事件)，也不把处理计数当作真实模型延迟或成本测量。
 
 ## 0.3 低风险短流程与固定模型回归
 

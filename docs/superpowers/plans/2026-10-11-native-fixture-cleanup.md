@@ -18,8 +18,8 @@
 
 - once wrappers、重复注册、启动后 sentinel 均保留；引用差集支持重复数。
 - 竞争controlledProfile创建在环境/目录变更前拒绝，token覆盖整个fixture lifetime，旧dispose不可覆盖后续fixture；每fixture一次boot，失败启动也捕获，异常基数不猜测清理。
-- 捕获诊断失败不能丢失返回应用的 teardown 路径；原有 rejected/hanging cleanup 非零闸不被吞掉。
-- 应用shutdown/flush/dispose时监听器仍有效；cleanup timeout保留非零升级，Promise未settled不声称恢复成功，回调保留到实际teardown结算或进程退出。所有callers以nested finally保留exit hook/exitCode及原setup/cleanup失败。
+- 捕获诊断失败不能丢失返回应用的 teardown 路径；原有 rejected/hanging cleanup 非零闸不被吞掉。paid harness 补齐 forced-native-exit 的同步临时 home 清理 hook，正常和异常分支移除；保留两个 10000ms bounds。scheduler SQLite close 抛错仍由 finally 尝试实际 app shutdown。
+- 应用shutdown/flush/dispose时监听器仍有效；cleanup timeout保留非零升级，Promise未settled不声称恢复成功，paid 两段分别跟踪实际 teardown Promise（后一段完成不代表前段 settled），回调保留到全部实际 teardown 结算或进程退出。所有callers以nested finally保留exit hook/exitCode及原setup/cleanup失败。
 
 ### Task 1: 隔离 boot 范围与所有调用方
 
@@ -31,7 +31,7 @@
 - Consumes: actual `runProfile`、process rawListeners、既有 application teardown。
 - Produces: `controlledProfile(...).runProfile(options)` 实际应用；内部 boot scope 捕获并清理自己的回调，fixture.dispose 仍恢复环境/临时目录。
 
-- [ ] **Step 1: RED** — test-only 原生teardown回调增长、失败启动、fixture创建await时竞争、旧dispose重放、成功app+异常基数可teardown、setup/teardown错误加fixture诊断仍保留原错误，以及baseline/once/重复/sentinel控制；使用现有代码路径先复现，不让缺失 helper/import 错误成为唯一 RED。
+- [ ] **Step 1: RED** — test-only 原生teardown回调增长、失败启动、fixture创建await时竞争、旧dispose重放、成功app+异常基数可teardown、setup/teardown错误加fixture诊断仍保留原错误、paid forced-exit 删除 home 且不输出成功、scheduler close 抛错仍尝试 shutdown，以及baseline/once/重复/sentinel控制；使用现有代码路径先复现，不让缺失 helper/import 错误成为唯一 RED。
 - [ ] **Step 2: Observe RED** — 保存真实重复启动两 pins 的有界失败与未改 production 源码证明。
 - [ ] **Step 3: Implement** — 集中实际 boot wrapper、独占闸和引用/重复数捕获；逐一迁移启动与nested-finally清理调用方；正常应用清理后才释放，timeout保留至settlement/exit，异常诊断固定且不掩盖原始失败。
 - [ ] **Step 4: GREEN** — 定向 unit、两 pins 各 12 实际 boot/teardown、existing failure/hang cleanup 与 scheduler native；保留无请求/stream 证明和临时目录清理；最后 sole `npm test`。

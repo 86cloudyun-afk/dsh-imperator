@@ -13,3 +13,7 @@
 调用方涉及 verify-model、verify-host、verify-isolation 和 scheduler-native 测试。无新依赖、schema、包名或 runtime 组件；Node `^22.23.2 || ^24.19.0`、宿主 `0.2.0-rc.2` / `0.2.1-alpha.2`、60000ms 子进程验收与 12000ms 原生清理闸不变，full-tree adapter 关闭。
 
 验收先记录原生重复启动和错误启动的实际 RED，再验证每次 teardown 后四事件的原始引用/重复数回到基线，两 pins 各 12 次启动无监听器增长、请求/stream 调用为零，外部 sentinel 和 once wrappers 保留。特别覆盖fixture创建期间await边界竞争、旧dispose在下一fixture存活时重放、成功app+异常基数仍teardown、native teardown拒绝+fixture诊断保留两者、setup错误+fixture诊断保留原错误并完成所属清理。保留故意失败样本，不把 SDK 自身被修改或生产稳定性作为结果。
+
+调用方预检补充：createNativeHarness 当前没有 emergency exit hook；迁移时在 fixture 存活期登记同步临时 home 清理，以覆盖 native shutdown 的 process.exit（会跳过 Promise finally）。该退出清理不能提前释放仍在 teardown 中的 fatal/signal callbacks，普通结束、setup/teardown/fixture 诊断均以 nested finally 移除自己的 exit hook、恢复 exitCode；保留失败退出及两个 10000ms paid cleanup bounds。用独立有界子进程的实际 native reject/hang 路径证明 home 已删除且不能输出成功标记，不投入模型请求。scheduler-native 的 workingStore.close() 即使抛错也必须在 finally 尝试实际 application.shutdown，之后才做 fixture 所属清理，原 close 错误与次级 shutdown/fixture 错误都保留。
+
+paid cleanup 两次 deadline race 必须分别保留其原始 handle-dispose / app-shutdown Promise 的实际结算状态；第二段完成不能证明第一段超时后仍未 settled 的清理已结束。监听器释放必须等待全部已启动的实际 teardown settled，或由已选择失败的进程退出路径结束；不得用 race 包装器完成替代原始 Promise。

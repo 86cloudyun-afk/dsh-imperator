@@ -953,3 +953,142 @@ test('scheduler historical settled replay preserves the newer admission through 
   assert.equal(JSON.stringify(restored.state({}, run, lead)), queue)
   assert.equal(durableSchedulingRows(reopened), rows)
 })
+
+// Task19 P6: fresh post16 closure; inherited Node24 Q1 fixtures remain separate.
+for (const [position, fullRun, owner] of [
+  ['leading', '\u0000run', '\u0000worker'],
+  ['middle', 'run\u0000tail', 'worker\u0000tail'],
+  ['trailing', 'run\u0000', 'worker\u0000'],
+  ['literal-T', 'Trun', 'Tworker'],
+  ['literal-J', 'J"run"', 'J"worker"'],
+  ['literal-JSON', '{"run":true}', '{"worker":true}'],
+  ['literal-backslash', 'run\\u0000tail', 'worker\\u0000tail'],
+  ['Unicode', '运行🔑', '工作人员🔑'],
+]) for (const scopeKind of ['safe-run', 'full-run']) {
+  test('Task19 scheduler view preserves session and new request run: ' + position + '/' + scopeKind, t => {
+    const { store, scheduler: s } = setup(t)
+    const scope = scopeKind === 'safe-run' ? run : fullRun
+    const actor = { role: 'worker', sessionId: owner }
+    const args = input(task(store, owner, scope))
+    const queued = s.enqueue(args, scope, actor)
+    const checkQueueStorage = source => {
+      const stored = source.open().prepare('SELECT json_quote(run_id) AS run, typeof(run_id) AS run_type, json_quote(owner_session) AS owner, typeof(owner_session) AS owner_type FROM scheduler_request WHERE request_id = ?').get(queued.request_id)
+      assert.deepEqual([JSON.parse(stored.run), stored.run_type, JSON.parse(stored.owner), stored.owner_type],
+        [scope, 'text', owner, 'text'])
+    }
+    checkQueueStorage(store)
+    assert.equal(queued.run_id, scope)
+    assert.equal(queued.session_id, null)
+    assert.equal(queued.reservation_id, null)
+    assert.equal(queued.generation, 0)
+    assert.equal(queued.state, 'queued')
+    assert.deepEqual(s.enqueue(args, scope, actor), queued)
+    const admitted = s.admitNext({ request_key: 'admit' }, scope, lead)
+    assert.equal(admitted.status, 'admitted')
+    assert.equal(admitted.request.run_id, scope)
+    assert.equal(admitted.request.session_id, null)
+    assert.equal(admitted.request.generation, 1)
+    const bound = s.bind(ref(admitted.request, { session_id: owner }), scope, actor)
+    const checkSessionStorage = source => {
+      const stored = source.open().prepare('SELECT json_quote(session_id) AS session, typeof(session_id) AS session_type FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?').get(bound.reservation_id, scope, queued.task_id)
+      assert.deepEqual([JSON.parse(stored.session), stored.session_type], [owner, 'text'])
+    }
+    checkSessionStorage(store)
+    assert.equal(bound.run_id, scope)
+    assert.equal(bound.session_id, owner)
+    assert.equal(bound.state, 'running')
+    const check = (scheduler, source) => {
+      checkQueueStorage(source)
+      checkSessionStorage(source)
+      assert.deepEqual(scheduler.enqueue(args, scope, actor), bound)
+      for (const authority of [lead, actor]) {
+        const page = scheduler.state({}, scope, authority)
+        assert.equal(page.run_id, scope)
+        assert.deepEqual(page.requests, [bound])
+        assert.equal(page.has_more, false)
+        assert.equal(page.next_after, null)
+        assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 65536)
+      }
+      const prefix = owner.split('\u0000')[0]
+      const other = prefix && prefix !== owner ? prefix : 'different-worker'
+      assert.deepEqual(scheduler.state({}, scope, { role: 'worker', sessionId: other }).requests, [])
+      assert.deepEqual(scheduler.admitNext({ request_key: 'admit' }, scope, lead), { ...admitted, replay: true })
+    }
+    check(s, store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try {
+      const restored = new module.TaskforceScheduler(reopened)
+      check(restored, reopened)
+      const before = reopened.open().prepare('SELECT total_changes() AS n').get().n
+      check(restored, reopened)
+      assert.equal(reopened.open().prepare('SELECT total_changes() AS n').get().n, before)
+      const unknown = restored.markUnknown(ref(bound, { reason: 'delivery unknown' }), scope, actor)
+      assert.equal(unknown.run_id, scope)
+      assert.equal(unknown.session_id, owner)
+      assert.equal(unknown.state, 'unknown')
+      assert.deepEqual(restored.state({}, scope, actor).requests, [unknown])
+      assert.deepEqual(restored.enqueue(args, scope, actor), unknown)
+    } finally { reopened.close() }
+  })
+}
+
+test('Task19 restored long NUL governor session drives the original scheduler byte refusal', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const owner = 's\u0000' + 'x'.repeat(70000)
+  const args = input(task(store, owner))
+  const queued = s.enqueue(args, run, lead)
+  const admitted = admit(s).request
+  assert.equal(admitted.request_id, queued.request_id)
+  // The public governor accepts this identity; scheduler.bind retains its own 512-byte bound.
+  g.bind({ reservation_id: admitted.reservation_id, generation: admitted.generation, session_id: owner }, run, lead)
+  const check = (scheduler, source) => {
+    const stored = source.open().prepare('SELECT json_quote(session_id) AS session, typeof(session_id) AS session_type FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?').get(admitted.reservation_id, run, queued.task_id)
+    assert.deepEqual([JSON.parse(stored.session), stored.session_type], [owner, 'text'])
+    assert.throws(() => scheduler.state({}, run, lead), error =>
+      error.code === 'E_SCHEDULER_CONFLICT' && error.message === 'scheduler state item exceeds response byte limit')
+  }
+  check(s, store)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  try {
+    const restored = new module.TaskforceScheduler(reopened)
+    check(restored, reopened)
+    const before = reopened.open().prepare('SELECT total_changes() AS n').get().n
+    check(restored, reopened)
+    assert.equal(reopened.open().prepare('SELECT total_changes() AS n').get().n, before)
+  } finally { reopened.close() }
+})
+
+// Q3 stays Task16-owned: assert its durable closure without another product decoder.
+test('Task19 delegated withdrawal closure preserves full run after reopen without duplicate writes', t => {
+  const { store, scheduler: s } = setup(t), scope = 'task19-withdraw\0full', owner = 'worker\0full'
+  const actor = { role: 'worker', sessionId: owner }
+  const queued = s.enqueue(input(task(store, owner, scope)), scope, lead)
+  const args = { request_id: queued.request_id, request_key: 'task19-withdraw' }
+  const first = s.withdraw(args, scope, actor)
+  assert.equal(first.status, 'withdrawn'); assert.equal(first.request.run_id, scope)
+  assert.equal(first.request.request_id, queued.request_id)
+  function check(db) {
+    const rows = db.prepare('SELECT json_quote(result) AS result_json, typeof(result) AS result_type'
+      + ' FROM scheduler_decision WHERE run_id=? AND request_key=?').all(scope, args.request_key)
+    assert.equal(rows.length, 1); assert.equal(rows[0].result_type, 'text')
+    const wrapper = JSON.parse(JSON.parse(rows[0].result_json))
+    assert.equal(wrapper.action, 'withdraw'); assert.equal(wrapper.result.request.run_id, scope)
+    assert.equal(wrapper.result.request.request_id, queued.request_id)
+  }
+  check(store.open())
+  const before = store.open().prepare('SELECT total_changes() AS n').get().n
+  assert.deepEqual(s.withdraw(args, scope, actor), { ...first, replay: true })
+  assert.equal(store.open().prepare('SELECT total_changes() AS n').get().n, before)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  try {
+    const restored = new module.TaskforceScheduler(reopened)
+    restored.state({}, scope, lead)
+    const db = reopened.open(), before = db.prepare('SELECT total_changes() AS n').get().n
+    assert.deepEqual(restored.withdraw(args, scope, actor), { ...first, replay: true })
+    check(db)
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+  } finally { reopened.close() }
+})

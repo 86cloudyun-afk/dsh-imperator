@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
+import { types } from 'node:util'
 import { controlledProfile, nativeModule, resolveInstallAnchor, installationVersion } from './host-runtime.mjs'
 import { MODEL_STAGES, STRICT_COMMAND, STRICT_FILES, writeModelFixture, gradeMoney } from './model-fixtures.mjs'
 import { strictExecutionEvidence } from '../lib/store/execution.js'
@@ -216,6 +217,39 @@ function safeSnapshot(harness) {
   return structuredClone(result)
 }
 
+const settlementPhases = new Set(['not-started', 'waiting-idle', 'waiting-notices', 'checking-stability', 'settled'])
+const settlementCounters = ['trackedAgents', 'idleAgents', 'runningAgents', 'unknownAgents', 'pendingIdleWaits',
+  'requiredNotices', 'deliveredNotices', 'missingNotices']
+// Diagnostics are synchronous, optional and strictly primitive. Never invoke a
+// foreign thenable or getter, await a snapshot, or serialize arbitrary keys.
+function discardDiagnosticPromise(value) {
+  if (!types.isPromise(value)) return false
+  Promise.prototype.then.call(value, () => {}, () => {})
+  return true
+}
+function projectSettlement(value) {
+  try {
+    if (discardDiagnosticPromise(value)) {
+      // A mistaken async hook must not create an unhandled rejection. Use the
+      // native method, not an untrusted .then, and never substitute this Promise.
+      return null
+    }
+    if (!value || typeof value !== 'object' || 'then' in value) return null
+    const keys = Reflect.ownKeys(value)
+    if (keys.length !== settlementCounters.length + 1 || keys.some(key => key !== 'phase' && !settlementCounters.includes(key))) return null
+    const fields = Object.getOwnPropertyDescriptors(value)
+    if (!settlementPhases.has(fields.phase?.value) || settlementCounters.some(key => !count(fields[key]?.value))) return null
+    return { phase: fields.phase.value, ...Object.fromEntries(settlementCounters.map(key => [key, fields[key].value])) }
+  } catch { return null }
+}
+function settlementProgress(harness, lastRequestElapsedMs) {
+  let settlement = null
+  try {
+    if (typeof harness?.settlementSnapshot === 'function') settlement = projectSettlement(harness.settlementSnapshot())
+  } catch { /* diagnostics never change a stage's outcome or cancellation */ }
+  return { lastRequestElapsedMs, settlement }
+}
+
 /** The optional second argument is an offline harness dependency seam, never a CLI option. */
 export async function runModelVerification(options = {}, { createHarness = createNativeHarness } = {}) {
   const config = validate(options)
@@ -223,6 +257,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
   const requests = new Set()
   let harness, stopped = false, capHit = false, runtimeStopped = false, workerId
   let stageRecord, stageStart, stageRequestStart = 0, stageUsageStart, stageBefore, stagePreviousRequests
+  let lastRequestElapsedMs = null
   const report = { ok: false, provenance: {
     packageVersion: JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version,
     gitCommit: null, sourceSha256: productFingerprint(), packageSha256: config.packageSha256 ?? null,
@@ -249,12 +284,14 @@ export async function runModelVerification(options = {}, { createHarness = creat
     const key = `${agentId}:${turn}:${step}`
     if (requests.has(key)) { stopped = true; fail('duplicate-request') }
     requests.add(key)
+    if (stageRecord) lastRequestElapsedMs = Math.max(0, Date.now() - stageStart)
   }
   function recordObservation(after) {
     const total = accounting(after, requests, config)
     report.usage = total.usage
     report.runtimeDiagnostics = total.runtimeDiagnostics
     if (!stageRecord) return { total }
+    stageRecord.progress = settlementProgress(harness, lastRequestElapsedMs)
     const workers = after.sessions.filter(s => s.id !== harness.rootId)
     const newWorkers = workers.filter(s => !stageBefore.sessions.some(old => old.id === s.id)).length
     const newTasks = after.tasks.filter(t => !stageBefore.tasks.some(old => old.id === t.id))
@@ -289,9 +326,14 @@ export async function runModelVerification(options = {}, { createHarness = creat
       stageStart = Date.now()
       stageRequestStart = beforeRequests
       stageUsageStart = beforeUsage
-      stageRecord = { name: stage.name, ok: false, requests: 0, usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, newWorkers: 0, reuse: 0, rework: 0, facts: 0, accepted: 0, independentChecks: 0, strictVerified: false }
+      lastRequestElapsedMs = null
+      stageRecord = { name: stage.name, ok: false, requests: 0, usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, newWorkers: 0, reuse: 0, rework: 0, facts: 0, accepted: 0, independentChecks: 0, strictVerified: false, progress: settlementProgress(harness, lastRequestElapsedMs), timeoutProgress: null }
       report.stages.push(stageRecord)
-      await deadline(() => harness.runStage(stage), config.stageTimeoutMs, () => { stopped = true; harness.cancel() })
+      await deadline(() => harness.runStage(stage), config.stageTimeoutMs, () => {
+        // Capture a fresh primitive copy before cancellation mutates native state.
+        try { stageRecord.timeoutProgress = settlementProgress(harness, lastRequestElapsedMs) }
+        finally { stopped = true; harness.cancel() }
+      })
       const after = safeSnapshot(harness)
       const { total, workers, newWorkers, newTasks, reuse } = recordObservation(after)
       if (capHit) fail('request-cap')
@@ -329,6 +371,7 @@ export async function runModelVerification(options = {}, { createHarness = creat
       try { finalSnapshot = safeSnapshot(harness); recordObservation(finalSnapshot) } catch { /* retain last confirmed counters */ }
     }
     if (stageRecord) {
+      stageRecord.progress = settlementProgress(harness, lastRequestElapsedMs)
       stageRecord.requests = requests.size - stageRequestStart
       stageRecord.durationMs = Date.now() - stageStart
       stageRecord.usage = Object.fromEntries(usageKeys.map(key => [key, report.usage[key] - stageUsageStart[key]]))
@@ -374,12 +417,55 @@ function settlementCounts(sessions) {
   return counts
 }
 
+function nativeSettlementSnapshot({ tracked, rootId, activationCounts, beforeCounts, beforeNotices }, state) {
+  try {
+    const agents = [...tracked.values()], sessions = nativeSessions(tracked), notices = settlementCounts(sessions)
+    const result = { phase: state.phase, trackedAgents: agents.length, idleAgents: 0, runningAgents: 0, unknownAgents: 0,
+      pendingIdleWaits: state.pending.size, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0 }
+    for (const agent of agents) {
+      const status = agent.status
+      result[status === 'idle' ? 'idleAgents' : status === 'running' ? 'runningAgents' : 'unknownAgents']++
+    }
+    for (const child of sessions.filter(session => session.id !== rootId)) {
+      const needed = Math.max(0, (activationCounts.get(child.id) ?? 0) - (beforeCounts.get(child.id) ?? 0))
+      const key = JSON.stringify([child.parent, child.id])
+      const delivered = sessions.some(session => session.id === child.parent)
+        ? Math.min(needed, Math.max(0, (notices.get(key) ?? 0) - (beforeNotices.get(key) ?? 0))) : 0
+      result.requiredNotices += needed
+      result.deliveredNotices += delivered
+      result.missingNotices += needed - delivered
+    }
+    return projectSettlement(result)
+  } catch { return null }
+}
+
 /** Wait through native asynchronous flush/dispose and the parent's resulting turn.
  * Each newly created activation requires its own delivered notice, including
  * cold reuse of an existing session id and every depth of the descendant tree. */
-export async function waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed }) {
+export async function waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed, observe }) {
+  const state = { phase: 'not-started', pending: new Set() }
+  const read = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, beforeCounts, beforeNotices }, state)
+  const publish = () => { try { discardDiagnosticPromise(observe?.(read)) } catch { /* observation cannot affect waiting */ } }
+  const phase = value => { state.phase = value; publish() }
+  publish()
   while (!isDisposed()) {
-    await Promise.all([...tracked.values()].map(agent => agent.whenIdle()))
+    state.phase = 'waiting-idle'
+    const cohort = new Set()
+    state.pending = cohort
+    await Promise.all([...tracked.values()].map(agent => {
+      const original = agent.whenIdle()
+      try {
+        const token = {}
+        cohort.add(token)
+        const finished = () => {
+          try { cohort.delete(token); if (state.pending === cohort) publish() } catch { /* side observation only */ }
+        }
+        Promise.prototype.then.call(original, finished, finished)
+        publish()
+      } catch { /* preserve the exact native Promise and Promise.all outcome */ }
+      return original
+    }))
+    phase('waiting-notices')
     await tick()
     const sessions = nativeSessions(tracked)
     const notices = settlementCounts(sessions)
@@ -391,9 +477,10 @@ export async function waitForNativeSettlement({ tracked, rootId, activationCount
     })
     if (delivered && [...tracked.values()].every(agent => agent.status === 'idle')) {
       const positions = new Map(sessions.map(s => [s.id, s.events.length]))
+      phase('checking-stability')
       await tick()
       if ([...tracked.values()].every(agent => agent.status === 'idle') && tracked.size === positions.size
-        && nativeSessions(tracked).every(s => s.events.length === positions.get(s.id))) return
+        && nativeSessions(tracked).every(s => s.events.length === positions.get(s.id))) { phase('settled'); return }
     }
   }
   fail('unsettled-tree')
@@ -574,12 +661,13 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     // live object; its durable session history contains prior usage and notices.
     const sessions = () => nativeSessions(tracked)
     let settled = true
+    let settlementSnapshot = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, beforeCounts: new Map(activationCounts), beforeNotices: settlementCounts(sessions()) }, { phase: 'not-started', pending: new Set() })
     async function runStage(stage) {
       settled = false
       const beforeNotices = settlementCounts(sessions())
       const beforeCounts = new Map(activationCounts)
       handle.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: stage.prompt }] }))
-      await waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed: () => disposed })
+      await waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
       settled = true
     }
 
@@ -588,7 +676,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
       const tasks = observeModelTasks(store, rootId, workspace)
       return { sessions: sessions(), tasks, settled, streamAccounting: boundary.snapshot() }
     }
-    return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, streamSnapshot: boundary.snapshot, cancel, dispose }
+    return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, settlementSnapshot: () => settlementSnapshot(), streamSnapshot: boundary.snapshot, cancel, dispose }
   } catch (error) {
     try { await dispose() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'native setup and cleanup failed') }
     throw error

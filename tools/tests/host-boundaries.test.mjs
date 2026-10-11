@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, access, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { TASKFORCE_DEFINITION } from '../../lib/preset.js'
@@ -1356,3 +1356,198 @@ for (const action of ['send', 'stop']) {
     })
   }
 }
+
+const nativeGate = () => Promise.withResolvers()
+async function nativeCondition(predicate) {
+  const end = Date.now() + 5000
+  while (!predicate()) {
+    assert.ok(Date.now() < end, 'native lifecycle condition did not arrive')
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+}
+function signalGate(signal, gate) {
+  return new Promise((resolve, reject) => {
+    const aborted = () => { signal.removeEventListener('abort', aborted); reject(signal.reason) }
+    if (signal.aborted) return aborted()
+    signal.addEventListener('abort', aborted, { once: true })
+    gate.then(value => { signal.removeEventListener('abort', aborted); resolve(value) }, error => { signal.removeEventListener('abort', aborted); reject(error) })
+  })
+}
+
+test('native settlement diagnostics follow mounted continuable child, live send, real notice and cold reuse after stage baselines', options, async t => {
+  const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+  const { isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-settlement-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let root, ctx, agents, fixtureRoot, childId, stage = 0, rootRequests = 0, localRequests = 0, completed = false
+  const children = [], disposed = [], observations = [], releases = []
+  let childGate, flushGate, parentGate, childEntered, flushEntered, parentEntered, childEnded = false
+  const arrived = async (promise, boundary) => {
+    let timer
+    try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(JSON.stringify({ boundary, stage, rootRequests, localRequests, children: children.length, progress: harness.settlementSnapshot(), events: root.session.snapshotEvents().filter(e => ['step/error', 'tool/result'].includes(e.type)).map(e => ({ type: e.type, code: e.data.error?.code, error: e.data.error?.message })) }))), 5000) })]) }
+    finally { clearTimeout(timer) }
+  }
+  const reset = () => {
+    rootRequests = 0; completed = false; childEnded = false
+    childGate = nativeGate(); flushGate = nativeGate(); parentGate = nativeGate()
+    childEntered = nativeGate(); flushEntered = nativeGate(); parentEntered = nativeGate()
+    releases.push(childGate, flushGate, parentGate)
+  }
+  const notices = () => root.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data?.source?.kind === 'subagent-settled' && e.data.source.senderSessionId === childId).length
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
+    onRequest() {},
+  }, { inspectNative: nativeState => {
+    root = nativeState.root; ctx = nativeState.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+    // Registration only: every real creation and continuation below is caused
+    // by runStage's root loop after its activation and notice baselines exist.
+    ctx.on('agent/created', ({ agent }) => {
+      if (agent.session.header.parentSession !== root.id) return
+      childId = agent.id; children.push(agent)
+    }, { global: true })
+    ctx.on('agent/disposed', ({ agent }) => { if (agent.id === childId) disposed.push(agent) }, { global: true })
+    ctx.on('session/event', (session, event) => { if (session.id === childId && event.type === 'turn/end' && event.data.reason.kind === 'completed') childEnded = true }, { global: true })
+    ctx.on('session/flush', session => {
+      if (session.id !== childId || !childEnded) return
+      flushEntered.resolve()
+      return flushGate.promise
+    }, { global: true })
+    ctx.on('llm/stream', request => (async function* () {
+      localRequests++
+      assert.equal(isAgentLoopRequest(request), true)
+      assert.equal(request.maxTokens, 8192)
+      let block = { type: 'text', text: '137' }
+      if (request.sessionId === root.id) {
+        rootRequests++
+        if (rootRequests === 1) block = stage === 1
+          ? { type: 'tool-call', id: `local-spawn-${stage}`, name: 'subagent', arguments: JSON.stringify({ description: 'local settlement worker', prompt: 'Return 137.', run_in_background: true }) }
+          : { type: 'tool-call', id: `local-cold-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Return 137 again.' }) }
+        else if (stage === 1 && rootRequests === 2) block = { type: 'tool-call', id: 'local-live-send', name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Continue with the same answer.' }) }
+        else if (notices() >= stage) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
+      } else {
+        assert.equal(request.sessionId, childId)
+        childEntered.resolve()
+        await signalGate(request.signal, childGate.promise)
+      }
+      yield { type: 'block-end', index: 0, block }
+      yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+      yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+    })(), { global: true })
+  } })
+  let pending
+  try {
+    assert.equal(children.length, 0)
+    assert.equal(harness.settlementSnapshot?.().phase, 'not-started')
+    for (stage = 1; stage <= 2; stage++) {
+      reset()
+      const beforeNotices = notices()
+      pending = harness.runStage({ name: 'local-settlement', prompt: 'Exercise the local child lifecycle.' }).then(() => { completed = true })
+      pending.catch(() => {})
+      await arrived(childEntered.promise, 'child-stream')
+      await nativeCondition(() => root.status === 'idle')
+      assert.equal(children.length, stage, 'one activation for spawn/live-send, then one cold activation')
+      assert.equal(completed, false)
+      const active = harness.settlementSnapshot()
+      assert.equal(active.requiredNotices, 1)
+      assert.equal(active.missingNotices, 1)
+      assert.ok(active.runningAgents >= 1)
+      observations.push({ stage, boundary: 'child-stream', ...active })
+      childGate.resolve()
+      await arrived(flushEntered.promise, 'final-flush')
+      await nativeCondition(() => harness.settlementSnapshot().phase === 'waiting-notices')
+      const heldFlush = harness.settlementSnapshot()
+      assert.equal(notices(), beforeNotices, 'the real SDK has not emitted a notice before its held final flush')
+      assert.equal(heldFlush.requiredNotices, 1)
+      assert.equal(heldFlush.deliveredNotices, 0)
+      assert.equal(heldFlush.missingNotices, 1)
+      assert.equal(completed, false)
+      observations.push({ stage, boundary: 'final-flush', ...heldFlush })
+      flushGate.resolve()
+      await arrived(parentEntered.promise, 'parent-wake')
+      assert.equal(notices() - beforeNotices, 1, 'actual native settlement notice reaches the direct parent')
+      assert.equal(disposed.length, stage)
+      assert.equal(root.status, 'running')
+      assert.equal(completed, false, 'notice delivery cannot bypass the reawakened parent')
+      const awake = harness.settlementSnapshot()
+      assert.equal(awake.deliveredNotices, 1); assert.equal(awake.missingNotices, 0)
+      observations.push({ stage, boundary: 'parent-wake', ...awake })
+      parentGate.resolve()
+      await pending
+      const final = harness.settlementSnapshot()
+      assert.equal(final.phase, 'settled')
+      assert.equal(final.requiredNotices, 1)
+      assert.equal(final.deliveredNotices, 1)
+      assert.equal(final.idleAgents, 2)
+      assert.equal(final.pendingIdleWaits, 0)
+      observations.push({ stage, boundary: 'settled', ...final })
+    }
+    assert.equal(children[0].id, children[1].id)
+    assert.notEqual(children[0], children[1], 'cold reuse replaces the native Agent object')
+    assert.equal(notices(), 2)
+    const calls = root.session.snapshotEvents().filter(e => e.type === 'tool/call')
+    assert.equal(calls.filter(e => e.data.name === 'subagent').length, 1)
+    assert.equal(calls.filter(e => e.data.name === 'task_child_send').length, 2)
+    assert.deepEqual(diagnoseModelRuntime(harness.snapshot()).failureCodes, [])
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0,
+      realParentNotices: notices(), sameSessionDifferentAgents: true, observations }))
+  } finally {
+    for (const gate of releases) gate.resolve()
+    harness.cancel()
+    const deadline = setTimeout(() => { console.error('FIXTURE_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+    try { await harness.dispose() } finally { clearTimeout(deadline) }
+    if (pending) await pending.catch(() => {})
+    assert.equal(agents.get(root.id), undefined)
+    assert.equal(agents.get(childId), undefined)
+    await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+    t.diagnostic(JSON.stringify({ nativeSettlementCleanup: true, paidRequests: 0 }))
+  }
+})
+
+test('native settlement timeout snapshots the held local stream before signal cancellation and drains it', options, async t => {
+  const { createNativeHarness, runModelVerification } = await import('../verify-model.mjs')
+  const outputDir = await mkdtemp(join(tmpdir(), 'taskforce-native-settlement-timeout-'))
+  t.after(() => rm(outputDir, { recursive: true, force: true }))
+  let localRequests = 0, aborted = 0, drained = 0, root, ctx, agents, fixtureRoot, actualBeforeCancel, nativeHarness
+  const report = await runModelVerification({ modelCalls: true, installAnchor: anchor, provider: 'deepseek-official', model: 'deepseek-flash', outputDir, stageTimeoutMs: 100 }, {
+    createHarness: async config => {
+      nativeHarness = await createNativeHarness(config, { inspectNative: state => {
+        root = state.root; ctx = state.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+        ctx.on('llm/stream', request => (async function* () {
+          localRequests++
+          try {
+            yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+            await new Promise(resolve => {
+              const cancel = () => { aborted++; resolve() }
+              if (request.signal.aborted) cancel()
+              else request.signal.addEventListener('abort', cancel, { once: true })
+            })
+            // Keep the boundary complete while the SDK consumes the abort.
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          } finally { drained++ }
+        })(), { global: true })
+      } })
+      const cancel = nativeHarness.cancel
+      nativeHarness.cancel = () => {
+        actualBeforeCancel ??= { status: root.status, observation: nativeHarness.settlementSnapshot() }
+        cancel()
+      }
+      return nativeHarness
+    },
+  })
+  assert.equal(report.ok, false)
+  assert.equal(report.failure, 'timeout')
+  assert.equal(localRequests, 1)
+  assert.equal(aborted, 1); assert.equal(drained, 1)
+  assert.equal(actualBeforeCancel.status, 'running')
+  assert.deepEqual(report.stages[0].timeoutProgress.settlement, actualBeforeCancel.observation)
+  assert.equal(report.stages[0].timeoutProgress.settlement.phase, 'waiting-idle')
+  assert.equal(report.stages[0].timeoutProgress.settlement.runningAgents, 1)
+  assert.equal(report.stages[0].timeoutProgress.settlement.pendingIdleWaits, 1)
+  assert.ok(Number.isSafeInteger(report.stages[0].timeoutProgress.lastRequestElapsedMs))
+  assert.equal(report.usage.inputTokens, 2)
+  assert.ok(nativeHarness.streamSnapshot().records.every(record => record.ended))
+  assert.equal(agents.get(root.id), undefined)
+  await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+  t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0, aborted, drained,
+    timeoutProgress: report.stages[0].timeoutProgress, fixtureDisposed: true }))
+})

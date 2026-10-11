@@ -880,3 +880,292 @@ test('working-directory diagnostics accept only the literal native and PTC name'
   assert.equal(diagnostics.errorCounts.INVALID_ARGS, names.length * 2)
   assert.doesNotMatch(JSON.stringify(diagnostics), /sk-secret|__proto__/)
 })
+
+const settlementShape = (overrides = {}) => ({ phase: 'waiting-idle', trackedAgents: 1, idleAgents: 0,
+  runningAgents: 1, unknownAgents: 0, pendingIdleWaits: 1, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0, ...overrides })
+const deferred = () => Promise.withResolvers()
+
+test('settlement progress freezes the actual timeout boundary before cancellation changes observations', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t, 'timeout')
+  h.options.stageTimeoutMs = 20
+  let current = settlementShape(), cancelled = 0
+  const report = await runModelVerification(h.options, { createHarness: async config => {
+    const harness = await h.factory(config)
+    harness.settlementSnapshot = () => current
+    harness.runStage = async () => { config.onRequest({ agentId: 'root', turn: 1, step: 1 }); return new Promise(() => {}) }
+    harness.cancel = () => { cancelled++; current.phase = 'settled'; current.pendingIdleWaits = 0 }
+    return harness
+  } })
+  assert.equal(report.failure, 'timeout')
+  assert.ok(cancelled >= 2)
+  assert.deepEqual(report.stages[0].timeoutProgress?.settlement, settlementShape())
+  assert.equal(report.stages[0].progress.settlement.phase, 'settled')
+  assert.ok(Number.isSafeInteger(report.stages[0].timeoutProgress.lastRequestElapsedMs))
+  assert.ok(report.stages[0].timeoutProgress.lastRequestElapsedMs <= report.stages[0].durationMs)
+  assert.equal(report.outputCapacity.source, 'custom-harness-unverified')
+  assert.deepEqual(JSON.parse(readFileSync(join(h.outputDir, 'report.json'))), report)
+})
+
+test('settlement progress remains optional, resets request time per stage and records normal settlement', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t)
+  const report = await runModelVerification(h.options, { createHarness: async config => {
+    const harness = await h.factory(config)
+    harness.settlementSnapshot = () => settlementShape({ phase: 'settled', idleAgents: 1, runningAgents: 0, pendingIdleWaits: 0 })
+    return harness
+  } })
+  assert.equal(report.ok, true)
+  for (const stage of report.stages) {
+    assert.equal(stage.progress?.settlement.phase, 'settled')
+    assert.ok(Number.isSafeInteger(stage.progress.lastRequestElapsedMs))
+    assert.equal(stage.timeoutProgress, null)
+  }
+  const absent = setup(t, 'timeout'); absent.options.stageTimeoutMs = 10
+  const unavailable = await runModelVerification(absent.options, { createHarness: absent.factory })
+  assert.deepEqual(unavailable.stages[0].timeoutProgress, { lastRequestElapsedMs: null, settlement: null })
+})
+
+for (const invalid of ['extra-key', 'unsafe', 'negative', 'fraction', 'phase', 'getter', 'method-getter', 'throws', 'promise', 'rejected-promise', 'thenable', 'inherited-thenable', 'then-getter', 'missing']) {
+  test(`settlement progress rejects ${invalid} without leaking diagnostics or masking timeout and cleanup`, async t => {
+    const { runModelVerification } = await api()
+    const h = setup(t, 'timeout'); h.options.stageTimeoutMs = 10
+    let cancellations = 0, foreignCalls = 0
+    const marker = 'settlement-private-path-reasoning-sk-secret'
+    const report = await runModelVerification(h.options, { createHarness: async config => {
+      const harness = await h.factory(config)
+      let value = settlementShape()
+      if (invalid === 'extra-key') value[marker] = marker
+      if (invalid === 'unsafe') value.trackedAgents = Number.MAX_SAFE_INTEGER + 1
+      if (invalid === 'negative') value.pendingIdleWaits = -1
+      if (invalid === 'fraction') value.pendingIdleWaits = 0.5
+      if (invalid === 'phase') value.phase = marker
+      if (invalid === 'getter') Object.defineProperty(value, 'phase', { get() { foreignCalls++; throw new Error(marker) } })
+      if (invalid === 'promise') value = Promise.resolve(value)
+      if (invalid === 'rejected-promise') value = Promise.reject(new Error(marker))
+      if (invalid === 'thenable') value.then = () => { foreignCalls++; throw new Error(marker) }
+      if (invalid === 'inherited-thenable') Object.setPrototypeOf(value, { then() { foreignCalls++; throw new Error(marker) } })
+      if (invalid === 'then-getter') Object.defineProperty(value, 'then', { get() { foreignCalls++; throw new Error(marker) } })
+      if (invalid === 'missing') delete value.runningAgents
+      harness.settlementSnapshot = () => { if (invalid === 'throws') throw new Error(marker); return value }
+      if (invalid === 'method-getter') Object.defineProperty(harness, 'settlementSnapshot', { get() { throw new Error(marker) } })
+      harness.cancel = () => { cancellations++ }
+      return harness
+    } })
+    assert.equal(report.failure, 'timeout')
+    assert.ok(cancellations >= 2)
+    assert.equal(foreignCalls, 0, 'foreign getters and thenables are never invoked')
+    assert.deepEqual(report.stages[0].timeoutProgress, { lastRequestElapsedMs: null, settlement: null })
+    assert.equal(report.stages[0].progress.settlement, null)
+    assert.doesNotMatch(JSON.stringify(report), new RegExp(marker))
+  })
+}
+
+test('settlement diagnostics preserve invalid observation and cleanup failure precedence', async t => {
+  const { runModelVerification } = await api()
+  for (const fault of ['invalid-observation', 'cleanup-error']) {
+    const h = setup(t, 'timeout'); h.options.stageTimeoutMs = 10
+    const report = await runModelVerification(h.options, { createHarness: async config => {
+      const harness = await h.factory(config)
+      harness.settlementSnapshot = () => { throw new Error('diagnostic-private') }
+      if (fault === 'invalid-observation') harness.runStage = async () => { harness.snapshot = () => ({}) }
+      else harness.dispose = async () => { throw new Error('cleanup-private') }
+      return harness
+    } })
+    assert.equal(report.failure, fault)
+    assert.equal(report.stages[0].progress?.settlement, null)
+    assert.doesNotMatch(JSON.stringify(report), /diagnostic-private|cleanup-private/)
+  }
+})
+
+function controlledSettlement(waitForNativeSettlement, definitions) {
+  const histories = new Map(), tracked = new Map(), counts = new Map(), beforeCounts = new Map(), beforeNotices = new Map()
+  const gates = new Set(), seen = [], subscribers = new Set()
+  let disposed = false, read = () => undefined, hook = () => {}
+  const add = (id, parent, status = 'idle') => {
+    if (!histories.has(id)) histories.set(id, [])
+    const gate = deferred(); gates.add(gate)
+    const agent = { id, status, session: { header: { parentSession: parent }, snapshotEvents: () => histories.get(id) },
+      idleCalls: 0, whenIdle() { this.idleCalls++; return gate.promise } }
+    tracked.set(id, agent); counts.set(id, (counts.get(id) ?? 0) + 1)
+    return { agent, gate }
+  }
+  for (const definition of definitions) add(...definition)
+  const observe = snapshot => { read = snapshot; const value = snapshot(); seen.push(value); hook(value); for (const fn of subscribers) fn(value) }
+  const waitPhase = phase => {
+    const gate = deferred()
+    const accept = value => { if (value?.phase === phase) { subscribers.delete(accept); gate.resolve(value) } }
+    subscribers.add(accept); accept(read())
+    return gate.promise
+  }
+  const notice = (parent, id) => histories.get(parent).push({ type: 'user/message', data: { source: { kind: 'subagent-settled', senderSessionId: id } } })
+  return { tracked, counts, beforeCounts, beforeNotices, histories, add, notice, seen, waitPhase,
+    read: () => read(), hook: fn => { hook = fn }, release: () => { for (const gate of gates) gate.resolve() },
+    stop: () => { disposed = true; for (const gate of gates) gate.resolve() },
+    run: () => waitForNativeSettlement({ tracked, rootId: 'root', activationCounts: counts, beforeCounts, beforeNotices, isDisposed: () => disposed, observe }) }
+}
+
+test('settlement progress distinguishes maintenance idle from resolved native idle promises', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null]])
+  const pending = f.run()
+  try {
+    assert.deepEqual(f.read(), settlementShape({ idleAgents: 1, runningAgents: 0 }))
+    assert.equal(f.tracked.get('root').idleCalls, 1, 'diagnostics do not call whenIdle again')
+    f.release(); await pending
+    assert.equal(f.read().phase, 'settled')
+    assert.equal(f.read().pendingIdleWaits, 0)
+  } finally { f.stop(); await pending.catch(() => {}) }
+})
+
+test('settlement progress caps each notice pair before summing, including nested and missing parents', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['a', 'root'], ['b', 'root'], ['nested', 'a'], ['orphan', 'absent']])
+  f.notice('root', 'a'); f.notice('root', 'a'); f.notice('root', 'a'); f.notice('a', 'nested')
+  const pending = f.run()
+  try {
+    assert.equal(f.read()?.requiredNotices, 4)
+    assert.equal(f.read().deliveredNotices, 2)
+    assert.equal(f.read().missingNotices, 2)
+    f.release()
+    assert.equal((await f.waitPhase('waiting-notices')).phase, 'waiting-notices')
+    f.tracked.get('orphan').session.header.parentSession = 'root'
+    f.notice('root', 'b'); f.notice('root', 'orphan')
+    await pending
+    assert.equal(f.read().phase, 'settled')
+  } finally { f.stop(); await pending.catch(() => {}) }
+})
+
+test('settlement progress follows parent reawakening and event or agent changes through original stable ticks', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['child', 'root']])
+  const parentWake = deferred(); let stableChecks = 0, completed = false
+  f.hook(value => {
+    if (value?.phase !== 'checking-stability') return
+    stableChecks++
+    if (stableChecks === 1) {
+      f.histories.get('root').push({ type: 'local-change' })
+      const root = f.tracked.get('root'); root.status = 'running'; root.whenIdle = () => parentWake.promise
+    }
+    if (stableChecks === 2) { const added = f.add('later', 'root'); f.notice('root', 'later'); added.gate.resolve() }
+  })
+  const pending = f.run().then(() => { completed = true })
+  try {
+    assert.equal(f.read()?.phase, 'waiting-idle')
+    f.release(); await f.waitPhase('waiting-notices'); f.notice('root', 'child')
+    await f.waitPhase('checking-stability'); await f.waitPhase('waiting-idle')
+    assert.equal(completed, false)
+    assert.equal(f.read().runningAgents, 1)
+    await Promise.resolve() // resolved sibling callbacks drain; parent remains held
+    assert.equal(f.read().pendingIdleWaits, 1)
+    f.tracked.get('root').status = 'idle'; parentWake.resolve()
+    await pending
+    assert.ok(stableChecks >= 3)
+    assert.equal(f.read().phase, 'settled')
+  } finally { parentWake.resolve(); f.stop(); await pending.catch(() => {}) }
+})
+
+test('settlement progress separates cold activation baselines, live reuse, unknown status and stale agent promises', async () => {
+  const { waitForNativeSettlement } = await api()
+  const f = controlledSettlement(waitForNativeSettlement, [['root', null], ['child', 'root', 'maintenance-private']])
+  f.beforeCounts.set('child', 1); f.notice('root', 'child'); f.beforeNotices.set(JSON.stringify(['root', 'child']), 1)
+  const first = f.run()
+  try {
+    assert.equal(f.read()?.unknownAgents, 1)
+    assert.equal(f.read().requiredNotices, 0, 'live continuation has no new activation')
+    f.tracked.get('child').status = 'idle'; f.release(); await first
+    const child = f.add('child', 'root')
+    const second = f.run()
+    assert.equal(f.read().requiredNotices, 1)
+    assert.equal(f.read().deliveredNotices, 0, 'old notice cannot satisfy cold activation')
+    assert.equal(f.read().pendingIdleWaits, 2)
+    await Promise.resolve()
+    assert.equal(f.read().pendingIdleWaits, 1)
+    child.gate.resolve(); await f.waitPhase('waiting-notices')
+    f.notice('root', 'child'); await second
+    assert.equal(f.read().missingNotices, 0)
+  } finally { f.stop(); await first.catch(() => {}) }
+})
+
+test('settlement observer exceptions and rejected original promises cannot alter wait semantics', async () => {
+  const { waitForNativeSettlement } = await api()
+  const rejection = new Error('native-idle-rejection')
+  for (const reject of [false, true]) {
+    const idle = deferred(); let calls = 0, observations = 0
+    const agent = { id: 'root', status: 'idle', session: { header: {}, snapshotEvents: () => [] }, whenIdle() { calls++; return idle.promise } }
+    const pending = waitForNativeSettlement({ tracked: new Map([['root', agent]]), rootId: 'root', activationCounts: new Map(),
+      beforeCounts: new Map(), beforeNotices: new Map(), isDisposed: () => false,
+      observe() { observations++; throw new Error('private-observer-failure') } })
+    if (reject) { idle.reject(rejection); await assert.rejects(pending, error => error === rejection) }
+    else { idle.resolve(); await pending }
+    assert.equal(calls, 1)
+    assert.ok(observations > 0)
+  }
+})
+
+test('settlement side observations isolate async rejection and throwing native diagnostic getters at every phase', async () => {
+  const { waitForNativeSettlement } = await api()
+  let inspecting = false, calls = 0
+  const phases = new Set(), observations = []
+  const agent = { id: 'root', get status() { if (inspecting) throw new Error('private-diagnostic-getter'); return 'idle' },
+    session: { header: {}, snapshotEvents: () => [] }, whenIdle() { calls++; return Promise.resolve() } }
+  await waitForNativeSettlement({ tracked: new Map([['root', agent]]), rootId: 'root', activationCounts: new Map(),
+    beforeCounts: new Map(), beforeNotices: new Map(), isDisposed: () => false,
+    observe(read) {
+      phases.add(read().phase)
+      inspecting = true
+      try { observations.push(read()) } finally { inspecting = false }
+      return Promise.reject(new Error('private-async-observer'))
+    },
+  })
+  assert.equal(calls, 1)
+  assert.ok(observations.length >= 5)
+  assert.ok(observations.every(value => value === null))
+  assert.deepEqual([...phases], ['not-started', 'waiting-idle', 'waiting-notices', 'checking-stability', 'settled'])
+})
+
+test('settlement pending observations keep exact Promise.all inputs and late rejected-cohort callbacks isolated', async () => {
+  const { waitForNativeSettlement } = await api()
+  const oldRoot = deferred(), oldChild = deferred(), freshChild = deferred()
+  const tracked = new Map()
+  const make = (id, gate) => ({ id, status: 'idle', session: { header: { parentSession: id === 'root' ? null : 'root' }, snapshotEvents: () => [] }, whenIdle: () => gate.promise })
+  tracked.set('root', make('root', oldRoot)); tracked.set('child', make('child', oldChild))
+  const config = { tracked, rootId: 'root', activationCounts: new Map(), beforeCounts: new Map(), beforeNotices: new Map(), isDisposed: () => false }
+  let oldRead, newRead, exactInputs
+  const originalAll = Promise.all
+  let oldPending
+  try {
+    Promise.all = function (inputs) { exactInputs = [...inputs]; return originalAll.call(this, exactInputs) }
+    oldPending = waitForNativeSettlement({ ...config, observe: read => { oldRead = read } })
+  } finally { Promise.all = originalAll }
+  assert.equal(exactInputs.length, 2)
+  assert.equal(exactInputs[0], oldRoot.promise, 'the original root Promise reaches Promise.all')
+  assert.equal(exactInputs[1], oldChild.promise, 'the original child Promise reaches Promise.all')
+  const error = new Error('original-idle-failure'); oldRoot.reject(error)
+  await assert.rejects(oldPending, thrown => thrown === error)
+  const rootReady = deferred(); rootReady.resolve()
+  tracked.set('root', make('root', rootReady)); tracked.set('child', make('child', freshChild))
+  const next = waitForNativeSettlement({ ...config, observe: read => { newRead = read } })
+  await Promise.resolve()
+  assert.equal(newRead().pendingIdleWaits, 1)
+  oldChild.resolve(); await Promise.resolve()
+  assert.equal(oldRead().pendingIdleWaits, 0)
+  assert.equal(newRead().pendingIdleWaits, 1, 'the prior Agent/cohort cannot decrement the new one')
+  freshChild.resolve(); await next
+  assert.equal(newRead().phase, 'settled')
+})
+
+test('settlement last admitted request timestamp resets to null when a later stage makes no request', async t => {
+  const { runModelVerification } = await api()
+  const h = setup(t); h.options.stageTimeoutMs = 20
+  const report = await runModelVerification(h.options, { createHarness: async config => {
+    const harness = await h.factory(config), run = harness.runStage
+    harness.runStage = stage => stage.name === 'readonly' ? run(stage) : new Promise(() => {})
+    return harness
+  } })
+  assert.equal(report.failure, 'timeout')
+  assert.equal(report.stages[0].ok, true)
+  assert.ok(Number.isSafeInteger(report.stages[0].progress.lastRequestElapsedMs))
+  assert.equal(report.stages[1].requests, 0)
+  assert.deepEqual(report.stages[1].timeoutProgress, { lastRequestElapsedMs: null, settlement: null })
+})

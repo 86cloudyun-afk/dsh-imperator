@@ -203,3 +203,22 @@ root 采用新的受限四调用点修订：F5/F7/W4/W5 原查询只 prepare 取
 Task16 的等宽多字段与固定joined-star设计仍待独立审核/实施；root补充同一C-Q4withdraw读取的run_id，以防身份修复后将前缀写进scheduler_decision的JSON重放结果。Task17 的既有独立设计PASS已经root全文读取、17输入/4输出复核，R1正常控制保留task_event和R2只在独立克隆执行真实迁移的要求为规范义务；尚未实现或执行该公开preflight RED。准备证据的一个子代理被工具服务内容拦截，未生成/执行harness，由root接管；该服务失败不归因Imperator。
 
 新静态接受文本输出审计包含25个query/field记录（不是25个独立bug），确认任务说明、交接、审计归属、资源快照、恢复历史等还存在单独读取义务；root选择下一独立有界输出保真任务，未把原始SQL/nativehandle/不可能NUL文件路径或恢复已拒绝的输入纳入支持合同。该清单仅源预测，实际RED/GREEN尚待验证。最新8237真实模型FAILED保持不可变，无新增paid调用；PR69仍draft/未合并，后续完整候选/原生/模型/整版审核/实际PR CI/额外PR审核/预期head合并/实际main验证全部仍是门槛。
+
+
+### 13:51 UTC：第十五项实现审核通过，第十六项正式采用
+
+Task15 等宽实现提交 `ab2accd989def4668ccdc4b01e7aa99d01e5b2f2` / tree `aed4ebfa08cb6f7cd8536e237d5a4a2107c2d07c`，9 个既有产品/测试文件，111 产品 fingerprint `ae0b6f2a7aaead58761a6a9b55aaee60b9bbe3241bdf60357956a70b87a4e328`。新的六运行时/编码机制实际通过；第一轮 fake metadata 默认参数失败保留，第二轮仅纠正 omitted/undefined 夹具区分，root 完整核对 23 制品与全部 48 wildcard cases。合法 2000 列的公开 F5/F7 RED 在两准确 pin 均真实失败，修复后的同断言全部通过；这是未合并暂停方案的额外结果列缺陷，不把它描述成所有 main 表已存在的列上限故障。
+
+相同最终源码串行实测 Node22.23.2 与 Node24.19.0 目标各242/242 PASS、0 skip；Node24 offline 全源码1941项/1921 pass/20实际 host skip/0 fail、六独立脚本通过。verify-store 的 native compiler S33另为34 PASS/0 FAIL/1 SKIP，不混进 node:test20项。before/after SDK53987正规文件摘要/模式与60771全部条目模式/链接均一致；此不是全文件系统或所有进程静止证明。完整 Node22/双 SDK/native/model/PR/main 验收仍待新候选实测。
+
+fresh Task15 implementation SPEC `01f814eab9e0dbcb949b0b7de10036d5a7bcfebc2ace2b34ffbe13a8b14dae8a` PASS；root 全文读取、34+34制品/111+19输入/206源码与模式核对，receipt `b224a6cadcb597081ac8a5dbce4d0423d18bd51a114021d43a9761c618a16724` 后明确开始独立 QUALITY。QUALITY `8dd4db578d4df2dcf6a8af779f3271e0aa553fc1a8ef57a8209c6d138085ce8f` PASS，无阻塞项；root 再核36制品、150输入、206源码/模式/blob与111产品指纹，receipt `01a09302bc57413dec951d6c1eb73b634b1cf5d0c57f1c8ee620e10fbe649ff6`。显式 companion 注入计数、metadata 故障路径调用计数、target unsafe integer 独立性三项属于非阻塞补强，Task16 root 附录明确授权在现有测试中完善，不改写旧结论。
+
+正式采用 [Task16 身份等宽设计](../specs/2026-10-11-sqlite-identity-design.md) / [计划](../plans/2026-10-11-sqlite-identity.md)。外部已审核设计 `8027140b6b732d6b1440a6f3b4d0972831a7a6ec8f8e81367b6e1aa623283b3f`、计划 `ad61d3310d9d090d6a0cbf9af8ef10412dea7f6e9bd5f130bad78f663ac30417`，fresh DESIGN_SPEC_PASS `61ff134d7aa781bd079c4f343ddd4903867a44d9f701e2fd7382135734a9a4af`，root核57制品/8selected/16support/18Git证据，receipt `5a402c00430eb57d28e44ef239989f705639c0f97695b0a29ac6d5680c7d12d3`。16读取点包括 C-Q4 同时恢复 owner_session+run_id，必须核对返回、持久化 `JSON.parse(scheduler_decision.result).result.request.run_id` 和重放均保留完整run；旧706 Node22撤回前被C-S1/C-Q1挡住，不能虚构旧成功路径RED。旧截断JSON/owner capture不猜测重建。静态执行 brief与16点map已root读完、8制品/25输入/206源核对，receipt `64ad5d246cfa2cb527fd957ff8a2cb4363865141bc0c810ed4951430e640f0ac`。正式规范整合是文档动作；实际机制与产品实施仍各需root明确GO。
+
+Task17 真实公开 preflight RED 已完成：UTF-8/UTF-16le/UTF-16be各仅一个目标fact TEXT的NUL后缀发生变化，独立迁移克隆证明其它单元/行数一致，原库文件字节/模式/列表与专属临时目录清理控制均通过。Node22 exit1，3 genuine semantic RED+12控制PASS；Node24 exit0，全部15控制PASS。旧Node22错误报告rows_preserved:true；前缀变化与TEXT→BLOB两准确pin均正确拒绝，相同全文与正常历史均保留。summary `a296df20b086532195d39c587b6cd43445d119b2135ae3f32a3ce7bb0758c201`，root完整30case/manifest读取receipt `111ed0456293f68d7b55e1cbb9fe521f26e2c4ae3c2698bb1879aa3cd98480c2`。这是旧源码漏洞证明，Task17产品修复尚未实施；GREEN必须绑定之后的实际完整候选，不能豁免固定旧源码摘要。STATIC handoff7制品/271输入已root复核，receipt `9679e304888d1d52394d90ee777b9382721eda404db8099bc709fc91a27802f5`。
+
+Task19 已选择25清单记录：24个输出读取点（9 explicit+15 single-star）与Task16拥有的Q3闭环，不是25个独立bug。root实际公开探针旧Node22十项语义失败/Node24同十项通过，只覆盖7个清单ID；leading-title与holds不虚构各自缺失的直接SQL存储oracle。新设计独立DESIGN_SPEC_PASS，报告 `2bf0e2f5242a87937e9a3711c5472436162e9fb7d8b0f9a8dbf239b09ce744d6`（仅设计审核）；root复核116审核制品、19草案、71输入与29 frozen Git捕获，receipt `39a619ac415fd5e95627819e5cd7453afbf0e5de93556afee51250adf5194653`。设计/实施分别约束真实NUL接受边界、既有clip与byte预算、helper字段联合、未知native列与原计数，无新增DDL/input policy。Task19尚未实施。
+
+唯一新的私有空编译缓存观测仍FAIL：原60s阶段exit1/timedOuttrue，78实际TAP pass，scheduler C001于59.946s进入后未结束。旧/新77可比较body记录总时长差−0.408889579s，但未测cachehit或因果收益；cache-alone不作为充分修复。全部83case静态重算和1083命名输入复核通过，root分析receipt `e2de29b9c71867c3cac8644c6b53e29417d23b1e4bd6774c0ae322fdc2ad5a65`。Task18新的helper-only公开初始化候选已静态封存，两SDK源分别核对；只移除首次丢弃loadProfile，保留后续加载与native named boot、cold fixture、选项/getter/Promise/lifecycle/全部原测试和门槛。其性能未测、transient read failure顺序差异明确披露；独立设计审核进行中，无runtime/productGO。
+
+最新真实模型8237仍FAILED、不可改写；无新增paid、无旧候选重试。PR69仍draft/remote da50未合并，artifact已关联本任务。原60000/12000/2×10000/180000、80/8192、Node/SDK pins/range、DDL/依赖/名字/SDK adapter CLOSED/acceptance gate均未放宽。用户历史生产停止仍未归因。后续整候选验收、whole SPEC→root→QUALITY、实际PR CI与额外fresh合并前审核、预期head合并及actualmain验证全部保留。

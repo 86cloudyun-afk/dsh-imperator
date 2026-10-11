@@ -26,12 +26,12 @@
 
 **Files:**
 - Modify:`lib/scheduler/index.js`, `docs/SCHEDULER.md`
-- Test:`tools/tests/scheduler.test.mjs`, `tools/tests/operations.test.mjs`（仅新增撤回备份回放）
+- Test:`tools/tests/scheduler.test.mjs`, `tools/tests/operations.test.mjs`（仅新增撤回备份回放）、`tools/tests/fixtures/scheduler-worker.mjs`（只扩展真实分进程竞态驱动，保留默认admit行为）
 **Interfaces:**
 - Consumes:现有queued row、scheduler_decision、#task当前/捕获owner、BEGIN IMMEDIATE/CAS。
 - Produces:withdraw({request_id,request_key},runId,authority)；public {status:'withdrawn',request:<existing view>,replay:boolean}；内部tagged envelope，不变DDL。
 
-- [ ] **Step 1: RED** — 两永久预算head场景、正常FIFO、所有state/owner/key/action边界、rollback、实际两worker连接竞争、操作backup/restore和无写replay。
+- [ ] **Step 1: RED** — 两永久预算head场景、正常FIFO、所有state/owner/key/action边界、lead enqueue未归属→worker claim但captured owner null时worker拒绝/lead允许、rollback、实际两worker分进程连接竞争、操作backup/restore和无写replay；不能用同进程Promise.all模拟竞态。
 - [ ] **Step 2: Observe RED** — unchanged产品下missing withdraw预期断言失败保存，原admission正控仍pass。
 - [ ] **Step 3: Implement** — 同transaction目标/权限/旧决策、queued且未reserved CAS、新envelope；admitNext校验action后才回放，保持旧admissionresult。state/原enqueue自然输出withdrawn，无governor调用。
 - [ ] **Step 4: GREEN** — scheduler/operations定向及sole `npm test`退出0，真实竞争串行结果，原budget/holds/task字节比较保持。

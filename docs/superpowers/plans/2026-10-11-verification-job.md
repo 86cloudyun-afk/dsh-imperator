@@ -18,8 +18,8 @@
 
 - promotion即使task_verify传run_in_background:false也可能发生。
 - locator从本次真实native union取得，不从rendered content解析。
-- 非法/超长ID与timeout省略且不回显；不能变成有效receipt。
-- 即时locator不落持久receipt/backup/restore或建立跨owner权限。
+- 非法/超长ID为job_id:null，background或非法timeout为timeout_ms:null；未批准的原生字段省略，不回显原值，不能变成有效receipt。
+- 即时locator不落持久receipt/backup/restore或建立跨owner权限；owner指发起本次调用的原生会话，任务await中重新分配不转移原生job权限。
 - 正常foreground与nativeerror/UNKNOWN_TOOL原行为和清理仍一致。
 
 ### Task 1: bounded native_job response
@@ -31,7 +31,7 @@
 - Consumes:runTaskVerification的原nativeResult、completedreceipt和同ownerhost调用。
 - Produces:仅promoted/background直接返回native_job白名单结构及next；无持久或exports变更。
 
-- [ ] **Step 1: RED** — 字段投影、foreground/error负控、jobID/timeout边界、receipt持久不变；在已有anchor-awarehost边界加入两pins真promotion+foreground，cleanup显式kill/wait。
+- [ ] **Step 1: RED** — 精确字段/null投影、foreground/error负控、256/257字符及非string jobID、safe正integer timeout边界、receipt持久不变、owner/generation在await中变化的promoted结果与strict拒绝；在已有anchor-awarehost边界加入两pins真promotion+foreground，cleanup显式kill/wait。
 - [ ] **Step 2: Observe RED** — unit+两个实际pins本次locator缺失预期失败，unchanged wrapper，保存日志。
 - [ ] **Step 3: Implement** — receipt持久完成后小白名单投影，固定恢复提示；禁止把renderedoutput变为rawlog成功、未知仍未知。
 - [ ] **Step 4: GREEN** — unit、两pinsnative边界及sole`npm test`退出0，strict拒绝/正常验收和jobcleanup保持。

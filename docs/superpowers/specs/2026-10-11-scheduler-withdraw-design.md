@@ -12,4 +12,6 @@
 
 保持所有既有命名、Node/宿主pins、依赖/schema、60000ms验收/12000ms清理、产品预算以及关闭的full-tree adapter。doctor及backup/restore须完整保留/识别原行和新决策值，不变日志权威。
 
+特别覆盖lead先enqueue未归属任务、worker后claim但queue captured owner仍null：worker不得撤回或捕获owner，lead可以；不要复制bind对null captured owner的例外。
+
 验收：两种累计预算队首撤回后tail可准入且业务task不变；暂时受阻仍FIFO至显式撤回；跨run/current+captured owner、各已准入state、新键/同target/跨action冲突、重开只读回放、decision故障rollback、两连接admit-vs-withdraw与same-key竞争、state/原enqueue、doctor+backup+restore。

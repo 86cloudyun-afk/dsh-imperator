@@ -318,15 +318,15 @@ section('1. 正常续作：sendMessage 收到正确的 sender / targetId / conte
   check(
     'C07',
     '归属核对走的是服务自己的 listChildren(callerSessionId)，parentSessionId = 调用者会话；'
-      + '且「操作前状态」复用归属核对那一份快照（不重复读目录）',
-    fake.calls.listChildren.length === 2
+      + '只核对一次目录，效果前后的活动态独立读取',
+    fake.calls.listChildren.length === 1
       && fake.calls.listChildren.every((c) => c.parentSessionId === LEAD_A),
     JSON.stringify(fake.calls.listChildren),
   )
 
   check(
     'C07b',
-    'activity_before 来自归属快照，current_turn 来自操作后重读（两次读，2 个字段各归其位）',
+    'activity_before / current_turn 来自效果前后两次活动表观测，缺席均保持 unknown',
     result.target?.activity_before === 'unknown' && result.target?.current_turn === 'unknown',
     JSON.stringify(result.target),
   )
@@ -431,15 +431,15 @@ section('3. 跨会话保护：目标不是本会话子代理时被拒，且一�
   )
 
   // LEAD_B 操作**自己**的子代理必须成功（否则「拒绝」可能只是能力不足，而不是权限判据在起作用）。
-  // 实测读次数（非估计）：拒绝路径 1 次（归属核对即返回），成功路径 2 次（归属快照 + 操作后重读）。
-  // 本节的 4 次调用 ⇒ C13(1) + C15(1) + C17(1) + C18(2) = 5 次，且父会话严格跟随调用者。
+  // 拒绝和成功路径都只读 1 次直属目录；效果后的活动态直接来自活动 agent 表。
+  // 本节的 4 次调用 ⇒ C13(1) + C15(1) + C17(1) + C18(1) = 4 次，父会话严格跟随调用者。
   const crossOwn = await scopedHarness.call('task_child_stop', { target_id: CHILD_2 }, { agent: LEAD_AGENT_B })
   check(
     'C18',
     '对照正例：同一服务、同一会话切到它自己的子代理 → 成功；且每次核对都以调用者自己的会话 id 为父',
     crossOwn.ok === true && scoped.calls.interrupt.length === 1
       && scoped.calls.listChildren.map((c) => c.parentSessionId).join(',')
-        === `${LEAD_A},${LEAD_A},${LEAD_B},${LEAD_B},${LEAD_B}`,
+        === `${LEAD_A},${LEAD_A},${LEAD_B},${LEAD_B}`,
     JSON.stringify({ result: crossOwn, queries: scoped.calls.listChildren }),
   )
 }
@@ -934,7 +934,7 @@ section('11c. 缺陷 2 回归：没有活动态就 unknown，不推断"已停止
 }
 
 {
-  // 活动态与目录**分两路**：第 2 次目录读（状态刷新那次）失败，活动态仍必须读得到。
+  // 活动态与目录**分两路**：授权后不再读目录，活动态直接从活动表取得。
   let listCalls = 0
   const flaky = {
     async listChildren() {
@@ -949,9 +949,9 @@ section('11c. 缺陷 2 回归：没有活动态就 unknown，不推断"已停止
   const result = await h.call('task_child_stop', { target_id: CHILD_1 }, { agent: LEAD_AGENT_A })
   check(
     'C60',
-    '目录读失败不影响活动态（两路来源分开）：仍读出 running，而不是被一起降级成 unknown',
+    '仅做一次目录授权查询，效果后独立读出 running，不依赖可能失败的第二次目录读取',
     result.ok === true && result.target?.current_turn === 'running' && result.execution?.stopped === false
-      && listCalls === 2,
+      && listCalls === 1,
     JSON.stringify({ target: result.target, execution: result.execution, listCalls }),
   )
 }

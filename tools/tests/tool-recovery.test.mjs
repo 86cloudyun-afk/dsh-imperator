@@ -300,6 +300,193 @@ function pendingControl(f) {
 function operationRows(store) {
   return store.open().prepare('SELECT * FROM control_operation ORDER BY id').all()
 }
+
+function controlDeferred() {
+  let resolve
+  const promise = new Promise(done => { resolve = done })
+  return { promise, resolve }
+}
+async function boundedControl(promise, phase) {
+  let timer
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new assert.AssertionError({
+          message: phase + ' must settle without optional catalog I/O',
+        })), 250)
+      }),
+    ])
+  } finally { clearTimeout(timer) }
+}
+
+// The real committed outcome is the barrier: removing the second catalog read
+// must not strand the test itself waiting for that read to begin.
+function controlReceiptFixture(t, { after = 'pending', status = 'running', denied = false,
+  preflight = 'authorized' } = {}) {
+  const store = tempStore(t)
+  const agent = { id: RUN, session: { header: { id: RUN }, events: [] } }
+  const definitions = new Map(), outcome = controlDeferred(), release = controlDeferred()
+  const effects = { send: 0, stop: 0 }, catalogCalls = []
+  let readsInCall = 0
+  const finish = store.recovery.finishControl.bind(store.recovery)
+  store.recovery.finishControl = (input, authority) => {
+    const result = finish(input, authority)
+    outcome.resolve(operationRows(store)[0])
+    return result
+  }
+  const subagents = {
+    async listChildren(parentId) {
+      catalogCalls.push(parentId)
+      assert.equal(parentId, RUN)
+      if (++readsInCall > 1) {
+        if (after === 'pending') await release.promise
+        if (after === 'throw') throw new Error('optional catalog observation unavailable')
+      }
+      if (preflight === 'unavailable') throw new Error('authorization catalog unavailable')
+      if (preflight === 'not-own') return []
+      return [{ id: CHILD, mode: preflight === 'settled' ? 'one-shot' : 'continuable', createdAt: 0 }]
+    },
+    async sendMessage(sender, targetId, content, options) {
+      assert.equal(sender, agent)
+      assert.equal(targetId, CHILD)
+      assert.deepEqual(content, [{ type: 'text', text: 'receipt instruction' }])
+      assert.equal(options.signal instanceof AbortSignal, true)
+      effects.send++
+      return 'receipt-message'
+    },
+    interrupt(targetId, authority) {
+      assert.equal(targetId, CHILD)
+      assert.deepEqual(authority, { kind: 'ancestor', agent })
+      assert.equal(authority.agent, agent)
+      effects.stop++
+      if (denied) return { accepted: false }
+      // Pinned hosts return synchronous void, including silent no-op paths.
+    },
+  }
+  applyTools({
+    logger: { warn() {} },
+    get(name) {
+      if (name === 'taskforceStore') return store
+      if (name === 'subagents') return subagents
+      if (name === 'agents') return { get(id) {
+        if (id === RUN) return agent
+        if (id !== CHILD) return undefined
+        if (effects.send + effects.stop === 0) return { status: 'idle' }
+        return status === null ? undefined : { status }
+      } }
+    },
+    tools: { register(definition) { definitions.set(definition.name, definition); return () => {} } },
+  })
+  return {
+    store, effects, catalogCalls, outcome, release,
+    async call(action, signal = new AbortController().signal) {
+      readsInCall = 0
+      return JSON.parse(await definitions.get('task_child_' + action).execute({
+        target_id: CHILD, request_key: 'receipt-' + action,
+        ...(action === 'send' ? { message: 'receipt instruction' } : {}),
+      }, { agent: preflight === 'missing-agent' ? undefined : agent, signal }))
+    },
+  }
+}
+
+for (const action of ['send', 'stop']) {
+  test('control receipt ' + action + ' survives optional catalog failure and post-outcome abort', async t => {
+    for (const after of ['pending', 'throw', 'resolved']) {
+      const f = controlReceiptFixture(t, { after }), controller = new AbortController()
+      const call = f.call(action, controller.signal)
+      try {
+        const committed = await boundedControl(f.outcome.promise, 'durable outcome')
+        assert.equal(committed.status, 'accepted')
+        assert.equal(committed.request_key, 'receipt-' + action)
+        assert.equal(committed.caller_session, RUN)
+        assert.equal(committed.action, action)
+        assert.equal(committed.target_id, CHILD)
+        assert.equal(f.effects[action], 1)
+        controller.abort(new Error('caller cancelled after durable acceptance'))
+        const result = await boundedControl(call, action + ' accepted receipt (' + after + ')')
+        assert.equal(result.ok, true, JSON.stringify(result))
+        assert.equal(result.operation.status, 'accepted')
+        assert.equal(result.operation.durable, true)
+        assert.equal(result.operation.retry_key, committed.request_key)
+        assert.equal(result.target.mode, 'continuable')
+        assert.equal(result.target.activity_before, 'inactive')
+        assert.equal(result.target.current_turn, 'running')
+        assert.deepEqual(f.catalogCalls, [RUN], 'only the authorization catalog read is required')
+        if (action === 'send') {
+          assert.equal(result.sent.message_id, 'receipt-message')
+          assert.equal(committed.message_id, 'receipt-message')
+          assert.equal(result.route.reported, false)
+          assert.doesNotMatch(result.delivery, /steer|queue/)
+        } else {
+          assert.equal(result.stopped.accepted, true)
+          assert.match(result.stopped.receipt, /^void/)
+          assert.deepEqual(result.execution, { observed: 'running', tree_quiescent: null, stopped: false })
+        }
+        assert.deepEqual(operationRows(f.store), [committed], 'late cancellation must not rewrite acceptance')
+        const replay = await boundedControl(f.call(action), 'accepted replay')
+        assert.equal(replay.ok, true, JSON.stringify(replay))
+        assert.equal(replay.operation.replayed, true)
+        assert.equal(replay.operation.invoke, false)
+        assert.equal(replay.operation.operation_id, committed.operation_id)
+        assert.equal(replay.operation.retry_key, committed.request_key)
+        assert.equal(replay.operation.status, 'accepted')
+        assert.equal(f.effects[action], 1)
+        assert.deepEqual(f.catalogCalls, [RUN, RUN], 'replay still requires direct-child authorization')
+        assert.deepEqual(operationRows(f.store), [committed])
+      } finally {
+        f.release.resolve()
+        await boundedControl(call, 'fixture cleanup')
+      }
+    }
+  })
+
+  for (const [preflight, code] of [
+    ['unavailable', 'E_CHILD_NO_ID'], ['not-own', 'E_CHILD_NOT_OWN'],
+    ['settled', 'E_CHILD_SETTLED'], ['missing-agent', 'E_CHILD_NO_AGENT'],
+  ]) {
+    test('control receipt ' + action + ' retains ' + preflight + ' preflight refusal', async t => {
+      const f = controlReceiptFixture(t, { preflight })
+      const result = await boundedControl(f.call(action), 'preflight refusal')
+      assertNoReceipt(result)
+      assert.equal(result.code, code, JSON.stringify(result))
+      assert.deepEqual(f.effects, { send: 0, stop: 0 })
+      assert.deepEqual(f.catalogCalls, preflight === 'missing-agent' ? [] : [RUN])
+      assert.deepEqual(operationRows(f.store), [])
+    })
+  }
+}
+
+for (const status of ['running', 'idle', null]) {
+  test('control receipt explicit stop refusal has truthful prose for ' + (status ?? 'unknown'), async t => {
+    const f = controlReceiptFixture(t, { after: 'resolved', status, denied: true })
+    const result = await boundedControl(f.call('stop'), 'explicit refusal')
+    const before = operationRows(f.store), observed = status === null ? 'unknown' : status === 'idle' ? 'inactive' : status
+    assert.equal(result.ok, true, JSON.stringify(result))
+    assert.equal(result.stopped.accepted, false)
+    assert.equal(result.operation.status, 'rejected')
+    assert.equal(result.operation.durable, true)
+    assert.equal(before[0].status, 'rejected')
+    assert.equal(result.target.current_turn, observed)
+    assert.deepEqual(result.execution, { observed, tree_quiescent: null,
+      stopped: status === null ? null : status === 'idle' })
+    assert.doesNotMatch(result.state_truth, /请求已接纳|信号已发|会在观察到信号后停下/,
+      'explicit refusal must not assert acceptance, signaling, or eventual stopping')
+    assert.match(result.state_truth, /拒绝|未接纳/)
+    assert.ok(result.state_truth.includes('current_turn=' + observed))
+    assert.deepEqual(f.catalogCalls, [RUN])
+    const replay = await boundedControl(f.call('stop'), 'rejected replay')
+    assertNoReceipt(replay)
+    assert.equal(replay.operation.replayed, true)
+    assert.equal(replay.operation.invoke, false)
+    assert.equal(replay.operation.operation_id, before[0].operation_id)
+    assert.equal(replay.operation.retry_key, before[0].request_key)
+    assert.equal(replay.operation.status, 'rejected')
+    assert.deepEqual(f.effects, { send: 0, stop: 1 })
+    assert.deepEqual(operationRows(f.store), before)
+  })
+}
+
 function assertJournalUnavailable(result) {
   assert.equal(result.ok, false, JSON.stringify(result))
   assert.equal(result.code, 'E_CONTROL_JOURNAL_UNAVAILABLE', JSON.stringify(result))

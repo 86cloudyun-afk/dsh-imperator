@@ -13,6 +13,12 @@
 额外核对 `listChildren(调用者会话)` 的直属归属，并返回当前轮状态和稳定错误码。
 主控 persona 优先推荐这两个入口，不再声称原生控制工具只能操作 teammate。
 
+发送/停止在效果调用前必须读取直属目录，核对归属和 `continuable` 模式；活动表不能代替此授权。
+效果和持久 outcome 完成后，只同步读取活动 agent 表，不再做第二次异步目录查询。
+因此目录后续查询挂起或失败不会阻塞已确定的控制回执；调用者在 durable accepted 之后取消，
+也不会把已接纳效果改写成未执行或允许再次 dispatch。`target.mode` 保留授权时的目录值，
+`activity_before` / `current_turn` 分别是效果前后的独立活动态观测，不证明投递路由或后代进程已安静。
+
 ## 2. 工具契约
 
 ### `task_child_send` —— 续作（把新要求发给子代理）
@@ -50,7 +56,12 @@
 | `reason` | 否 | 只写进**返回体**供对账，不投递给目标（要它知道原因就先 `task_child_send` 再停） |
 | `request_key` | 否 | 原操作的重试键，最多 256 UTF-8 字节；显式提供时必须有可用恢复日志 |
 
-成功返回额外带 `stopped.accepted`、`state_truth`（区分「信号已发出」与「已安静」）。
+返回额外带 `stopped.accepted`、`state_truth`（接纳/拒绝与活动态分别陈述）。
+固定宿主 `interrupt()` 仍是同步 **void** 契约：未抛错按请求已接纳处理，不等待异步停止。
+兼容的同步显式 `{ accepted:false }` 收据会保留 `stopped.accepted:false` 并持久化为 rejected；
+`state_truth` 在 running / inactive / unknown 三态都明确拒绝，不声称信号已发出或预测之后会停止。
+该次返回的 `ok:true` 表示工具完成调用，不能覆盖收据中的拒绝；原键重放读取 rejected，
+返回 `ok:false` 且不重复效果。此兼容路径不扩展为 Promise 返回接口支持。
 `next` 给出机械路径：**要确认真实状态就去读能证明状态的地方**（`task_board` 看它落的事实、
 `list_agents` 看 status），并显式警告**不要为了查状态重复调 `task_child_stop`** —— 那是
 「再发一次停止信号」，不是查询；要它带着新要求接着干就先 `task_child_send` 再等它落事实。

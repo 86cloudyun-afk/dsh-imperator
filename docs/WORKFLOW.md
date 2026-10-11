@@ -14,7 +14,11 @@ Import TaskforceWorkflow from lib/workflow/index.js and instantiate it with the 
 - recordArtifact({task_id,expected_version,request_key}, runId, currentWorker).
 - recordReview({task_id,revision_id,requirements_result,quality_result,findings,expected_version,request_key}, runId, reviewer). Results are pass/fail/unverified; findings are bounded strings.
 - returnForRework({task_id,reason,expected_version,request_key}, runId, root).
-- state({task_id}, runId) and ready({limit?:25}, runId).
+- state({task_id,include_context?:boolean}, runId) and ready({limit?:25}, runId).
+
+State defaults to compact metadata; omitting include_context or setting it to false preserves that output. Explicit include_context:true adds context:{plan,latest_review}, including the complete persisted plan and the latest same-task/run review's metadata and complete findings. latest_review is null before the first review. Its is_current flag compares revision_id, plan_version and evidence_generation with the current workflow/task; historical findings remain readable after rework but do not prove a current passing review. The task_workflow_state tool exposes the same optional Boolean and derives run identity from the host. No checkpoint rewrite is needed after reopening the database.
+
+Context is read in the existing authorized SQLite snapshot after workflow ownership/integrity checks, with no writes, owner restoration, execution or acceptance changes. Only explicit context reads validate the stored plan and latest findings: plan/list/string shapes and the existing 16384-byte JSON budgets must hold. Text field bounds retain the writers' JavaScript String.length semantics; aggregate JSON budgets count UTF-8 bytes. Invalid JSON, shape or stored size returns a generic E_STORE_INTEGRITY without echoing stored content. Working-context and default state do not automatically expand these payloads.
 
 A request key is unique within its run. Equal payload and actual actor replay the original result, even after subsequent state changes; different content or identity conflicts. These receipts never authorize an external action. expected_version provides optimistic concurrency.
 
@@ -34,7 +38,7 @@ Writer tracking covers sessions bound through the store. It does not prove that 
 
 ## Bounds and migration
 
-There are at most 256 workflows per run, 64 prerequisites, 512 ordinary workflow mutation decisions per task and 0–8 configured reworks. Default reworks are 2. Input JSON is capped at 32768 UTF-8 bytes, plans at 16384, persisted/API results at 65536; overflowing artifact provenance fails without partial writes. State shows the latest 20 artifacts/reviews with an explicit history_truncated flag. Ready returns at most 100 compact rows. No cross-run listing is provided.
+There are at most 256 workflows per run, 64 prerequisites, 512 ordinary workflow mutation decisions per task and 0–8 configured reworks. Default reworks are 2. Input JSON is capped at 32768 UTF-8 bytes, plans and review findings each at 16384, persisted/API results at 65536; overflowing artifact provenance fails without partial writes. State shows the latest 20 artifacts/reviews with an explicit history_truncated flag. Explicit context reads also bound the actual serialized tool response, including {ok:true,...result}, to 65536 UTF-8 bytes. If necessary they remove the oldest whole artifact/review metadata entries and set history_truncated:true, preserving complete plan/findings; an essential response that still cannot fit fails with generic E_STORE_INTEGRITY. Ready returns at most 100 compact rows. No cross-run listing is provided.
 
 All tables are additive and created in the store migration transaction after existing schema migration. Existing task/fact/handoff rows and owner/run identifiers are not rewritten. Workflow child rows are checked against their parent run; dependency targets are checked too. Integrity errors never include foreign row contents. Reopening the store reconstructs state without external effects.
 

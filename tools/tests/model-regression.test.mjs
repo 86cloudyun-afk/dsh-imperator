@@ -1460,7 +1460,7 @@ for (const fault of ['absent', 'hook-getter', 'inherited-hook', 'proxy-harness',
   })
 }
 
-async function taskCollectorFixture() {
+async function taskCollectorFixture({ announceRoot = true, beginStage = true } = {}) {
   const { createTaskToolDiagnosticsCollector } = await api()
   const agents = new Map()
   const collector = createTaskToolDiagnosticsCollector({ rootId: 'root', agents })
@@ -1472,7 +1472,7 @@ async function taskCollectorFixture() {
     if (announce) collector.created(session)
     return session
   }
-  const root = create('root')
+  const root = create('root', null, { announce: announceRoot })
   const emit = (session, type, data = {}, extra = {}) => {
     const event = { seq: session.seq++, type, data, ...extra }
     collector.published(session, event)
@@ -1486,7 +1486,7 @@ async function taskCollectorFixture() {
       isError: false, content: [{ type: 'text', text: JSON.stringify(body) }], ...changes.message }, ...changes.data },
     { sourceEventSeqs: [call.seq], ...changes.event })
   }
-  collector.beginStage()
+  if (beginStage) collector.beginStage()
   return { collector, agents, root, create, emit, step, call, result }
 }
 function assertTaskPartition(report) {
@@ -1595,6 +1595,63 @@ for (const fault of ['gap', 'duplicate-publication', 'seq-rollback', 'cut', 'lin
     assert.equal(f.collector.snapshot(), null)
   })
 }
+
+for (const role of ['first-root', 'new-direct-child']) {
+  for (const fault of ['identity-mismatch', 'registry-throw', 'header-throw']) {
+    test(`published task collector preserves unestablished ownership across stages: ${role} ${fault}`, async () => {
+      const f = await taskCollectorFixture(role === 'first-root' ? { announceRoot: false, beginStage: false } : {})
+      const session = role === 'first-root' ? f.root : f.create('worker', 'root', { announce: false })
+      if (role === 'new-direct-child') {
+        f.result(f.root, f.call(f.root, 'task_board', 'before-child'))
+        assert.equal(f.collector.snapshot().byTool.task_board.envelopeOk, 1, 'root coverage is established before child acquisition fails')
+      }
+      const agent = f.agents.get(session.id), header = session.header
+      if (fault === 'identity-mismatch') agent.session = { id: session.id }
+      if (fault === 'registry-throw') f.agents.get = id => {
+        if (id === session.id) throw new Error('acquisition lookup failed')
+        return Map.prototype.get.call(f.agents, id)
+      }
+      if (fault === 'header-throw') Object.defineProperty(session, 'header', { configurable: true, get() { throw new Error('acquisition header failed') } })
+      assert.doesNotThrow(() => f.collector.created(session))
+      assert.equal(f.collector.snapshot(), null, 'failed acquisition is initially unavailable')
+      agent.session = session
+      delete f.agents.get
+      Object.defineProperty(session, 'header', { configurable: true, writable: true, value: header })
+      const observations = []
+      for (let stage = 1; stage <= 3; stage++) {
+        f.collector.beginStage()
+        observations.push([`stage ${stage} reset`, f.collector.snapshot()])
+        f.step(session, stage)
+        f.result(session, f.call(session, 'task_board', `unobserved-${stage}`, stage))
+        if (role === 'new-direct-child') f.result(f.root, f.call(f.root, 'task_board', `root-${stage}`, stage))
+        observations.push([`stage ${stage} subsequent own publications`, f.collector.snapshot()])
+      }
+      for (const [boundary, snapshot] of observations) assert.equal(snapshot, null, `${boundary} cannot reestablish missing ownership`)
+    })
+  }
+}
+
+test('published task collector healthy repeated stage resets and cold restoration remain available', async () => {
+  const f = await taskCollectorFixture()
+  let worker = f.create('worker', 'root')
+  for (let stage = 1; stage <= 3; stage++) {
+    if (stage === 2) {
+      const seq = worker.seq
+      f.collector.disposed(worker); f.agents.delete(worker.id)
+      worker = f.create('worker', 'root', { seq: seq + 2 })
+    }
+    f.collector.beginStage()
+    assertTaskPartition(f.collector.snapshot())
+    assert.equal(f.collector.snapshot().observedEvents, 0)
+    f.step(worker, stage)
+    f.result(worker, f.call(worker, 'task_board', `healthy-${stage}`, stage))
+    const report = f.collector.snapshot(); assertTaskPartition(report)
+    assert.equal(report.byTool.task_board.calls, 1)
+    assert.equal(report.byTool.task_board.envelopeOk, 1)
+    assert.equal(report.observedEvents, 4)
+    assert.equal(report.truncated, false)
+  }
+})
 
 test('published task collector bounds details, events, coordinates, cumulative bytes and counter saturation', async () => {
   const f = await taskCollectorFixture(); f.step()
@@ -1820,6 +1877,7 @@ test('published task collector contains creation and disposal observer faults an
   const hostile = Object.defineProperty({}, 'id', { get() { throw new Error('SECRET_callback') } })
   assert.doesNotThrow(() => f.collector.created(hostile)); assert.equal(f.collector.snapshot(), null)
   f.collector.beginStage()
+  assert.equal(f.collector.snapshot(), null, 'a stage reset cannot erase an unresolved observer fault')
   assert.doesNotThrow(() => f.collector.disposed(hostile)); assert.equal(f.collector.snapshot(), null)
 })
 

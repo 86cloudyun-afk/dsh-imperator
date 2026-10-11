@@ -504,7 +504,8 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
     } catch { invalidate(state) }
   }
   return { created, disposed, published,
-    beginStage() { report = emptyTaskDiagnostics(); report.truncated = limitedSessions; decodedBytes = 0; unavailable = [...sessions.values()].some(state => !state.valid); stageCursor++ },
+    // Reset counters, never revive coverage lost before a Session was retained.
+    beginStage() { report = emptyTaskDiagnostics(); report.truncated = limitedSessions; decodedBytes = 0; stageCursor++ },
     snapshot() { try { return unavailable ? null : projectTaskDiagnostics(report) } catch { return null } },
   }
 }

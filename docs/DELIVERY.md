@@ -79,7 +79,7 @@ node tools/verify-model.mjs --model-calls \
 
 原生验证器固定每个获准请求输出容量为8192 tokens，同时配置 provider 默认值与 root agent；官方子会话继承此配置，不降低 reasoning effort。在全局公开 `llm/stream` waterfall 消费边界，以 SDK `isAgentLoopRequest` 的精确对象标记、真实 agent/request 的 agent/turn/step/signal 和受控 root 子树核对归属，只对匹配的一次实际流消费计请求。SDK prepared call 已解析的 provider/model/maxTokens 必须匹配固定路由与8192，错误路由或65536等容量在派发前拒绝。报告 `outputCapacity.source=native-stream-boundary`；自定义离线 harness 为 `custom-harness-unverified`。报告 `auxiliaryPolicy=reject-before-dispatch`：本固定回归不支持辅助 LLM 调用，包括自动 compaction；尝试即拒绝并锁存失败，不能捕获异常后继续获准。生产 preset compaction 保持 auto=true 及其原配置，未被禁用或更改。历史 `native-configuration` 仅证明普通 agent 配置，不能证明辅助请求容量；8192与历史4096不能作同额度性能比较。
 
-本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
+本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。每进程仅允许一个存活 fixture、每 fixture 一次实际原生启动；启动结算时按原始回调引用及重复次数捕获四种原生 fatal/signal 监听器，全部已启动的应用与 handle 清理实际结算后才释放所属回调并恢复环境、删除 home。超时 race 不代表底层清理完成；此时仍保留回调及独占环境，并保持失败判定，强制退出仅同步删除临时 home。异常监听器基数按固定诊断失败，不扩大删除范围；原有及稍后加入的无关回调保留。这是隔离验证器的资源管理，不修复或证明生产 SDK 的监听器生命周期。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
 
 没有显式 opt-in、非法请求/timeout 参数、超时、超过全局请求上限、provider/tool 错误、usage 缺失、未收口任务、错误执行者复用、无有效 strict 回执或独立断言失败均退出非零。不得用单条模型总结、模型改写后的测试退出码、静态提示词字数或 mock 成功代替真实模型验收。
 

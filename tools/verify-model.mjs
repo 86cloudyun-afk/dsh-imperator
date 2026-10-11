@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { spawnSync } from 'node:child_process'
 import { controlledProfile, nativeModule, resolveInstallAnchor, installationVersion } from './host-runtime.mjs'
 import { MODEL_STAGES, STRICT_COMMAND, STRICT_FILES, writeModelFixture, gradeMoney } from './model-fixtures.mjs'
@@ -520,6 +520,8 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
   const anchor = resolveInstallAnchor({ installAnchor })
   if (!modelHostVersions.has(installationVersion(anchor))) fail('host-version')
   const fixture = await controlledProfile(anchor, packageRoot)
+  const emergency = () => fixture.emergencyDispose()
+  process.once('exit', emergency)
   let app, handle
   const tracked = new Map()
   const activationCounts = new Map()
@@ -532,15 +534,21 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     const failures = []
     cancel()
     try {
-      try { await deadline(() => handle?.dispose(), 10000, cancel) } catch (error) { failures.push(error) }
-      try { await deadline(() => app?.shutdown.shutdown(1), 10000, cancel) } catch (error) { failures.push(error) }
-    } finally { fixture.dispose(); process.exitCode = exit }
+      try { await deadline(() => fixture.teardown(() => handle?.dispose()), 10000, cancel) } catch (error) { failures.push(error) }
+      try { await deadline(() => fixture.shutdown(1), 10000, cancel) } catch (error) { failures.push(error) }
+    } finally {
+      try { fixture.dispose() } catch (error) { failures.push(error) }
+      finally {
+        if (fixture.isDisposed()) process.off('exit', emergency)
+        else fixture.whenDisposed.then(() => process.off('exit', emergency))
+        process.exitCode = exit
+      }
+    }
     if (failures.length) throw new AggregateError(failures, 'native cleanup failed')
   }
   try {
     writeFileSync(fixture.overlay, readFileSync(fixture.overlay, 'utf8') + `\n- id: session-title-llm\n  disabled: true\n- id: llm-retry\n  disabled: true\n- id: llm-deepseek\n  config:\n    maxTokens: ${MODEL_MAX_OUTPUT_TOKENS}\n    streamIdleTimeoutMs: 30000\n`)
-    const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
-    app = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web', patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
+    app = await fixture.runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web', patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     const { createUserMessage, isAgentLoopRequest } = await nativeModule(anchor, '@deepseek-ai/dsh-llm')
     const boundary = createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure })
     app.ctx.on('llm/stream', (options, next) => boundary.intercept(options, next), { global: true, prepend: true })
@@ -561,7 +569,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     tracked.set(rootId, handle.agent)
     // Native unpaid verification seam: inspect SDK wiring or drive genuine
     // lifecycles behind a local stream sentinel. Not exposed by the CLI.
-    await inspectNative?.({ ctx: app.ctx, root: handle.agent })
+    await inspectNative?.({ ctx: app.ctx, root: handle.agent, handle })
     // A reused cold child has the same session id but a fresh Agent. Keep its latest
     // live object; its durable session history contains prior usage and notices.
     const sessions = () => nativeSessions(tracked)
@@ -581,7 +589,10 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
       return { sessions: sessions(), tasks, settled, streamAccounting: boundary.snapshot() }
     }
     return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, streamSnapshot: boundary.snapshot, cancel, dispose }
-  } catch (error) { try { await dispose() } catch { /* preserve original setup failure */ } throw error }
+  } catch (error) {
+    try { await dispose() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'native setup and cleanup failed') }
+    throw error
+  }
 }
 
 function parseArgs(args) {

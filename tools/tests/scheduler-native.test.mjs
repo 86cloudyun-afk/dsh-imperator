@@ -10,6 +10,39 @@ import { controlledProfile, installationVersion, resolveInstallAnchor } from '..
 let anchor, skip
 try { anchor = resolveInstallAnchor({}) } catch (error) { skip = error.message }
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+async function cleanupScheduler({ fixture, application, workingStore, handles, cleanup, mainDeadline, previousExitCode, version, requests, failures = [] }) {
+  const cleanupStarted = Date.now()
+  const cleanupDeadline = setTimeout(() => { console.error('SCHEDULER_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+  let disposed = 0, shutdown = false, remaining
+  try {
+    for (const handle of handles.reverse()) {
+      try { await fixture.teardown(() => handle.dispose()); disposed++ } catch (error) { failures.push(error) }
+    }
+    try { remaining = application?.ctx.get('agents').list().length; assert.equal(remaining, 0) }
+    catch (error) { failures.push(error) }
+  } finally {
+    try { workingStore?.close() } catch (error) { failures.push(error) }
+    finally {
+      try { await fixture.shutdown(1); shutdown = true } catch (error) { failures.push(error) }
+      finally {
+        try { fixture.dispose() } catch (error) { failures.push(error) }
+        finally {
+          if (fixture.isDisposed()) process.off('exit', cleanup)
+          else fixture.whenDisposed.then(() => process.off('exit', cleanup))
+          clearTimeout(cleanupDeadline)
+          clearTimeout(mainDeadline)
+          process.exitCode = previousExitCode
+          console.log('SCHEDULER_CLEANUP_OBSERVED ' + JSON.stringify({ version, handles_disposed: disposed,
+            remaining_live_agents: remaining, application_shutdown: shutdown, profile_removed: !existsSync(fixture.root),
+            cleanup_ms: Date.now() - cleanupStarted, model_requests: requests }))
+        }
+      }
+    }
+  }
+  if (failures.length === 1) throw failures[0]
+  if (failures.length) throw new AggregateError(failures, 'scheduler verification and cleanup failed')
+}
+
 test('pinned official H01 preparation and H03 strict flush raw readback; no model requests', { skip }, async t => {
   const helpers = await import('../../lib/scheduler/dsh-host.js').catch(e => { if (e.code === 'ERR_MODULE_NOT_FOUND') return {}; throw e })
   assert.equal(typeof helpers.prepareNativeIdentity, 'function', 'native identity preparation missing')
@@ -18,13 +51,12 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
   const version = installationVersion(anchor)
   const mainDeadline = setTimeout(() => { console.error('SCHEDULER_DEADLINE_60S'); process.exit(124) }, 60000)
   const fixture = await controlledProfile(anchor, root)
-  const cleanup = () => fixture.dispose()
+  const cleanup = () => fixture.emergencyDispose()
   process.once('exit', cleanup)
   let application, workingStore, requests = 0
-  const handles = []
+  const handles = [], failures = []
   try {
-    const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
-    application = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+    application = await fixture.runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
       patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     const { ctx } = application
     ctx.on('agent/request', () => { requests++; throw new Error('model requests forbidden') })
@@ -231,26 +263,52 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
       console.log('SCHEDULER_PACKAGE_EVIDENCE ' + JSON.stringify({ name: manifest.name, version: manifest.version, entry_sha256: createHash('sha256').update(bytes).digest('hex') }))
     }
     console.log('SCHEDULER_HOST_VERIFIED ' + JSON.stringify({ version, checks: ['prebound-id', 'live-parent', 'strict-flush', 'raw-readback'], native_enabled: false, model_requests: requests }))
+  } catch (error) { failures.push(error) }
+  finally {
+    await cleanupScheduler({ fixture, application, workingStore, handles, cleanup, mainDeadline, previousExitCode, version, requests, failures })
+  }
+})
+
+
+test('scheduler store close failure still shuts down the actual app and preserves cleanup errors', { skip }, async () => {
+  const { TaskforceStore } = await import('../../lib/store/index.js')
+  const fixture = await controlledProfile(anchor, root)
+  const previousExitCode = process.exitCode, baselineExit = process.rawListeners('exit')
+  const mainDeadline = setTimeout(() => { process.exit(124) }, 60000)
+  const cleanup = () => fixture.emergencyDispose ? fixture.emergencyDispose() : fixture.dispose()
+  process.once('exit', cleanup)
+  const run = fixture.runProfile ?? (await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)).runProfile
+  const application = await run({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+    patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
+  const workingStore = new TaskforceStore(join(fixture.root, 'close-fault'))
+  workingStore.open()
+  const close = workingStore.close.bind(workingStore), sentinel = new Error('actual store close sentinel')
+  workingStore.close = () => { close(); throw sentinel }
+  let attempted = false
+  const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+  const before = events.map(event => process.rawListeners(event))
+  const shutdown = application.shutdown.shutdown.bind(application.shutdown)
+  application.shutdown.shutdown = (...args) => {
+    attempted = true
+    assert.deepEqual(events.map(event => process.rawListeners(event)), before, 'callbacks must cover actual shutdown')
+    return shutdown(...args)
+  }
+  const disposeFixture = fixture.dispose, diagnostic = new Error('injected fixture diagnostic')
+  fixture.dispose = () => { disposeFixture(); throw diagnostic }
+  let failure
+  try {
+    try { await cleanupScheduler({ fixture, application, workingStore, handles: [], cleanup, mainDeadline,
+      previousExitCode, version: installationVersion(anchor), requests: 0 }) } catch (error) { failure = error }
+    assert.equal(attempted, true, 'actual store.close error skipped native shutdown')
+    const all = error => error instanceof AggregateError ? error.errors.flatMap(all) : [error]
+    assert.ok(all(failure).includes(sentinel))
+    assert.ok(all(failure).includes(diagnostic))
+    assert.equal(existsSync(fixture.root), false)
+    assert.equal(mainDeadline._destroyed, true)
+    assert.deepEqual(process.rawListeners('exit'), baselineExit)
+    assert.equal(process.exitCode, previousExitCode)
   } finally {
-    const cleanupStarted = Date.now()
-    const cleanupDeadline = setTimeout(() => { console.error('SCHEDULER_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
-    let disposed = 0, shutdown = false, remaining
-    try {
-      for (const handle of handles.reverse()) { await handle.dispose(); disposed++ }
-      remaining = application?.ctx.get('agents').list().length
-      assert.equal(remaining, 0)
-    } finally {
-      try { workingStore?.close(); await application?.shutdown.shutdown(1); shutdown = true }
-      finally {
-        process.off('exit', cleanup)
-        fixture.dispose()
-        clearTimeout(cleanupDeadline)
-        clearTimeout(mainDeadline)
-        process.exitCode = previousExitCode
-        console.log('SCHEDULER_CLEANUP_OBSERVED ' + JSON.stringify({ version, handles_disposed: disposed,
-          remaining_live_agents: remaining, application_shutdown: shutdown, profile_removed: !existsSync(fixture.root),
-          cleanup_ms: Date.now() - cleanupStarted, model_requests: requests }))
-      }
-    }
+    try { if (!attempted) await shutdown(1) }
+    finally { clearTimeout(mainDeadline); process.off('exit', cleanup); disposeFixture(); process.exitCode = previousExitCode }
   }
 })

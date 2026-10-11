@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { TASKFORCE_DEFINITION } from '../../lib/preset.js'
-import { installationVersion } from '../host-runtime.mjs'
+import { controlledProfile, installationVersion } from '../host-runtime.mjs'
 import { apply as applyScope, DENY_CODE } from '../../lib/plugins/orchestrator-scope.mjs'
 
 // Integration supplies an explicit installation; offline checks never claim a
@@ -14,6 +14,52 @@ import { apply as applyScope, DENY_CODE } from '../../lib/plugins/orchestrator-s
 const anchor = process.env.DSH_INSTALL_ANCHOR
 const native = async (name) => import(pathToFileURL(createRequire(anchor).resolve(name)).href)
 const options = { skip: !anchor && 'requires DSH_INSTALL_ANCHOR' }
+
+test('twelve actual profile boots restore exact native listener baselines without requests or streams', options, async t => {
+  const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+  const snapshot = () => events.map(event => process.rawListeners(event))
+  const sentinel = () => {}, later = () => {}
+  for (const event of events) { process.once(event, sentinel); process.on(event, sentinel); process.on(event, sentinel) }
+  const baseline = snapshot(), observations = []
+  let requests = 0, streams = 0
+  try {
+    for (let boot = 0; boot < 12; boot++) {
+      const fixture = await controlledProfile(anchor, new URL('../..', import.meta.url).pathname)
+      const previousExitCode = process.exitCode
+      const emergency = () => fixture.emergencyDispose ? fixture.emergencyDispose() : fixture.dispose()
+      process.once('exit', emergency)
+      let app
+      try {
+        // The legacy fallback makes the RED reproduce the actual native leak,
+        // rather than fail merely because the new fixture method is absent.
+        const run = fixture.runProfile ?? (await import(new URL('./lib/profile-boot.js', pathToFileURL(anchor)))).runProfile
+        app = await run({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+          patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
+        app.ctx.on('agent/request', () => { requests++; throw new Error('lifecycle request forbidden') })
+        app.ctx.on('llm/stream', () => { streams++; throw new Error('lifecycle stream forbidden') }, { global: true, prepend: true })
+        for (const event of events) process.on(event, later)
+      } finally {
+        const cleanupDeadline = setTimeout(() => { console.error('FIXTURE_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+        try { if (fixture.shutdown) await fixture.shutdown(1); else await app?.shutdown.shutdown(1) }
+        finally {
+          try { fixture.dispose() }
+          finally { clearTimeout(cleanupDeadline); process.off('exit', emergency); process.exitCode = previousExitCode }
+        }
+      }
+      const after = snapshot()
+      observations.push({ boot: boot + 1, counts: after.map(row => row.length),
+        exact: after.every((row, index) => row.length === baseline[index].length + 1 && row.every((fn, i) => fn === [...baseline[index], later][i])) })
+      for (const event of events) process.off(event, later)
+      await assert.rejects(access(fixture.root), { code: 'ENOENT' })
+    }
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), observations, requests, streams }))
+    assert.equal(requests, 0); assert.equal(streams, 0)
+    assert.ok(observations.every(row => row.exact), 'actual native teardown retained boot callbacks')
+    assert.deepEqual(snapshot(), baseline)
+  } finally {
+    for (const event of events) { process.off(event, sentinel); process.off(event, sentinel); process.off(event, sentinel); process.off(event, later) }
+  }
+})
 
 // Native Session + pure fork preparation with explicitly authorized hook scope.
 // No agent loop, model/provider request or actual delegation runs in this fixture.

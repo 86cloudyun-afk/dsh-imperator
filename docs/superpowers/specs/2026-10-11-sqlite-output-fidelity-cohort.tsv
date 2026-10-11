@@ -1,0 +1,26 @@
+id	frozen_source_path	line	query_identity	task19_mode	new_task19_fields	preserved_task15_16_fields	fixed_qualifier_or_mapping	decode_boundary	new_metadata_prepares_over_tasks15_16
+T1	lib/store/index.js	787	#scopedTask	explicit	title;note	run_id;owner;owner_session;verification_command	task	before #scopedTask run/owner checks and returned task	0
+T2	lib/store/index.js	375	BOARD_SELECT executed1857	explicit	title;owner;owner_session		t	before #taskBrief	0
+T3	lib/store/index.js	914	#lateBlockersOf	explicit	title;owner;created_by;actor_session	statement	t.title;t.owner;f.created_by;f.actor_session;f.statement	before grouping/clip	0
+T4	lib/store/index.js	1907	workingState joined current task	explicit	task_title		current.title -> task_title	before workingState returns and readStoreState nonblank check	0
+T5	lib/store/board-page.js	152	selected task CTE outer projection156	explicit	title;owner;owner_session		t	before clipFields/spread/byte calculation	0
+T6	lib/store/board-page.js	86	latePage	explicit	title;owner;by;actor_session	statement	t.title;t.owner;b.created_by -> by;b.actor_session;b.statement	before optional clipFields/spread/bytes	0
+H1	lib/store/index.js	1838	legacy task-detail handoffs	explicit	from_child;to_child;note		handoff	before legacy handoff result	0
+H2	lib/store/board-page.js	60	historyPage handoffs branch	star	from_child;to_child;note;run_id		f	before history pagination/result or detail forwarding	1
+A1	lib/store/index.js	833	#factRows	explicit	created_by;actor_session;evidence_path	statement	fact	before detail mapping	0
+A2	lib/store/index.js	1871	ranked fact summary outer SELECT	explicit	created_by;actor_session;evidence_path	statement	f	before briefFact	0
+A3	lib/store/board-page.js	60	historyPage facts branch	star	created_by;actor_session;evidence_path;run_id	statement	f	before history spread/factRow	0 (reuse Task15 F5)
+A4	lib/store/board-page.js	166	selected latest fact f.*	star	created_by;actor_session;evidence_path	statement	f	before factRow/clipFields	0 (reuse Task15 F7)
+E1	lib/store/index.js	1821	board detail execution receipts	star	run_id;owner_session;actor_session;command;call_id;root_call_id;parent_call_id		execution_receipt	before receiptRow parse/spread	1
+E2	lib/store/index.js	1822	board detail execution waivers	star	reason;actor_session;run_id		execution_waiver	before waiver public array	1
+G1	lib/governor/index.js	131	#target reservation	star	run_id	owner_session;session_id	governor_reservation	before #target callers including reservation output	0 (reuse Task16 C-G3)
+G2	lib/governor/index.js	150	reserve replay reservation	star	run_id;session_id	owner_session	governor_reservation	before #task(old), payload/replay return	0 (reuse Task16 C-G4)
+G3	lib/governor/index.js	180	reserve newly inserted result	star	run_id		governor_reservation	before newly created reservation output	1
+G4	lib/governor/index.js	257	snapshot reservations	star	run_id;session_id		governor_reservation	before snapshot map(reservation)	1
+G5	lib/governor/index.js	258	snapshot holds	star	resource_key		h	before snapshot hold spread	1
+G6	lib/governor/index.js	260	snapshot audit	star	run_id;session_id		governor_audit	before audit spread/details parse	1
+Q1	lib/scheduler/index.js	73	#view governor reservation	star	session_id		governor_reservation	before #view session output and state bytes	1
+Q2	lib/scheduler/index.js	102	enqueue newly inserted request	star	run_id		scheduler_request	before postinsert #view	1
+Q3	lib/scheduler/index.js	157	withdraw queued request	delegated		owner_session;run_id	scheduler_request	Task16 C-Q4 before #view/new decision JSON/replay	0 (no Task19 edit)
+R1	lib/store/recovery.js	243	timeline task_event e.*	star	owner_session		e	before publicEvent/bounded/diagnosticBundle	1
+R2	lib/store/recovery.js	272	inspect task_checkpoint c.*	star	owner_session		c	before checkpoint spread/bounded/diagnosticBundle	1

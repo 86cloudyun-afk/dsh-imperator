@@ -241,3 +241,14 @@ Task20 repeated certified frozen cursor 的静态设计独立PASS，报告 `9a45
 Task18三次original60s观测均FAIL保留；fresh cache与initializer-only不足，initializer correctness268checks通过不替代整native。boot-only省略后加载会改变invalid-config dotenv副作用顺序，source-confirmed reject，无候选product patch/实际negative probe。原CI Node22目标12s被杀phase未观测，历史生产停止仍未归因。最终候选将补准确Node22 source/npm/fullnative，与原四Node24 local gates及六CI共同验收；65s standalone native diagnostic collector不变为完整multi-stage验收新上限。
 
 原Node/DSH pins、DDL/名字/依赖/SDK adapter CLOSED、60000/12000/2×10000/180000、80/8192及原grader/gate不变。paid8237 FAILED不可改写、无旧候选重试、无新增paid。PR69实际仍draft/remote da50未合并，正文已更新当前局部进展；源码尚未推送。新冻结整候选/source/npm/双pin双SDK完整native/ONEpurposeful paid原始60检查加独立diagnostics/whole SPEC-root-QUALITY/实际PR六CI/额外fresh合并前审核/match-head合并/actualmain parents-tree-fingerprint-version-六CI仍全部必须完成。
+
+
+### 17:22 UTC：Task17 完整接受，Task19 正式采用
+
+Task17 `7e8507df98091fadfdfea9b6c3ad476b65349b57` / tree `f9226f46269c045a41f61222ddc4aa556db5dfe6` 仅修改 operations 与既有测试，232+/4−；111产品 fingerprint `f294e1a62523396e9026f5ed0d4bf91689628c5a4769d0e161ce92606e7f697c`。TEXT经SQLite json_quote和一次严格JSON解码，非TEXT native值、原列排序/定义复用/流式BigInt数组与换行SHA framing保持。R1正常历史与R2只读原库/独立真实迁移clone控制落实。准确22/24定向各153PASS，新public各15case/247assertion groups PASS；Node24 offline1983total/1963PASS/20existing SKIP/0FAIL、七source检查通过，host仍UNVERIFIED。早期loaderFAIL/误wholeTMPempty collectorFAIL/旧706 genuine RED保留，未重跑成功22target。
+
+fresh SPEC report `7b1ceb268610873b18dd5115c67b616b51e9f1a6f9853220968ac12eee1eaf8a` 保存STOP后root全文/2583输入复核再发QUALITY GO；fresh QUALITY `4b2b73f364ac42d278d5937e7fce5b08e71744e3364fa6e92ac8e2074a22f963` PASS。root全文复核15审核制品、2597普通输入、210actual source/Git以及完整60771 SDK条目，acceptance receipt `6bc984b96d390063f8b622624726de1528584cdf569e916a8090ed350020c43b`。排序/collation及malformed/nonstring transport分支仅source-reviewed，不写成独立动态覆盖；不声称性能等价、native/模型通过或历史生产停止归因。审查者两次静态manifest/Git会计失败和根静态慢枚举中断均保留，未触发runtime。
+
+正式采用 [Task19 output-fidelity规范](../specs/2026-10-11-sqlite-output-fidelity-design.md)、[75字段cohort](../specs/2026-10-11-sqlite-output-fidelity-cohort.tsv) 与 [计划](../plans/2026-10-11-sqlite-output-fidelity.md)，绑定完整接受16/17及actual helper接口。actual7e静态准备323输出/191输入已root全文/rehash，单E1七字段、15star机制仍UNEXECUTED。独立静态机制审查正在检查中断后无界wait及保留证据路径；修订通过与完整采用源码重新绑定前无mechanismGO，完整15x6/legalMAX PASS root复核前无CODEGO。全部12失去canonical路径仍缺失、Task16archives仅历史；未来public seeds新建/关闭/封存，不能恢复或借用旧receipt路径。
+
+Task20设计与有限CPU收集器仅静态准备；fresh formal review发现中断/尝试登记/完整post-child环境绑定缺口，未执行benchmark、未主张性能收益。最终Node22补充收集器V2两个原阻断已静态解决，P3初始inventory诊断恢复丢失正在最小V3修正；三原commands/四Node24 prerequisite/60s child门槛不变。Task18三旧stress FAIL与8237 paid FAILED均保留。PR69仍草稿、尚未合并；整候选/原模型60检查/whole/实际PR六CI/额外fresh合并前审核/match-head merge/actualmain六CI仍须完成。

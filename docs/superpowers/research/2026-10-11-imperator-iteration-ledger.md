@@ -172,3 +172,17 @@ usage input49479/output38973/cacheRead1346816/cacheWrite0；最终runtime计数m
 root另在执行者停止后完成实际全局 /tmp 元数据扫描：9目录593项，0 taskforce 匹配、0 symlink、0错误；原空 taskforce-native-settlement 旧目录只按原 inode/时间/空状态用 rmdir 移除。此为有界非原子扫描和空目录维护，不追补第三冻结包全局覆盖或生产清理证明。旧 raw日志/失败报告均不改。
 
 截至本实施基线，第十三项任务级 SPEC/QUALITY 均通过，第十四项尚未实现；最新实际模型仍为8237 FAILED，PR69草稿未合并。新产品全部冻结包/source/CPU/两宿主全量 native/真实模型、whole及额外实际PR审核、六项PR/main CI与expected-head merge均须实际完成。
+
+## 第十四项完成及 Node22 新缺口（12:10 UTC 更新）
+
+第十四项固定 `706295d7f1e43490f41baa04f13ee87faf10b278` / tree `ffef2a240d14ad6603efd9253f4879610da346b5`，三个文件+701/-10，111产品fingerprint `0eb7e49087911fb112828f5726b870fa1a216af6dd6ea2aa4195c6144dbb51b3`。真实两pin旧产品cold-rollback+同ID重试RED保留；新行为仅在有完整可信生命周期/当前continuable/实际disposed/无live own start时提前产生原 unsettled-tree，失败不因同ID重试消失。公开live Session lease有界读取并释放，原2215字节 waiter正文相同；shared mode classifier对Proxy/accessor证据更保守，不能宣称整个positive路径完全相同。
+
+唯一执行者最终Node24/CPU0同源码：model311/311；rc2所选native9/9；alpha所选6PASS+3公开foreground不支持SKIP；完整source1884total/1864PASS/20offlineSKIP/0FAIL、六scripts通过。此selectednative/source不是全native/模型验收。104-artifact seal `5282a2e146c2935a4803425ffcc53738dc9213639364ca873e6b762d0e81af30`。
+
+fresh SPEC `d9acbdeab2c3f329f7c24db2914efd7edca872ec3a31430e2ad84b216cdf90d6` 保存后STOP，root全文核对369local+2Git输入才明确QUALITY GO；QUALITY `19adb4ca5eba5b93c59a74e920780e02c871d97ce22310b9753d7af7e7635de6` PASS，root核对377local+2Git，receipt `935690ad04c11aeef22ca1dbcdcbc27ec34e1fc75ff37637d9dd1095d156d2d3`。没有阻塞finding。两个late waiter/cleanupdeadline组合仅静态审查，未直接强制执行；application shutdown仅观察Agent registry absence，两个disposal callback flag都false，不能宣称Session registry removal。真实fiber quiescence/指定tail重启不证明所有旧close/effect成功，也不能归因8237或生产停止。
+
+实际progress PR da50的run38133998318：三Node24 SUCCESS、三Node22 FAIL。完整ZIP/checkout tree核对；九处 history_truncated断言失败，前置report.ok与64KiB断言通过；两native12s目标child ETIMEDOUT，原CI被杀phase未观测。官方22.23.2新探针确认公开recordFact接受并完整存储NUL，board读回截断；24.19对照保真，公开json_quote/strictparse与instr小型机制通过。root proof `85098c0ee64cef73685453f729fb5ca788c843d08f5d81639ceab2da431c8a74`，不靠替换测试padding掩盖产品bug。
+
+原四native文件在localCPU0,1串行四对照保存：Node22rc2/alpha整stage60sTIMEOUT，Node24两stage实际innerexit0/timedOutfalse；四个目标child均完成原assertions/success/exit，11.659/11.771/11.608/11.600s。Node24rc2外层60.012s含driver/import采集开销，不等于inner timeout。collector65s watchdog均未触发，已退出；所有源码、prep、运行时与SDK anchors重核，root随后补核53987SDK regularfiles及60771entry modes/links未改。此本地双核不等同CI硬件，不能说明原CI timeout是flake；整Node22 stage最后活跃case尚不明。completion seal `9ac282defb9d98e4cef41168601cb15729a79c447db74f9d114adad2d2e31882`。
+
+下一步 [第十五项TEXT读取设计](../specs/2026-10-11-sqlite-text-read-design.md)：十二处业务字段、先做准确22/24与三encoding/类型/碰撞机制验证，保留输入与旧数据，再真实RED/GREEN。第十六项另核身份read-to-compare/rebind，第十七项另核preflight fingerprint，第十八项处理native耗时；均仍待设计/实现审核。最新真实模型8237 FAILED不变，无重试、无新增paid、PR69draft未合并。预算/pin/skip/DDL/依赖/acceptance标准均未放宽。

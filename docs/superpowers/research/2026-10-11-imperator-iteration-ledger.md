@@ -267,3 +267,16 @@ fresh SPEC `f69a96efbe45d3209b261a3ba2c8c733f0b12beb12c33d9eba9ba13ea99014ad` �
 正式采用 [Task20设计](../specs/2026-10-11-repeated-frozen-event-cursor-design.md) / [计划](../plans/2026-10-11-repeated-frozen-event-cursor.md)。全部13 touched/relevant源码、native tests与cost docs对frozen706字节相同，accepted16/17/19接口重新绑定；独立设计、保留测试草稿和cursor draft静态审核通过。root追加一条严格event-reference身份断言，两variant使用相同15新实例，先两pin baseline PASS再唯一模块优化。CPU preparation V2和final Node22 supplement V3独立静态审核/root read完成，但actual20代码、preservation、有限12-child CPU和全部final gates仍待执行。
 
 所有原cap/pins/CLI/default concurrency/reporters/graders/gates不变；paid8237 FAILED不可重解释或同candidate重试，历史生产停止仍未归因。PR69仍draft/unmerged、remote da50；整候选原四Node24/三Node22全量source/npm/native、ONEpurposeful新paid、whole SPEC→root→QUALITY、实际PR六CI、额外fresh合并前审核、match-head merge和actualmain parents/tree/fingerprint/version/六CI仍须全部完成。
+
+
+### 21:28 UTC：Task20 完整接受，有限 CPU 对照完成
+
+Task20 baseline43e/tree28297与implementation8f02/tree77a均为215 tracked；111产品 fingerprint `d7ab0370c75a720e67b2b730f6baf5020288f58c4dc7fecdb8b9bf371ee38683`。同一401行原测试前缀与15新public preservation实例，两准确Node pin在baseline/candidate各35/35 PASS。Node24原offline七阶段2142total/2122PASS/20existing host SKIP/0FAIL，host仍UNVERIFIED；原fixture stderr与accepted19相同。候选可调用weak故障实测3条，2项不可用能力未观测；no-target不当作GC证明。默认reporter多行test name导致root初次静态parser漏1项，旧reader/失败保留，修正后重读同一raw，未重跑runtime。
+
+fresh SPEC `fd96220472ded914ee36c5fe20f04e8dd54795894eacead1cdb269ffd6edbcd9` 保存STOP后root全文/rehash，再明确fresh QUALITY GO；fresh QUALITY `6630afe299d3cfbbd774fb8aa332af30ed304fb0a7fa062331f2403844240984` 保存STOP，root全文/rehash后接受，receipt `b2ae336dbdfcd79f6aea2182dfbdca6b2ece4e90967e76c35fa647ce8b105a50`。严格只改event-projection一个产品模块，未改snapshot、reducer、公开metrics或native cases。root接受后更新PERF/ORCH三段成本与弱持有边界，docs-only c290/tree d21a保持产品指纹不变。
+
+完整215-file frozen baseline43e与candidatec290仅event/PERF/ORCH三路径不同，tests相同。固定12串行child按各pin B/C、C/B、B/C完成，2688读/1920计时，全部raw public parity一致、stderr空、exit0且reaped，无重试/校准/删样本/overhead扣除。root独立解析每child259记录、复核73raw制品和所有完整source/pins，FULLPARSE receipt `29207fc2105b60e6e9ae6c2de85170a4fd8e3a6867c700c78335f35e348b7190`。详见 [32组性能报告](2026-10-11-repeated-frozen-event-cursor-measurement.md)：S1同一已认证冻结数组cursor两pin约16–98/24–76倍、flow约12–50/10–42倍；S2不同数组/S3追加/S4可变历史无稳定收益，较慢样本全部保留。同步同job强持有fixture/noGC，只测read窗口，不能推断完整hooks、原生60s修复、冷启动或生产停止归因。
+
+最终验收准备的fresh审查新发现F1：启动登记仅file fsync缺目录同步；F2：Node22补充V3在KeyboardInterrupt可能回收leader后仍numeric killpg。V1/V3旧准备封存、均无此次runtime；root暂停V3运行，分别准备最小V2协调器与V4补充收集器，待root fullread/fresh review，原四Node24/三Node22 commands与所有预算不变。21:21独立完整SDK60771条目/bytes/modes/links重新一致，adapter CLOSED；无SDK执行或修改，也不证明全局静止。
+
+旧Task18 native60s FAIL与paid8237 FAILED继续保留，不能同candidate付费重试或放宽grader/cap。PR69仍draft/unmerged、remote da50。最终C的原四Node24/三Node22 source/npm/双SDK native、ONEpurposeful新paid与原60检查、whole SPEC→root→freshQUALITY、实际PR六CI、额外fresh合并前审核、match-head merge与actualmain parents/tree/fingerprint/version/六CI仍须全部完成。

@@ -194,6 +194,130 @@ test('prepared identity uses the exact live ancestor chain and never creates or 
   assert.throws(() => host.prepareNativeIdentity(ctx, { version: '0.2.0-rc.2', parentAgent: child, session_id: 'x' }), code('E_SCHEDULER_CAPABILITY'))
 })
 
+function identityAgent(id, header = {}, options) {
+  return { id, session: { header: { id, ...header } }, ...(options === undefined ? {} : { options }) }
+}
+function identityFixture(version, nodes) {
+  const live = new Map(nodes.map(agent => [agent.id, agent])), lookups = []
+  const agents = { get(id) { lookups.push(id); return live.get(id) },
+    create() { assert.fail('identity preparation must not create an agent') } }
+  return { live, lookups, prepare(parentAgent, session_id = ' reserved ') {
+    return host.prepareNativeIdentity({ get: name => name === 'agents' ? agents : undefined },
+      { version, parentAgent, session_id })
+  } }
+}
+function preparedIdentity(fixture, parent, root, depth) {
+  const value = fixture.prepare(parent)
+  assert.deepEqual(value, { session_id: ' reserved ', parent_session_id: parent.id,
+    root_run_id: root.id, delegation_depth: depth, native_enabled: false })
+  assert.ok(Object.isFrozen(value))
+}
+
+for (const version of ['0.2.0-rc.2', '0.2.1-alpha.2']) {
+  test(`H01 ${version}: an ordinary fork starts its own run without reading seed ancestry`, () => {
+    const source = identityAgent('source', { origin: 'subagent', delegationDepth: 2, parentSession: 'offline' })
+    const fork = identityAgent('fork', { parentSession: source.id, isSeeded: true })
+    const fixture = identityFixture(version, [source, fork])
+    preparedIdentity(fixture, fork, fork, 1)
+    assert.ok(!fixture.lookups.includes(source.id))
+  })
+  test(`H01 ${version}: a fork and its real child work with the seed source offline`, () => {
+    const fork = identityAgent('fork', { parentSession: 'offline-seed', isSeeded: true })
+    const child = identityAgent('child', { parentSession: fork.id, origin: 'subagent', delegationDepth: 1 })
+    const fixture = identityFixture(version, [fork, child])
+    preparedIdentity(fixture, fork, fork, 1)
+    preparedIdentity(fixture, child, fork, 2)
+    assert.ok(!fixture.lookups.includes('offline-seed'))
+  })
+  test(`H01 ${version}: ordinary roots stop before even reading a seed parent field`, () => {
+    const root = identityAgent('root', { delegationDepth: 0 }, { subagentDepth: 0 })
+    Object.defineProperty(root.session.header, 'parentSession', { get() { assert.fail('seed ancestry must not be read') } })
+    preparedIdentity(identityFixture(version, [root]), root, root, 1)
+  })
+  for (const [label, headerDepth, runtimeDepth, expected] of [
+    ['ordinary root', undefined, undefined, 1],
+    ['runtime-only child', undefined, 1, 2],
+    ['runtime-only depth two', undefined, 2, null],
+    ['durable depth survives runtime zero', 1, 0, 2],
+    ['runtime deepens durable zero', 0, 1, 2],
+    ['durable two survives runtime one', 2, 1, null],
+    ['runtime two deepens durable one', 1, 2, null],
+  ]) {
+    test(`H01 ${version}: ${label}`, () => {
+      const root = identityAgent('root')
+      const current = label === 'ordinary root' ? root : identityAgent('child',
+        { parentSession: root.id, delegationDepth: headerDepth }, { subagentDepth: runtimeDepth })
+      const fixture = identityFixture(version, [root, current])
+      if (expected === null) assert.throws(() => fixture.prepare(current), code('E_SCHEDULER_CAPABILITY'))
+      else preparedIdentity(fixture, current, root, expected)
+    })
+  }
+  test(`H01 ${version}: origin-only live delegation edges count toward the depth limit`, () => {
+    const root = identityAgent('root', { parentSession: 'offline-seed' })
+    const child = identityAgent('child', { parentSession: root.id, origin: 'subagent' })
+    const grandchild = identityAgent('grandchild', { parentSession: child.id, origin: 'subagent' })
+    const fixture = identityFixture(version, [root, child, grandchild])
+    preparedIdentity(fixture, child, root, 2)
+    assert.throws(() => fixture.prepare(grandchild), code('E_SCHEDULER_CAPABILITY'))
+  })
+  test(`H01 ${version}: a fork grandchild cannot prepare depth three`, () => {
+    const fork = identityAgent('fork', { parentSession: 'offline-seed' })
+    const child = identityAgent('child', { parentSession: fork.id, origin: 'subagent', delegationDepth: 1 })
+    const grandchild = identityAgent('grandchild', { parentSession: child.id, origin: 'subagent', delegationDepth: 2 })
+    assert.throws(() => identityFixture(version, [fork, child, grandchild]).prepare(grandchild), code('E_SCHEDULER_CAPABILITY'))
+  })
+  for (const [label, value] of [['negative', -1], ['negative zero', -0], ['fraction', 1.5], ['NaN', NaN],
+    ['infinity', Infinity], ['unsafe integer', Number.MAX_SAFE_INTEGER + 1], ['null', null], ['string', '1'], ['boolean', true]]) {
+    for (const source of ['durable', 'runtime']) {
+      test(`H01 ${version}: rejects ${source} ${label} depth`, () => {
+        const root = identityAgent('root')
+        const current = identityAgent('child', { parentSession: root.id, delegationDepth: source === 'durable' ? value : 1 },
+          { subagentDepth: source === 'runtime' ? value : 1 })
+        assert.throws(() => identityFixture(version, [root, current]).prepare(current), code('E_SCHEDULER_CAPABILITY'))
+      })
+    }
+  }
+  test(`H01 ${version}: validates runtime depths on live ancestors too`, () => {
+    const root = identityAgent('root', {}, { subagentDepth: -1 })
+    const child = identityAgent('child', { parentSession: root.id, origin: 'subagent', delegationDepth: 1 })
+    assert.throws(() => identityFixture(version, [root, child]).prepare(child), code('E_SCHEDULER_CAPABILITY'))
+  })
+  for (const parentSession of [undefined, null, '', 'offline']) {
+    for (const classification of ['origin', 'durable', 'runtime']) {
+      test(`H01 ${version}: ${classification} delegation refuses missing parent ${String(parentSession)}`, () => {
+        const child = identityAgent('child', { parentSession,
+          ...(classification === 'origin' ? { origin: 'subagent' } : {}),
+          ...(classification === 'durable' ? { delegationDepth: 1 } : {}) },
+        classification === 'runtime' ? { subagentDepth: 1 } : undefined)
+        assert.throws(() => identityFixture(version, [child]).prepare(child), code('E_SCHEDULER_CAPABILITY'))
+      })
+    }
+  }
+  test(`H01 ${version}: reconstructed objects and fresh proxies cannot replace exact live agents`, () => {
+    const root = identityAgent('root')
+    const fixture = identityFixture(version, [root])
+    assert.throws(() => fixture.prepare({ ...root }), code('E_SCHEDULER_CAPABILITY'))
+    assert.throws(() => fixture.prepare(new Proxy(root, {})), code('E_SCHEDULER_CAPABILITY'))
+    root.session.header.id = 'other'
+    assert.throws(() => fixture.prepare(root), code('E_SCHEDULER_CAPABILITY'))
+  })
+  test(`H01 ${version}: occupied reserved IDs and cyclic delegated ancestry refuse`, () => {
+    const root = identityAgent('root')
+    const child = identityAgent('child', { parentSession: root.id, origin: 'subagent' })
+    const fixture = identityFixture(version, [root, child])
+    assert.throws(() => fixture.prepare(root, child.id), code('E_SCHEDULER_CAPABILITY'))
+    root.session.header.origin = 'subagent'
+    root.session.header.parentSession = child.id
+    assert.throws(() => fixture.prepare(child), { code: 'E_SCHEDULER_CAPABILITY', message: 'broken live ancestor identity' })
+  })
+  test(`H01 ${version}: ancestry traversal remains bounded at 64 live nodes`, () => {
+    const nodes = Array.from({ length: 65 }, (_, i) => identityAgent('node-' + i,
+      i === 64 ? {} : { parentSession: 'node-' + (i + 1), origin: 'subagent' }))
+    assert.throws(() => identityFixture(version, nodes).prepare(nodes[0]),
+      { code: 'E_SCHEDULER_CAPABILITY', message: 'ancestor chain exceeds bound' })
+  })
+}
+
 test('binding a lead-queued unbound task captures its actual worker for scoped state and replay', t => {
   const { store, scheduler: s } = setup(t)
   const id = store.openTask({ title: 'unbound' }, run).task_id

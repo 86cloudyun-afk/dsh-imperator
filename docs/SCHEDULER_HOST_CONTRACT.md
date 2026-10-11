@@ -21,6 +21,29 @@ GitHub source observations are not installed npm-package or deployment proof.
 | H05 | JSONL holds a kernel lock for one session writer. | Scheduler-domain process-held ownership and old execution reconciliation after host death, without TTL takeover. |
 | H06 | Host can generate canonical path/Git resource keys and independent clones. | Enforced filesystem/process isolation over every native/PTC/tool route; aliases and shared Git metadata remain deployment concerns. |
 
+H01 preparation distinguishes delegation from seed lineage. An ordinary fork
+is its own `root_run_id`, even when `header.parentSession` names a live or
+offline seed source. The helper stops at the first ordinary root without
+reading that root's seed parent. Only `origin === 'subagent'` or a positive
+effective delegation depth requires traversal to an exact live parent.
+
+At every visited Agent, effective depth is the maximum of durable
+`header.delegationDepth` and runtime `agent.options.subagentDepth`; absence
+counts as zero. Both values must be non-negative safe integers (negative zero
+also refuses). Runtime options cannot lower durable depth. The helper also
+counts actual delegation edges, including origin-only children, and preserves
+any larger ancestor depth plus the intervening edges. The prepared next depth
+must be at most two. A missing delegated parent refuses, with no offline
+ancestor fallback. Exact live Agent/header identity, reserved-ID availability,
+cycle detection and the 64-node ancestry bound remain required; reconstructed
+Agents and new Proxy wrappers cannot stand in for the registered object.
+
+The frozen prepared identity is read-only information, not an authorization
+or dispatch result. Installed idle-Agent tests cover fork lineage and actual
+runtime depth on both pinned hosts with zero model requests. They do not close
+H01's publication/delivery fences or H02–H06: every capability and
+`native_enabled` stays false, and the full native adapter still refuses.
+
 The H03 helper additionally pins Cordis's internal service tracing identity.
 `ctx.get` creates contextual proxies; wrapper equality is not service identity.
 Both reviewed releases expose the exact underlying target under

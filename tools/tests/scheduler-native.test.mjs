@@ -1,32 +1,32 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { createHash } from 'node:crypto'
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { controlledProfile, installationVersion, nativeModule, resolveInstallAnchor } from '../host-runtime.mjs'
+import { controlledProfile, installationVersion, resolveInstallAnchor } from '../host-runtime.mjs'
 
 let anchor, skip
 try { anchor = resolveInstallAnchor({}) } catch (error) { skip = error.message }
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
-test('pinned official H01 preparation and H03 strict flush raw readback; no model requests', { skip }, async () => {
+test('pinned official H01 preparation and H03 strict flush raw readback; no model requests', { skip }, async t => {
   const helpers = await import('../../lib/scheduler/dsh-host.js').catch(e => { if (e.code === 'ERR_MODULE_NOT_FOUND') return {}; throw e })
   assert.equal(typeof helpers.prepareNativeIdentity, 'function', 'native identity preparation missing')
   assert.equal(typeof helpers.flushNativeCheckpoint, 'function', 'strict native checkpoint missing')
   const previousExitCode = process.exitCode
   const version = installationVersion(anchor)
+  const mainDeadline = setTimeout(() => { console.error('SCHEDULER_DEADLINE_60S'); process.exit(124) }, 60000)
   const fixture = await controlledProfile(anchor, root)
   const cleanup = () => fixture.dispose()
   process.once('exit', cleanup)
-  let application
+  let application, requests = 0
   const handles = []
   try {
     const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
     application = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
       patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     const { ctx } = application
-    let requests = 0
     ctx.on('agent/request', () => { requests++; throw new Error('model requests forbidden') })
     const agents = ctx.get('agents')
     const parent = await agents.create({ sessionId: 'scheduler-root', meta: { cwd: fixture.root } })
@@ -68,6 +68,84 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
     assert.equal(checkpoint.quiescence_proven, false)
     assert.equal(requests, 0)
     const requireHost = createRequire(anchor)
+    const { delegationDepthOf } = await import(new URL('./types/depth.js', pathToFileURL(requireHost.resolve('@deepseek-ai/dsh-subagent'))))
+    const create = async options => {
+      const handle = await agents.create(options)
+      handles.push(handle)
+      assert.equal(agents.get(handle.agent.id), handle.agent)
+      return handle
+    }
+    const prepare = agent => helpers.prepareNativeIdentity(ctx, { version, parentAgent: agent, session_id: 'scheduler-unused' })
+    const checkPrepared = (agent, run, depth) => {
+      const value = prepare(agent)
+      assert.deepEqual(value, { session_id: 'scheduler-unused', parent_session_id: agent.id,
+        root_run_id: run.id, delegation_depth: depth, native_enabled: false })
+      assert.ok(Object.isFrozen(value))
+      return value
+    }
+    const seed = await create({ sessionId: 'scheduler-seed', meta: { cwd: fixture.root } })
+    const fork = await create({ sessionId: 'scheduler-fork', meta: { cwd: fixture.root, parentSession: seed.agent.id, isSeeded: true },
+      seed: [], inheritedEventCount: 0 })
+    const forkChild = await create({ sessionId: 'scheduler-fork-child', parentAgent: fork.agent,
+      meta: { cwd: fixture.root, parentSession: fork.agent.id, origin: 'subagent', delegationDepth: 1 } })
+    const forkGrandchild = await create({ sessionId: 'scheduler-fork-grandchild', parentAgent: forkChild.agent,
+      meta: { cwd: fixture.root, parentSession: forkChild.agent.id, origin: 'subagent', delegationDepth: 2 } })
+    assert.ok(agents.roots().includes(fork.agent))
+    assert.equal(fork.agent.session.header.parentSession, seed.agent.id)
+    assert.equal(fork.agent.session.header.origin, undefined)
+    assert.equal(fork.agent.session.header.delegationDepth, undefined)
+    assert.equal(delegationDepthOf(fork.agent), 0)
+    await t.test('ordinary fork retains its independent run with a live seed source', () => {
+      checkPrepared(fork.agent, fork.agent, 1)
+    })
+    await t.test('a real child of an ordinary fork may prepare depth two', () => {
+      assert.equal(delegationDepthOf(forkChild.agent), 1)
+      checkPrepared(forkChild.agent, fork.agent, 2)
+    })
+    await t.test('a real fork grandchild refuses depth three', () => {
+      assert.equal(delegationDepthOf(forkGrandchild.agent), 2)
+      assert.throws(() => prepare(forkGrandchild.agent), { code: 'E_SCHEDULER_CAPABILITY' })
+    })
+    await seed.dispose()
+    assert.equal(agents.get(seed.agent.id), undefined)
+    await t.test('ordinary fork and delegated child retain their run with the seed source offline', () => {
+      assert.ok(agents.roots().includes(fork.agent))
+      checkPrepared(fork.agent, fork.agent, 1)
+      checkPrepared(forkChild.agent, fork.agent, 2)
+    })
+    for (const [label, headerDepth, runtimeDepth, expected] of [
+      ['runtime-only-one', undefined, 1, 2],
+      ['runtime-only-two', undefined, 2, null],
+      ['durable-one-runtime-zero', 1, 0, 2],
+      ['durable-zero-runtime-one', 0, 1, 2],
+      ['durable-two-runtime-one', 2, 1, null],
+      ['durable-one-runtime-two', 1, 2, null],
+    ]) {
+      const runtime = await create({ sessionId: 'scheduler-' + label, parentAgent: parent.agent,
+        meta: { cwd: fixture.root, parentSession: parent.agent.id, ...(headerDepth === undefined ? {} : { delegationDepth: headerDepth }) },
+        agentOptions: { subagentDepth: runtimeDepth } })
+      assert.equal(runtime.agent.session.header.delegationDepth, headerDepth)
+      assert.equal(runtime.agent.options.subagentDepth, runtimeDepth)
+      assert.equal(delegationDepthOf(runtime.agent), Math.max(headerDepth ?? 0, runtimeDepth))
+      await t.test('actual Agent options: ' + label, () => {
+        if (expected === null) assert.throws(() => prepare(runtime.agent), { code: 'E_SCHEDULER_CAPABILITY' })
+        else checkPrepared(runtime.agent, parent.agent, expected)
+      })
+    }
+    await t.test('actual runtime-only depth two without a delegated parent refuses', async () => {
+      const runtime = await create({ sessionId: 'scheduler-runtime-root-two', meta: { cwd: fixture.root }, agentOptions: { subagentDepth: 2 } })
+      assert.equal(delegationDepthOf(runtime.agent), 2)
+      assert.throws(() => prepare(runtime.agent), { code: 'E_SCHEDULER_CAPABILITY' })
+    })
+    await t.test('actual Agent clones and fresh proxies are rejected as parent identity', () => {
+      assert.throws(() => prepare({ ...fork.agent }), { code: 'E_SCHEDULER_CAPABILITY' })
+      assert.throws(() => prepare(new Proxy(fork.agent, {})), { code: 'E_SCHEDULER_CAPABILITY' })
+    })
+    assert.equal(requests, 0)
+    assert.equal(helpers.nativeSchedulerCapabilities({ version, native_enabled: true }).native_enabled, false)
+    assert.ok(helpers.nativeSchedulerCapabilities({ version }).capabilities.every(capability => capability.enabled === false))
+    console.log('SCHEDULER_IDENTITY_MATRIX_OBSERVED ' + JSON.stringify({ version, exact_live_agents: true,
+      fork_seed_source_disposed: true, runtime_options_observed: true, native_enabled: false, model_requests: requests }))
     for (const name of ['cordis', 'dsh-agent', 'dsh-session', 'dsh-session-persistence', 'dsh-session-persistence-jsonl', 'dsh-subprocess']) {
       const entry = requireHost.resolve('@deepseek-ai/' + name)
       const bytes = readFileSync(entry)
@@ -82,7 +160,25 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
     }
     console.log('SCHEDULER_HOST_VERIFIED ' + JSON.stringify({ version, checks: ['prebound-id', 'live-parent', 'strict-flush', 'raw-readback'], native_enabled: false, model_requests: requests }))
   } finally {
-    try { for (const handle of handles.reverse()) await handle.dispose() }
-    finally { try { await application?.shutdown.shutdown(1) } finally { process.off('exit', cleanup); fixture.dispose(); process.exitCode = previousExitCode } }
+    const cleanupStarted = Date.now()
+    const cleanupDeadline = setTimeout(() => { console.error('SCHEDULER_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+    let disposed = 0, shutdown = false, remaining
+    try {
+      for (const handle of handles.reverse()) { await handle.dispose(); disposed++ }
+      remaining = application?.ctx.get('agents').list().length
+      assert.equal(remaining, 0)
+    } finally {
+      try { await application?.shutdown.shutdown(1); shutdown = true }
+      finally {
+        process.off('exit', cleanup)
+        fixture.dispose()
+        clearTimeout(cleanupDeadline)
+        clearTimeout(mainDeadline)
+        process.exitCode = previousExitCode
+        console.log('SCHEDULER_CLEANUP_OBSERVED ' + JSON.stringify({ version, handles_disposed: disposed,
+          remaining_live_agents: remaining, application_shutdown: shutdown, profile_removed: !existsSync(fixture.root),
+          cleanup_ms: Date.now() - cleanupStarted, model_requests: requests }))
+      }
+    }
   }
 })

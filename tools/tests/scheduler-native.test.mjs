@@ -10,6 +10,24 @@ import { controlledProfile, installationVersion, resolveInstallAnchor } from '..
 let anchor, skip
 try { anchor = resolveInstallAnchor({}) } catch (error) { skip = error.message }
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
+// Shared acquisition used by the main native matrix and setup-fault probes.
+async function acquireSchedulerFixture(inspect) {
+  const previousExitCode = process.exitCode
+  const version = installationVersion(anchor)
+  const mainDeadline = setTimeout(() => { console.error('SCHEDULER_DEADLINE_60S'); process.exit(124) }, 60000)
+  try {
+    inspect?.({ mainDeadline, previousExitCode })
+    const fixture = await controlledProfile(anchor, root)
+    const cleanup = () => fixture.emergencyDispose()
+    process.once('exit', cleanup)
+    return { fixture, cleanup, mainDeadline, previousExitCode, version }
+  } catch (error) {
+    clearTimeout(mainDeadline)
+    process.exitCode = previousExitCode
+    throw error
+  }
+}
+
 async function cleanupScheduler({ fixture, application, workingStore, handles, cleanup, mainDeadline, previousExitCode, version, requests, failures = [] }) {
   const cleanupStarted = Date.now()
   const cleanupDeadline = setTimeout(() => { console.error('SCHEDULER_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
@@ -18,12 +36,12 @@ async function cleanupScheduler({ fixture, application, workingStore, handles, c
     for (const handle of handles.reverse()) {
       try { await fixture.teardown(() => handle.dispose()); disposed++ } catch (error) { failures.push(error) }
     }
-    try { remaining = application?.ctx.get('agents').list().length; assert.equal(remaining, 0) }
+    try { if (application) { remaining = application.ctx.get('agents').list().length; assert.equal(remaining, 0) } }
     catch (error) { failures.push(error) }
   } finally {
     try { workingStore?.close() } catch (error) { failures.push(error) }
     finally {
-      try { await fixture.shutdown(1); shutdown = true } catch (error) { failures.push(error) }
+      try { await fixture.shutdown(1); shutdown = Boolean(application) } catch (error) { failures.push(error) }
       finally {
         try { fixture.dispose() } catch (error) { failures.push(error) }
         finally {
@@ -47,12 +65,7 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
   const helpers = await import('../../lib/scheduler/dsh-host.js').catch(e => { if (e.code === 'ERR_MODULE_NOT_FOUND') return {}; throw e })
   assert.equal(typeof helpers.prepareNativeIdentity, 'function', 'native identity preparation missing')
   assert.equal(typeof helpers.flushNativeCheckpoint, 'function', 'strict native checkpoint missing')
-  const previousExitCode = process.exitCode
-  const version = installationVersion(anchor)
-  const mainDeadline = setTimeout(() => { console.error('SCHEDULER_DEADLINE_60S'); process.exit(124) }, 60000)
-  const fixture = await controlledProfile(anchor, root)
-  const cleanup = () => fixture.emergencyDispose()
-  process.once('exit', cleanup)
+  const { fixture, cleanup, mainDeadline, previousExitCode, version } = await acquireSchedulerFixture()
   let application, workingStore, requests = 0
   const handles = [], failures = []
   try {
@@ -270,45 +283,116 @@ test('pinned official H01 preparation and H03 strict flush raw readback; no mode
 })
 
 
-test('scheduler store close failure still shuts down the actual app and preserves cleanup errors', { skip }, async () => {
+async function exerciseSchedulerCloseFault({ failAt, primary, inspect } = {}) {
   const { TaskforceStore } = await import('../../lib/store/index.js')
-  const fixture = await controlledProfile(anchor, root)
-  const previousExitCode = process.exitCode, baselineExit = process.rawListeners('exit')
-  const mainDeadline = setTimeout(() => { process.exit(124) }, 60000)
-  const cleanup = () => fixture.emergencyDispose ? fixture.emergencyDispose() : fixture.dispose()
-  process.once('exit', cleanup)
-  const run = fixture.runProfile ?? (await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)).runProfile
-  const application = await run({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
-    patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
-  const workingStore = new TaskforceStore(join(fixture.root, 'close-fault'))
-  workingStore.open()
-  const close = workingStore.close.bind(workingStore), sentinel = new Error('actual store close sentinel')
-  workingStore.close = () => { close(); throw sentinel }
-  let attempted = false
-  const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
-  const before = events.map(event => process.rawListeners(event))
-  const shutdown = application.shutdown.shutdown.bind(application.shutdown)
-  application.shutdown.shutdown = (...args) => {
-    attempted = true
-    assert.deepEqual(events.map(event => process.rawListeners(event)), before, 'callbacks must cover actual shutdown')
-    return shutdown(...args)
-  }
+  const resources = await acquireSchedulerFixture()
+  const { fixture, cleanup, mainDeadline, previousExitCode } = resources
+  const baselineExit = process.rawListeners('exit').filter(callback => callback !== cleanup && callback.listener !== cleanup)
   const disposeFixture = fixture.dispose, diagnostic = new Error('injected fixture diagnostic')
-  fixture.dispose = () => { disposeFixture(); throw diagnostic }
-  let failure
+  const failures = []
+  let failure, setupFailure, sentinel
   try {
-    try { await cleanupScheduler({ fixture, application, workingStore, handles: [], cleanup, mainDeadline,
-      previousExitCode, version: installationVersion(anchor), requests: 0 }) } catch (error) { failure = error }
-    assert.equal(attempted, true, 'actual store.close error skipped native shutdown')
-    const all = error => error instanceof AggregateError ? error.errors.flatMap(all) : [error]
-    assert.ok(all(failure).includes(sentinel))
-    assert.ok(all(failure).includes(diagnostic))
-    assert.equal(existsSync(fixture.root), false)
-    assert.equal(mainDeadline._destroyed, true)
-    assert.deepEqual(process.rawListeners('exit'), baselineExit)
-    assert.equal(process.exitCode, previousExitCode)
-  } finally {
-    try { if (!attempted) await shutdown(1) }
-    finally { clearTimeout(mainDeadline); process.off('exit', cleanup); disposeFixture(); process.exitCode = previousExitCode }
+    fixture.dispose = () => { disposeFixture(); throw diagnostic }
+    Object.assign(resources, { disposeFixture, diagnostic, attempted: false })
+    inspect?.(resources)
+    const application = resources.application = await fixture.runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+      patchFiles: [fixture.overlay], get args() {
+        if (failAt === 'boot') throw primary
+        return ['--host', '127.0.0.1', '--port', '0', '--no-open']
+      } })
+    const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+    const before = events.map(event => process.rawListeners(event))
+    const shutdown = application.shutdown.shutdown.bind(application.shutdown)
+    application.shutdown.shutdown = (...args) => {
+      resources.attempted = true
+      assert.deepEqual(events.map(event => process.rawListeners(event)), before, 'callbacks must cover actual shutdown')
+      return shutdown(...args)
+    }
+    const workingStore = resources.workingStore = new TaskforceStore(join(fixture.root, 'close-fault'))
+    const open = workingStore.open.bind(workingStore)
+    workingStore.open = () => { const db = open(); if (failAt === 'store') throw primary; return db }
+    workingStore.open()
+    const close = workingStore.close.bind(workingStore)
+    sentinel = new Error('actual store close sentinel')
+    workingStore.close = () => { close(); throw sentinel }
+  } catch (error) { resources.setupFailure = setupFailure = error; failures.push(error) }
+  finally {
+    try { await cleanupScheduler({ ...resources, handles: [], requests: 0, failures }) }
+    catch (error) { failure = error }
   }
+  if (setupFailure) throw failure
+  assert.equal(resources.attempted, true, 'actual store.close error skipped native shutdown')
+  const all = error => error instanceof AggregateError ? error.errors.flatMap(all) : [error]
+  assert.ok(all(failure).includes(sentinel))
+  assert.ok(all(failure).includes(diagnostic))
+  assert.equal(existsSync(fixture.root), false)
+  assert.equal(mainDeadline._destroyed, true)
+  assert.deepEqual(process.rawListeners('exit'), baselineExit)
+  assert.equal(process.exitCode, previousExitCode)
+}
+
+test('scheduler store close failure still shuts down the actual app and preserves cleanup errors', { skip },
+  () => exerciseSchedulerCloseFault())
+
+for (const failAt of ['boot', 'store']) {
+  test('scheduler actual ' + failAt + ' setup rejection releases its fixture and preserves both errors', { skip }, async () => {
+    const primary = new Error('actual ' + failAt + ' setup sentinel')
+    const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+    const before = events.map(event => process.rawListeners(event)), previousHome = process.env.DSH_HOME
+    const previousTelemetry = process.env.DSH_TELEMETRY_DISABLED
+    const previousExitCode = process.exitCode
+    let resources, failure
+    try {
+      try { await exerciseSchedulerCloseFault({ failAt, primary, inspect: value => { resources = value } }) }
+      catch (error) { failure = error }
+      console.log('SCHEDULER_SETUP_FAILURE_OBSERVED ' + JSON.stringify({ failAt,
+        original_error: failure === resources.setupFailure || failure?.errors?.includes(resources.setupFailure),
+        fixture_disposed: resources.fixture.isDisposed(), profile_removed: !existsSync(resources.fixture.root),
+        main_timer_cleared: resources.mainDeadline._destroyed, application_shutdown: resources.attempted }))
+      assert.equal(resources.fixture.isDisposed(), true, 'setup rejection bypassed fixture cleanup')
+      const all = error => error instanceof AggregateError ? error.errors.flatMap(all) : [error]
+      assert.ok(all(failure).includes(resources.setupFailure), 'actual setup rejection identity lost')
+      // Native boot wraps host-preparation errors with cause; preserve both
+      // exact objects, rather than treating the SDK wrapper as cleanup loss.
+      if (failAt === 'boot') assert.equal(resources.setupFailure.cause, primary)
+      else assert.equal(resources.setupFailure, primary)
+      assert.ok(all(failure).includes(resources.diagnostic), 'secondary fixture diagnostic lost')
+      assert.equal(resources.attempted, failAt === 'store')
+      assert.equal(existsSync(resources.fixture.root), false)
+      assert.equal(resources.mainDeadline._destroyed, true)
+      assert.equal(process.rawListeners('exit').some(callback => callback === resources.cleanup || callback.listener === resources.cleanup), false)
+      assert.deepEqual(events.map(event => process.rawListeners(event)), before)
+      assert.equal(process.env.DSH_HOME, previousHome)
+      assert.equal(process.env.DSH_TELEMETRY_DISABLED, previousTelemetry)
+      assert.equal(process.exitCode, previousExitCode)
+      const next = await controlledProfile(anchor, root); next.dispose()
+    } finally {
+      // RED-only fallback also protects failed assertions; not the path under test.
+      if (resources) {
+        try { resources.workingStore?.close() } catch {}
+        try { await resources.fixture.shutdown(1) }
+        finally {
+          try { resources.disposeFixture() }
+          finally { clearTimeout(resources.mainDeadline); process.off('exit', resources.cleanup); process.exitCode = previousExitCode }
+        }
+      }
+    }
+  })
+}
+
+test('scheduler fixture acquisition rejection clears the already-started main deadline', { skip }, async () => {
+  const active = await controlledProfile(anchor, root)
+  const ownedHome = process.env.DSH_HOME, previousExitCode = process.exitCode
+  const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT', 'exit']
+  const before = events.map(event => process.rawListeners(event))
+  let timer
+  try {
+    await assert.rejects(acquireSchedulerFixture(value => { timer = value.mainDeadline }), /active controlled profile/)
+    assert.equal(timer._destroyed, true, 'rejected fixture acquisition retained the main deadline')
+    assert.equal(process.env.DSH_HOME, ownedHome, 'rejection must not disturb the existing fixture')
+    assert.equal(active.isDisposed(), false)
+    assert.equal(existsSync(active.root), true)
+    assert.deepEqual(events.map(event => process.rawListeners(event)), before)
+    assert.equal(process.exitCode, previousExitCode)
+  } finally { clearTimeout(timer); active.dispose() }
 })

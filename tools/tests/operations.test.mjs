@@ -69,6 +69,37 @@ function tableRows(db) {
   return Object.fromEntries(tables.map(({ name }) => [name, db.prepare('SELECT * FROM "' + name.replaceAll('"', '""') + '" ORDER BY rowid').all()]))
 }
 
+test('doctor backup and restore preserve withdrawal decisions and zero-write replay', async t => {
+  const ops = api(), f = fixture(t)
+  const lead = { role: 'lead', sessionId: 'root' }, worker = { role: 'worker', sessionId: 'worker' }
+  const task = seed(f, true), scheduler = new TaskforceScheduler(f.store)
+  assert.equal(typeof scheduler.withdraw, 'function', 'host-only withdraw API missing')
+  const queued = scheduler.enqueue({ request_key: 'queue', task_id: task.task_id, generation: 0,
+    kind: 'new', mode: 'write', resources: ['repo'] }, 'run', worker)
+  new TaskforceGovernor(f.store).snapshot('run')
+  const request = { request_id: queued.request_id, request_key: 'withdraw' }
+  const result = scheduler.withdraw(request, 'run', worker)
+  assert.deepEqual(result, { status: 'withdrawn', request: { ...queued, state: 'withdrawn' }, replay: false })
+  const original = tableRows(f.store.handle), before = bytes(f.store.dbPath)
+  assert.equal(safe(await ops.doctor({ root: f.root })).ok, true)
+  assert.equal(bytes(f.store.dbPath), before)
+  const backup = join(f.directory, 'withdraw-backup'), out = join(f.directory, 'withdraw-restored')
+  assert.equal(safe(await ops.backup({ root: f.root, out: backup })).ok, true)
+  assert.deepEqual(database(join(backup, 'taskforce.db'), tableRows), original)
+  assert.equal(safe(await ops.restore({ backup, out })).ok, true)
+  assert.deepEqual(database(join(out, 'taskforce.db'), tableRows), original)
+  assert.equal(safe(await ops.doctor({ root: out })).ok, true)
+  const restored = new TaskforceStore(out)
+  t.after(() => restored.close())
+  const restoredScheduler = new TaskforceScheduler(restored), db = restored.open()
+  const initialChanges = db.prepare('SELECT total_changes() AS n').get().n
+  assert.deepEqual(restoredScheduler.withdraw(request, 'run', worker), { ...result, replay: true })
+  assert.deepEqual(restoredScheduler.withdraw(request, 'run', lead), { ...result, replay: true })
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, initialChanges)
+  assert.deepEqual(tableRows(db), original)
+  assert.deepEqual(tableRows(f.store.handle), original)
+})
+
 test('doctor creates neither a missing database nor a missing root', async t => {
   const ops = api(), f = fixture(t), missing = join(f.directory, 'absent', 'nested')
   const result = safe(await ops.doctor({ root: missing }))

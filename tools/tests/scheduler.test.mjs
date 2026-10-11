@@ -513,6 +513,349 @@ function durableSchedulingRows(store) {
     .map(table => ({ table, rows: store.open().prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all() })))
 }
 
+function withdraw(scheduler, row, requestKey = 'withdraw', authority = worker, scope = run) {
+  assert.equal(typeof scheduler.withdraw, 'function', 'host-only withdraw API missing')
+  return scheduler.withdraw({ request_id: row.request_id, request_key: requestKey }, scope, authority)
+}
+function rowBytes(store, tables) {
+  return JSON.stringify(tables.map(table => [table, store.open().prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all()]))
+}
+function taskGovernorBytes(store) {
+  return rowBytes(store, ['task', 'governor_run', 'governor_reservation', 'governor_retry_charge', 'governor_hold', 'governor_audit'])
+}
+function changes(store) { return store.open().prepare('SELECT total_changes() AS n').get().n }
+function queueRow(store, row) { return { ...store.open().prepare('SELECT * FROM scheduler_request WHERE request_id = ?').get(row.request_id) } }
+
+test('withdraw removes only a queued intent and preserves ordinary FIFO, exact payload, and bounded state', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const a = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+  const b = s.enqueue(input(task(store)), run, worker)
+  const c = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const before = taskGovernorBytes(store), original = queueRow(store, b)
+  const result = withdraw(s, b)
+  assert.deepEqual(result, { status: 'withdrawn', request: { ...b, state: 'withdrawn' }, replay: false })
+  assert.deepEqual(queueRow(store, b), { ...original, state: 'withdrawn' })
+  assert.equal(taskGovernorBytes(store), before)
+  assert.deepEqual(s.enqueue(input(b.task_id), run, worker), result.request)
+  const page = s.state({ limit: 2 }, run, worker)
+  assert.deepEqual(page.requests.map(row => row.state), ['queued', 'withdrawn'])
+  assert.equal(page.has_more, true)
+  assert.deepEqual(s.state({ after: page.next_after, limit: 2 }, run, worker).requests, [c])
+  assert.equal(admit(s, 'first').request.request_id, a.request_id)
+  assert.equal(admit(s, 'second').request.request_id, c.request_id)
+  assert.equal(admit(s, 'empty').status, 'empty')
+})
+
+for (const kind of ['new', 'retry']) {
+  test('withdraw unblocks FIFO after default cumulative ' + kind + ' budget is exhausted without changing task or governor rows', t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    const id = task(store), limits = g.snapshot(run).limits
+    let generation = 0
+    const count = kind === 'new' ? limits.max_created : limits.max_retries
+    for (let i = 0; i < count; i++) {
+      const reservation = g.reserve({ operation_key: 'consume-' + i, task_id: id, generation,
+        kind, mode: 'read', resources: [] }, run, lead)
+      generation = reservation.generation
+      g.settle({ reservation_id: reservation.reservation_id, generation, proof: { kind: 'never_started' } }, run, lead)
+    }
+    const head = s.enqueue(input(id, { generation, kind }), run, worker)
+    const tail = s.enqueue(input(task(store)), run, worker)
+    assert.equal(g.snapshot(run).active_total, 0)
+    for (const decision of ['blocked-once', 'blocked-again']) {
+      const blocked = admit(s, decision)
+      assert.equal(blocked.status, 'blocked')
+      assert.equal(blocked.code, 'E_BUDGET_EXHAUSTED')
+      assert.equal(blocked.request.request_id, head.request_id)
+    }
+    const before = taskGovernorBytes(store), original = queueRow(store, head)
+    assert.equal(withdraw(s, head).status, 'withdrawn')
+    assert.equal(taskGovernorBytes(store), before)
+    assert.deepEqual(queueRow(store, head), { ...original, state: 'withdrawn' })
+    assert.equal(admit(s, 'blocked-once').status, 'blocked', 'historical admission decision stays historical')
+    assert.equal(admit(s, 'after-withdraw').request.request_id, tail.request_id)
+    const snapshot = g.snapshot(run)
+    assert.deepEqual(snapshot.limits, limits)
+    assert.equal(kind === 'new' ? snapshot.created_total : snapshot.retries[id], count)
+  })
+}
+
+test('withdraw explicitly clears temporary resource FIFO blockage without releasing the other run hold', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const external = task(store, worker.sessionId, 'other')
+  g.reserve({ operation_key: 'external', task_id: external, generation: 0, kind: 'new', mode: 'write', resources: ['repo'] }, 'other', lead)
+  const head = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+  const tail = s.enqueue(input(task(store)), run, worker)
+  for (const decision of ['blocked-a', 'blocked-b']) {
+    const blocked = admit(s, decision)
+    assert.equal(blocked.code, 'E_RESOURCE_BUSY')
+    assert.equal(blocked.request.request_id, head.request_id)
+    assert.equal(s.state({}, run, worker).requests[1].state, 'queued')
+  }
+  const before = taskGovernorBytes(store)
+  withdraw(s, head)
+  assert.equal(taskGovernorBytes(store), before)
+  assert.equal(admit(s, 'after-withdraw').request.request_id, tail.request_id)
+  assert.equal(g.snapshot('other').holds.length, 1)
+})
+
+test('withdraw validates exact bounded keys, input shape, trusted authority and root run without writes', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const row = s.enqueue(input(task(store)), run, worker)
+  assert.equal(typeof s.withdraw, 'function', 'host-only withdraw API missing')
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), initialChanges = changes(store)
+  const valid = { request_id: row.request_id, request_key: ' withdraw ' }
+  for (const value of [undefined, null, 1, '', ' ', 'x'.repeat(513), '界'.repeat(171)]) {
+    for (const field of ['request_id', 'request_key']) {
+      assert.throws(() => s.withdraw({ ...valid, [field]: value }, run, worker), code('E_SCHEDULER_CONFLICT'))
+    }
+  }
+  for (const invalid of [null, [], {}, { ...valid, generation: 0 }, { ...valid, run_id: run }]) {
+    assert.throws(() => s.withdraw(invalid, run, worker), code('E_SCHEDULER_CONFLICT'))
+  }
+  for (const authority of [undefined, {}, { role: 'root', sessionId: lead.sessionId },
+    { ...worker, sessionId: '' }, { ...worker, sessionId: 's'.repeat(513) }, { ...worker, sessionId: 'child' }]) {
+    assert.throws(() => s.withdraw(valid, run, authority), code('E_SCHEDULER_CONFLICT'))
+  }
+  for (const scope of ['', 'run', 'other', 'r'.repeat(513)]) {
+    assert.throws(() => s.withdraw(valid, scope, lead), code('E_SCHEDULER_CONFLICT'))
+  }
+  assert.throws(() => s.withdraw({ ...valid, request_id: 'missing' }, run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  assert.equal(s.withdraw(valid, run, worker).replay, false)
+  assert.equal(s.withdraw(valid, run, worker).replay, true)
+  assert.throws(() => s.withdraw({ ...valid, request_key: 'withdraw' }, run, worker), code('E_SCHEDULER_CONFLICT'))
+})
+
+test('withdraw requires current and captured owners before first mutation and before replay; same-run lead can recover', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const root = { sessionId: lead.sessionId, isRoot: true }, original = { sessionId: worker.sessionId, isRoot: false }
+  const replacement = { role: 'worker', sessionId: 'replacement' }
+  const rows = []
+  for (let i = 0; i < 2; i++) {
+    const id = task(store)
+    store.submitTask({ task_id: id }, run, original)
+    store.rejectTask({ task_id: id, reason: 'reassignment' }, run, root)
+    rows.push(s.enqueue(input(id), run, worker))
+  }
+  const historical = withdraw(s, rows[0], 'historical')
+  for (const row of rows) store.claimTask({ task_id: row.task_id, child_id: 'replacement' }, run, root, replacement.sessionId)
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store), initialChanges = changes(store)
+  for (const authority of [worker, replacement]) {
+    assert.throws(() => withdraw(s, rows[0], 'historical', authority), code('E_SCHEDULER_CONFLICT'))
+    assert.throws(() => withdraw(s, rows[1], 'new', authority), code('E_SCHEDULER_CONFLICT'))
+  }
+  assert.throws(() => withdraw(s, rows[0], 'historical', lead, 'other'), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  assert.deepEqual(withdraw(s, rows[0], 'historical', lead), { ...historical, replay: true })
+  assert.equal(changes(store), initialChanges)
+  assert.equal(withdraw(s, rows[1], 'lead-recovery', lead).status, 'withdrawn')
+  assert.equal(taskGovernorBytes(store), taskBefore)
+})
+
+test('withdraw rejects worker claim of a lead-queued null captured owner without capturing it; lead can withdraw', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = store.openTask({ title: 'unbound intent' }, run).task_id
+  const row = s.enqueue(input(id), run, lead)
+  store.claimTask({ task_id: id, child_id: 'label' }, run, { sessionId: worker.sessionId, isRoot: false }, worker.sessionId)
+  g.snapshot(run)
+  const before = taskGovernorBytes(store), queue = queueRow(store, row), initialChanges = changes(store)
+  assert.equal(queue.owner_session, null)
+  assert.throws(() => withdraw(s, row), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.deepEqual(queueRow(store, row), queue)
+  const first = withdraw(s, row, 'lead-only', lead)
+  assert.throws(() => withdraw(s, row, 'lead-only'), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(taskGovernorBytes(store), before)
+  assert.equal(queueRow(store, row).owner_session, null)
+  assert.deepEqual(withdraw(s, row, 'lead-only', lead), { ...first, replay: true })
+})
+
+test('withdraw decision binds action and target, rejects fresh keys on withdrawn intents, and replays read-only after reopen', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const row = s.enqueue(input(task(store)), run, worker), other = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const first = withdraw(s, row, ' exact-withdraw ')
+  const record = store.open().prepare('SELECT * FROM scheduler_decision WHERE request_key = ?').get(' exact-withdraw ')
+  assert.deepEqual(JSON.parse(record.result), { action: 'withdraw', request_id: row.request_id,
+    result: { status: 'withdrawn', request: first.request } })
+  assert.equal(record.actor_session, worker.sessionId)
+  const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store), initialChanges = changes(store)
+  assert.throws(() => withdraw(s, row, 'new-key'), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => withdraw(s, other, ' exact-withdraw '), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => admit(s, ' exact-withdraw '), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(withdraw(s, row, ' exact-withdraw '), { ...first, replay: true })
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  t.after(() => reopened.close())
+  const restored = new module.TaskforceScheduler(reopened)
+  const reopenedChanges = changes(reopened)
+  assert.deepEqual(withdraw(restored, row, ' exact-withdraw '), { ...first, replay: true })
+  assert.deepEqual(withdraw(restored, row, ' exact-withdraw ', lead), { ...first, replay: true })
+  assert.equal(changes(reopened), reopenedChanges)
+  assert.equal(durableSchedulingRows(reopened), before)
+  assert.equal(taskGovernorBytes(reopened), taskBefore)
+  assert.deepEqual(restored.enqueue(input(row.task_id), run, worker), first.request)
+})
+
+test('withdraw refuses an existing untagged admission key while historical admission replay stays compatible', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const old = admit(s, 'empty-admission')
+  assert.equal(old.status, 'empty')
+  const row = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), initialChanges = changes(store)
+  assert.throws(() => withdraw(s, row, 'empty-admission'), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(admit(s, 'empty-admission'), { ...old, replay: true })
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  assert.equal(withdraw(s, row, 'fresh-key').status, 'withdrawn')
+})
+
+for (const state of ['reserved', 'running', 'unknown', 'settled', 'refused']) {
+  test('withdraw refuses ' + state + ' requests without changing reservations, holds, tasks or decisions', t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    const row = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+    if (state === 'refused') {
+      const direct = g.reserve({ operation_key: 'advance', task_id: row.task_id, generation: 0, kind: 'reuse', mode: 'read', resources: [] }, run, lead)
+      g.settle({ reservation_id: direct.reservation_id, generation: direct.generation, proof: { kind: 'never_started' } }, run, lead)
+      assert.equal(admit(s).status, 'refused')
+    } else {
+      const admitted = admit(s).request
+      assert.equal(queueRow(store, row).state, 'admitted')
+      if (['running', 'unknown'].includes(state)) s.bind(ref(admitted, { session_id: worker.sessionId }), run, worker)
+      if (state === 'unknown') s.markUnknown(ref(admitted, { reason: 'DELIVERY_UNKNOWN' }), run, worker)
+      if (state === 'settled') s.settle(ref(admitted, { proof: { kind: 'never_started' } }), run, lead)
+    }
+    assert.equal(s.state({}, run, lead).requests[0].state, state)
+    g.snapshot(run)
+    const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store), initialChanges = changes(store)
+    for (const authority of [lead, worker]) assert.throws(() => withdraw(s, row, 'invalid', authority), code('E_SCHEDULER_CONFLICT'))
+    assert.equal(changes(store), initialChanges)
+    assert.equal(durableSchedulingRows(store), before)
+    assert.equal(taskGovernorBytes(store), taskBefore)
+  })
+}
+
+test('withdraw refuses even a queued row if a reservation is already attached', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const row = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+  admit(s)
+  store.open().prepare("UPDATE scheduler_request SET state = 'queued' WHERE request_id = ?").run(row.request_id)
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), initialChanges = changes(store)
+  assert.throws(() => withdraw(s, row, 'invalid', lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+})
+
+for (const fault of ['cas', 'decision-insert', 'outer-rollback']) {
+  test('withdraw rolls back queue and decision on ' + fault + ' failure', t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    const row = s.enqueue(input(task(store)), run, worker)
+    g.snapshot(run)
+    const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store)
+    if (fault === 'cas') store.open().exec("CREATE TRIGGER reject_withdraw BEFORE UPDATE OF state ON scheduler_request WHEN NEW.state = 'withdrawn' BEGIN SELECT RAISE(IGNORE); END")
+    if (fault === 'decision-insert') store.open().exec("CREATE TRIGGER reject_withdraw BEFORE INSERT ON scheduler_decision BEGIN SELECT RAISE(ABORT, 'injected withdraw decision failure'); END")
+    if (fault === 'outer-rollback') {
+      assert.throws(() => withWriteTransaction(store.open(), () => {
+        assert.equal(withdraw(s, row).status, 'withdrawn')
+        throw new Error('outer withdraw rollback')
+      }), /outer withdraw rollback/)
+    } else assert.throws(() => withdraw(s, row), fault === 'cas' ? code('E_SCHEDULER_CONFLICT') : /injected withdraw decision failure/)
+    assert.equal(durableSchedulingRows(store), before)
+    assert.equal(taskGovernorBytes(store), taskBefore)
+    if (fault !== 'outer-rollback') store.open().exec('DROP TRIGGER reject_withdraw')
+    assert.equal(withdraw(s, row).replay, false)
+  })
+}
+
+async function schedulerRace(t, store, commands) {
+  const children = commands.map(({ action, key, target = '' }) => fork(new URL('./fixtures/scheduler-worker.mjs', import.meta.url),
+    [store.root, run, key, action, target], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] }))
+  t.after(() => { for (const child of children) if (child.exitCode === null) child.kill() })
+  const ready = (await Promise.all(children.map(child => once(child, 'message')))).map(([message]) => message)
+  assert.ok(ready.every(message => message.ready))
+  assert.equal(new Set(ready.map(message => message.pid)).size, 2, 'two independent child processes opened SQLite connections')
+  const replies = children.map(child => once(child, 'message')), exits = children.map(child => once(child, 'exit'))
+  for (const child of children) child.send('go')
+  const results = (await Promise.all(replies)).map(([reply]) => reply)
+  for (const [exitCode, signal] of await Promise.all(exits)) { assert.equal(exitCode, 0); assert.equal(signal, null) }
+  return results
+}
+
+for (const sameKey of [false, true]) {
+  test('withdraw and admit race on two process connections with ' + (sameKey ? 'one shared key' : 'distinct keys') + ' has only serial outcomes', { timeout: 12000 }, async t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    assert.equal(typeof s.withdraw, 'function', 'host-only withdraw API missing')
+    const head = s.enqueue(input(task(store), { kind: 'new', mode: 'write', resources: ['repo'] }), run, worker)
+    const tail = s.enqueue(input(task(store)), run, worker)
+    g.snapshot(run)
+    const taskBefore = rowBytes(store, ['task'])
+    const [withdrawal, admission] = await schedulerRace(t, store, [
+      { action: 'withdraw', key: 'race-withdraw', target: head.request_id },
+      { action: 'admit', key: sameKey ? 'race-withdraw' : 'race-admit' },
+    ])
+    const rows = s.state({}, run, lead).requests, snapshot = g.snapshot(run)
+    if (withdrawal.result) {
+      assert.equal(withdrawal.result.status, 'withdrawn')
+      assert.equal(rows[0].state, 'withdrawn')
+      assert.equal(rows[0].reservation_id, null)
+      if (sameKey) {
+        assert.equal(admission.error, 'E_SCHEDULER_CONFLICT')
+        assert.equal(rows[1].state, 'queued')
+        assert.equal(snapshot.active_total, 0)
+      } else {
+        assert.equal(admission.error, undefined)
+        assert.equal(admission.result.request.request_id, tail.request_id)
+        assert.equal(snapshot.active_total, 1)
+      }
+      assert.equal(snapshot.created_total, 0)
+      assert.equal(snapshot.holds.length, 0)
+    } else {
+      assert.equal(withdrawal.error, 'E_SCHEDULER_CONFLICT')
+      assert.equal(admission.error, undefined)
+      assert.equal(admission.result.request.request_id, head.request_id)
+      assert.equal(rows[0].state, 'reserved')
+      assert.equal(rows[1].state, 'queued')
+      assert.equal(snapshot.active_total, 1)
+      assert.equal(snapshot.created_total, 1)
+      assert.equal(snapshot.holds.length, 1)
+    }
+    assert.equal(snapshot.reservations.length, snapshot.active_total)
+    assert.equal(snapshot.retry_charges.length, snapshot.active_total)
+    assert.equal(rowBytes(store, ['task']), taskBefore)
+    assert.equal(store.open().prepare('SELECT COUNT(*) AS n FROM scheduler_decision').get().n,
+      withdrawal.result && !sameKey ? 2 : 1)
+  })
+}
+
+test('withdraw same-key race on two process connections commits once with a zero-write replay', { timeout: 12000 }, async t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  assert.equal(typeof s.withdraw, 'function', 'host-only withdraw API missing')
+  const row = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const before = taskGovernorBytes(store)
+  const command = { action: 'withdraw', key: 'shared-withdraw', target: row.request_id }
+  const replies = await schedulerRace(t, store, [command, command])
+  assert.ok(replies.every(reply => reply.error === undefined))
+  const first = replies.find(reply => !reply.result.replay), replay = replies.find(reply => reply.result.replay)
+  assert.ok(first)
+  assert.ok(replay)
+  assert.deepEqual(replay.result, { ...first.result, replay: true })
+  assert.equal(replay.changes, 0)
+  assert.equal(first.changes, 2)
+  assert.equal(taskGovernorBytes(store), before)
+  assert.equal(store.open().prepare('SELECT COUNT(*) AS n FROM scheduler_decision').get().n, 1)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'withdrawn')
+})
+
 test('scheduler historical settled replay preserves the newer admission through reopening', t => {
   const { store, scheduler: s, governor: g } = setup(t)
   const id = task(store)

@@ -62,6 +62,154 @@ function fixture(t, options = {}) {
   return { get store() { return store }, get flow() { return flow }, actor, create, change, claim, open, verify, artifact, review, accept, key, reopen, executions: () => executions }
 }
 
+for (const route of ['artifact metadata', 'review metadata', 'latest review']) {
+  test(`SQLite TEXT workflow ${route} preserves complete persisted identities`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const identity = 'reviewer\0中文😀e\u0301'
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', findings: ['finding\0suffix'] }, { sessionId: identity, isRoot: false })
+    const producer = worker.sessionId + '\0suffix'
+    f.store.open().prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(producer, id)
+    f.reopen()
+    const state = f.flow.state({ task_id: id, include_context: true }, run)
+    if (route === 'artifact metadata') assert.equal(state.artifacts[0].producer_session, producer)
+    if (route === 'review metadata') assert.equal(state.reviews[0].reviewer_session, identity)
+    if (route === 'latest review') assert.equal(state.context.latest_review.reviewer_session, identity)
+    assert.deepEqual(state.context.latest_review.findings, ['finding\0suffix'])
+  })
+}
+
+test('SQLite TEXT acceptance rejects a producer whose ordinary owner is only a prefix', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  f.store.open().prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(worker.sessionId + '\0suffix', id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const before = f.store.open().prepare('SELECT total_changes() AS n').get().n
+  assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version,
+    request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_EVIDENCE' })
+  assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+  assert.equal(f.store.open().prepare('SELECT total_changes() AS n').get().n, before)
+})
+
+for (const exact of [false, true]) {
+  test(`SQLite TEXT acceptance uses ${exact ? 'exact' : 'distinct prefix'} reviewer writer history`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const identity = 'auditor\0suffix'
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', findings: [] }, { sessionId: identity, isRoot: false })
+    f.store.open().prepare('INSERT INTO workflow_writer(task_id,run_id,evidence_generation,session_id) VALUES(?,?,?,?)').run(id, run, 0, exact ? identity : 'auditor')
+    if (exact) assert.throws(() => f.accept(id), { code: 'E_WORKFLOW_EVIDENCE' })
+    else assert.equal(f.accept(id).execution_verified, true)
+    assert.equal(f.store.taskOf(id, run).task.status, exact ? 'submitted' : 'accepted')
+  })
+}
+
+for (const route of ['artifacts', 'reviews', 'latest', 'accept artifact', 'accept review']) {
+  test(`SQLite TEXT workflow ${route} rejects corrupt evidence before output or acceptance`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    f.store.submitTask({ task_id: id }, run, worker)
+    const version = f.flow.state({ task_id: id }, run).row_version
+    const db = f.store.open(), prepare = db.prepare.bind(db), before = db.prepare('SELECT total_changes() AS n').get().n
+    let corruptReads = 0, writerLookups = 0, writerGets = 0
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      if (sql === 'SELECT 1 FROM workflow_writer WHERE task_id=? AND session_id=? LIMIT 1') {
+        writerLookups++
+        const get = statement.get.bind(statement)
+        statement.get = (...args) => { writerGets++; return get(...args) }
+      }
+      const match = route === 'artifacts' ? sql.startsWith('SELECT id AS revision_id,receipt_id,')
+        : route === 'reviews' ? sql.startsWith('SELECT id,revision_id,evidence_generation,reviewer_session,')
+          : route === 'latest' ? sql.startsWith('SELECT id,revision_id,plan_version,evidence_generation,reviewer_session,')
+            : route === 'accept artifact' ? sql.includes("THEN 'J'||json_quote(") && sql.includes('FROM workflow_artifact')
+              : sql.includes("THEN 'J'||json_quote(") && sql.includes('FROM workflow_review')
+      if (match) {
+        const method = ['artifacts', 'reviews'].includes(route) ? 'all' : 'get', read = statement[method].bind(statement)
+        const corrupt = row => {
+          corruptReads++
+          if (route.startsWith('accept')) row[route === 'accept artifact' ? 'producer_session' : 'reviewer_session'] = 'J"private sentinel"'
+          else row[route.includes('artifact') ? '__imperator_nul_producer_session' : '__imperator_nul_reviewer_session'] = '"private sentinel"'
+          return row
+        }
+        statement[method] = (...args) => { const result = read(...args); return method === 'all' ? result.map(corrupt) : corrupt(result) }
+      }
+      return statement
+    }
+    assert.throws(() => route.startsWith('accept')
+      ? f.store.acceptTask({ task_id: id, expected_version: version, request_key: f.key() }, run, lead)
+      : f.flow.state({ task_id: id, include_context: true }, run), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(corruptReads, 1); assert.equal(writerLookups, 0); assert.equal(writerGets, 0)
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    assert.equal(db.isTransaction, false)
+    assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+  })
+}
+
+for (const table of ['workflow_artifact', 'workflow_review']) {
+  test(`SQLite TEXT acceptance retains legacy ${table} columns and native integer errors`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    const db = f.store.open(), field = table === 'workflow_artifact' ? 'producer_session' : 'reviewer_session'
+    db.exec(`ALTER TABLE ${table} ADD COLUMN __imperator_nul_${field} TEXT; ALTER TABLE ${table} ADD COLUMN "__proto__" TEXT;`
+      + ` ALTER TABLE ${table} ADD COLUMN constructor INTEGER; ALTER TABLE ${table} ADD COLUMN "2" TEXT;`
+      + ` ALTER TABLE ${table} ADD COLUMN extra_blob BLOB; ALTER TABLE ${table} ADD COLUMN extra_null; ALTER TABLE ${table} ADD COLUMN extra_integer INTEGER`)
+    db.prepare(`UPDATE ${table} SET __imperator_nul_${field}=?,"__proto__"=?,constructor=27,"2"=?,extra_blob=?,extra_integer=? WHERE task_id=?`)
+      .run('legacy companion', 'prototype data', 'two', new Uint8Array([0,255]), 9007199254740993n, id)
+    f.store.submitTask({ task_id: id }, run, worker)
+    const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+    const before = db.prepare('SELECT total_changes() AS n').get().n
+    assert.throws(() => f.store.acceptTask(args, run, lead), { code: 'ERR_OUT_OF_RANGE' })
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+    db.prepare(`UPDATE ${table} SET extra_integer=42 WHERE task_id=?`).run(id)
+    assert.equal(f.store.acceptTask(args, run, lead).execution_verified, true)
+  })
+}
+
+test('SQLite TEXT acceptance factories prepare metadata without executing either original star', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const version = f.flow.state({ task_id: id }, run).row_version
+  const db = f.store.open(), prepare = db.prepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if ((sql.startsWith('SELECT * FROM') || sql.includes("THEN 'J'||json_quote(")) && / FROM workflow_(artifact|review) WHERE/.test(sql)) {
+      const record = { table: sql.includes('FROM workflow_artifact') ? 'artifact' : 'review',
+        original: sql.startsWith('SELECT *'), get: 0, all: 0, iterate: 0, run: 0 }
+      records.push(record)
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const execute = statement[method].bind(statement)
+        statement[method] = (...args) => { record[method]++; return execute(...args) }
+      }
+    }
+    return statement
+  }
+  assert.equal(f.store.acceptTask({ task_id: id, expected_version: version, request_key: f.key() }, run, lead).execution_verified, true)
+  assert.deepEqual(records, ['artifact', 'review'].flatMap(table => [
+    { table, original: true, get: 0, all: 0, iterate: 0, run: 0 },
+    { table, original: false, get: 1, all: 0, iterate: 0, run: 0 },
+  ]))
+  t.diagnostic('acceptance SQL lifecycle=' + JSON.stringify(records))
+})
+
+test('SQLite TEXT workflow history still caps metadata at the twenty newest complete rows', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  const db = f.store.open(), producer = 'producer\0suffix', reviewIdentity = 'reviewer\0suffix'
+  db.prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(producer, id)
+  db.prepare('UPDATE workflow_review SET reviewer_session=? WHERE task_id=?').run(reviewIdentity, id)
+  for (let i = 0; i < 20; i++) {
+    db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) SELECT task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at FROM workflow_artifact WHERE task_id=? ORDER BY id LIMIT 1').run(id)
+    db.prepare('INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at FROM workflow_review WHERE task_id=? ORDER BY id LIMIT 1').run(id)
+  }
+  const before = db.prepare('SELECT total_changes() AS n').get().n
+  const state = f.flow.state({ task_id: id, include_context: true }, run)
+  assert.equal(state.history_truncated, true)
+  assert.deepEqual(state.artifacts.map(row => row.revision_id), Array.from({ length: 20 }, (_, i) => 21 - i))
+  assert.deepEqual(state.reviews.map(row => row.id), Array.from({ length: 20 }, (_, i) => 21 - i))
+  assert.ok(state.artifacts.every(row => row.producer_session === producer))
+  assert.ok(state.reviews.every(row => row.reviewer_session === reviewIdentity))
+  assert.equal(state.context.latest_review.reviewer_session, reviewIdentity)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+})
+
 // Replacing the template with legacy policy or accepting model provenance breaks these.
 test('coding creation is atomic, defaults strict execution, and preserves ordinary legacy tasks', t => {
   const f = fixture(t), result = f.create()

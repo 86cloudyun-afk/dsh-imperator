@@ -32,6 +32,131 @@ function tools(store, id = 'run-a') {
   return args => defs.find(d => d.name === 'task_board').execute(args, { agent: { options: {}, session: { header: { id } } } })
 }
 
+test('SQLite TEXT width-neutral facts and latest remain readable at the native column limit', async t => {
+  const store = tempStore(t), id = store.openTask('maximum width', 'run-a').task_id, db = store.open()
+  const capacity = Number(db.prepare('PRAGMA compile_options').all().map(row => row.compile_options)
+    .find(option => option.startsWith('MAX_COLUMN=')).split('=')[1])
+  const existing = db.prepare('PRAGMA table_info(fact)').all().length
+  for (let index = existing; index < capacity; index++) db.exec(`ALTER TABLE fact ADD COLUMN extension_${index}`)
+  assert.equal(db.prepare('SELECT * FROM fact').columns().length, capacity)
+  for (const statement of ['ordinary', 'left\0中文😀right']) {
+    store.recordFact({ task_id: id, statement }, 'run-a')
+    assert.equal(db.prepare('SELECT hex(CAST(statement AS BLOB)) AS bytes FROM fact WHERE task_id=? ORDER BY id DESC LIMIT 1').get(id).bytes,
+      Buffer.from(statement).toString('hex').toUpperCase())
+    for (const view of ['facts', 'latest']) await t.test(`${view}: ${JSON.stringify(statement)}`, () => {
+      const page = store.boardPage(view === 'facts' ? { view: 'facts', task_id: id } : {}, 'run-a')
+      const row = view === 'facts' ? page.facts[0] : page.tasks[0].facts[0]
+      assert.equal(row.statement, statement)
+      if (view === 'facts') {
+        assert.equal(row[`extension_${capacity - 1}`], null)
+        assert.ok(Object.keys(row).length >= capacity)
+      }
+    })
+  }
+})
+
+test('SQLite TEXT board factories add metadata prepares without additional data execution', t => {
+  const store = tempStore(t), id = store.openTask('counts', 'run-a').task_id
+  store.recordFact({ task_id: id, statement: 'prefix\0suffix' }, 'run-a')
+  const db = store.open(), prepare = db.prepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if ((sql.startsWith('SELECT f.*') || sql.includes("THEN 'J'||json_quote(")) && / FROM (fact|handoff) f JOIN task/.test(sql)) {
+      const record = { original: sql.startsWith('SELECT f.*'), handoff: sql.includes(' FROM handoff '), get: 0, all: 0, iterate: 0, run: 0 }
+      records.push(record)
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const execute = statement[method].bind(statement)
+        statement[method] = (...args) => { record[method]++; return execute(...args) }
+      }
+    }
+    return statement
+  }
+  for (const route of ['facts', 'handoffs', 'latest', 'empty']) {
+    records.length = 0
+    if (route === 'empty') store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+    store.boardPage(['facts', 'handoffs'].includes(route) ? { view: route, task_id: id } : {}, 'run-a')
+    const metadata = { original: true, handoff: false, get: 0, all: 0, iterate: 0, run: 0 }
+    const execution = { original: false, handoff: false, get: 0, all: 1, iterate: 0, run: 0 }
+    assert.deepEqual(records, route === 'empty' ? [] : route === 'handoffs'
+      ? [{ ...execution, original: true, handoff: true }] : [metadata, execution])
+    t.diagnostic(route + ' SQL lifecycle=' + JSON.stringify(records))
+  }
+})
+
+for (const route of ['facts', 'detail', 'latest', 'late full', 'late display']) {
+  test(`SQLite TEXT page ${route} restores text before pagination and clipping`, t => {
+    const store = tempStore(t), run = 'run-a'
+    const samples = ['plain', 'T', 'J', 'J"pretend"', 'Tordinary', '"json"', '\\u0000', '\0', '\0start', 'middle\0suffix', 'end\0', 'a\0\0b',
+      '中\0文😀e\u0301\r\n\u0001', ...[159, 160, 161].map(n => '中\0' + '文'.repeat(n - 2))]
+    const id = store.openTask('text', run).task_id
+    if (route.startsWith('late ')) store.closeTask({ task_id: id, result: 'failed' }, run)
+    for (const statement of samples) {
+      store.recordFact({ task_id: id, statement, kind: route.startsWith('late ') ? 'blocker' : 'fact' }, run)
+      const display = statement.length > 160 ? statement.slice(0, 160) + '…' : statement
+      if (route === 'facts') assert.equal(store.boardPage({ view: 'facts', task_id: id, limit: 1 }, run).facts[0].statement, statement)
+      if (route === 'detail') assert.equal(store.boardPage({ task_id: id }, run).facts[0].statement, statement)
+      if (route === 'latest') assert.equal(store.boardPage({}, run).tasks[0].facts[0].statement, display)
+      if (route === 'late full') assert.equal(store.boardPage({ view: 'late_blockers', task_id: id, limit: 1 }, run).late_blockers[0].statement, statement)
+      if (route === 'late display') assert.equal(store.boardPage({}, run).late_blockers[0].statement, display)
+    }
+    if (route === 'facts') assert.deepEqual(collect(store, { view: 'facts', task_id: id, limit: 3 }, 'facts').map(r => r.statement), samples.toReversed())
+    store.handle.close(); store.handle = null; store.open()
+    if (route === 'facts') assert.equal(store.boardPage({ view: 'facts', task_id: id }, run).facts[0].statement, samples.at(-1))
+  })
+}
+
+test('SQLite TEXT fact history preserves real companion names and unusual legacy column types', t => {
+  const store = tempStore(t), id = store.openTask('legacy columns', 'run-a').task_id
+  store.recordFact({ task_id: id, statement: 'prefix\0suffix' }, 'run-a')
+  const db = store.open()
+  db.exec('ALTER TABLE fact ADD COLUMN __imperator_nul_statement TEXT; ALTER TABLE fact ADD COLUMN "__proto__" TEXT;'
+    + ' ALTER TABLE fact ADD COLUMN constructor INTEGER; ALTER TABLE fact ADD COLUMN "12" TEXT; ALTER TABLE fact ADD COLUMN "2" TEXT;'
+    + ' ALTER TABLE fact ADD COLUMN extra_blob BLOB; ALTER TABLE fact ADD COLUMN extra_null; ALTER TABLE fact ADD COLUMN extra_integer INTEGER')
+  db.exec('ALTER TABLE fact ADD COLUMN "" TEXT; ALTER TABLE fact ADD COLUMN "quoted""列😀" TEXT')
+  db.prepare('UPDATE fact SET ""=?,"quoted""列😀"=? WHERE task_id=?').run('empty name', 'quoted name', id)
+  db.prepare('UPDATE fact SET __imperator_nul_statement=?,"__proto__"=?,constructor=27,"12"=?,"2"=?,extra_blob=?,extra_integer=42 WHERE task_id=?')
+    .run('legacy companion', 'prototype data', 'twelve', 'two', new Uint8Array([0,255]), id)
+  const row = store.boardPage({ view: 'facts', task_id: id }, 'run-a').facts[0]
+  assert.equal(row.statement, 'prefix\0suffix')
+  assert.equal(row.__imperator_nul_statement, 'legacy companion')
+  assert.equal(row.__proto__, 'prototype data'); assert.equal(row.constructor, 27)
+  assert.equal(row['12'], 'twelve'); assert.equal(row['2'], 'two')
+  assert.deepEqual(row.extra_blob, new Uint8Array([0,255])); assert.equal(row.extra_null, null)
+  assert.equal(row.extra_integer, 42)
+  assert.equal(row[''], 'empty name'); assert.equal(row['quoted"列😀'], 'quoted name')
+  assert.equal(Object.getPrototypeOf(row), Object.prototype, 'public history keeps its existing spread shape')
+  assert.deepEqual(Object.getOwnPropertyDescriptor(row, '__proto__'), { value: 'prototype data', writable: true, enumerable: true, configurable: true })
+  assert.equal(store.boardPage({}, 'run-a').tasks[0].facts[0].statement, 'prefix\0suffix')
+  db.prepare('UPDATE fact SET extra_integer=? WHERE task_id=?').run(9007199254740993n, id)
+  for (const args of [{ view: 'facts', task_id: id }, {}]) assert.throws(() => store.boardPage(args, 'run-a'), { code: 'ERR_OUT_OF_RANGE' })
+})
+
+for (const route of ['late', 'latest']) {
+  test(`SQLite TEXT page ${route} rejects corrupt evidence before clipping`, t => {
+    const store = tempStore(t), id = store.openTask('text', 'run-a').task_id
+    if (route === 'late') store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+    store.recordFact({ task_id: id, kind: 'blocker', statement: 'private\0sentinel' }, 'run-a')
+    const db = store.open(), prepare = db.prepare.bind(db)
+    let injections = 0
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      if (route === 'late' ? sql.startsWith('SELECT b.id AS fact_id,') : sql.includes("THEN 'J'||json_quote(") && sql.includes('FROM fact f')) {
+        const all = statement.all.bind(statement)
+        statement.all = (...args) => all(...args).map(row => {
+          injections++
+          if (route === 'latest') row.statement = 'J"private sentinel"'
+          else row.__imperator_nul_statement = '"private sentinel"'
+          return row
+        })
+      }
+      return statement
+    }
+    assert.throws(() => store.boardPage({}, 'run-a'), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
+    assert.equal(db.isTransaction, false)
+  })
+}
+
 test('1000 pending tasks have bounded defaults, full totals and complete descending keyset traversal', t => {
   const store = tempStore(t), ids = seed(store, 1000)
   assert.equal(typeof store.boardPage, 'function', 'paged store API is missing')

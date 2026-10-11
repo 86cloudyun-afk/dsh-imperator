@@ -77,3 +77,50 @@ test('detail aggregates facts in SQL without materializing one JS row per fact',
   assert.equal(board.facts.length, 50)
   assert.ok(Math.max(...lengths) <= 50, `materialized ${Math.max(...lengths)} rows`)
 })
+
+// Removing any selected TEXT recovery must fail through its public consumer.
+for (const route of ['detail', 'ranked summary', 'late blockers', 'reopen', 'accept blockers']) {
+  test(`SQLite TEXT ${route} preserves NUL before full output or clipping`, t => {
+    const store = tempStore(t), run = 'text-run'
+    const samples = ['ordinary', '"JSON"', 'back\\slash', '\0', '\0start', 'middle\0suffix', 'end\0', 'a\0\0b',
+      '中\0文😀e\u0301\r\n\u0001', ...[159, 160, 161].map(n => '中\0' + '文'.repeat(n - 2))]
+    for (const statement of samples) {
+      const id = store.openTask('text', run).task_id
+      if (['late blockers', 'reopen'].includes(route)) store.closeTask({ task_id: id, result: 'failed' }, run)
+      store.recordFact({ task_id: id, statement, kind: route === 'detail' || route === 'ranked summary' ? 'fact' : 'blocker' }, run)
+      const expected = statement.length > 160 ? statement.slice(0, 160) + '…' : statement
+      if (route === 'detail') assert.equal(store.board({ task_id: id }, run).facts[0].statement, statement)
+      if (route === 'ranked summary') assert.equal(store.board({}, run).tasks.find(row => row.id === id).facts[0].statement, expected)
+      if (route === 'late blockers') assert.equal(store.board({ task_id: id }, run).late_blockers[0].blockers[0].statement, expected)
+      if (route === 'reopen') assert.equal(store.rejectTask({ task_id: id, reason: 'reopen' }, run, 'lead').late_blockers[0].blockers[0].statement, expected)
+      if (route === 'accept blockers') {
+        store.submitTask({ task_id: id }, run)
+        assert.throws(() => store.acceptTask({ task_id: id }, run, 'lead'), error => error.code === 'E_BLOCKERS' && error.message.includes(expected))
+      }
+    }
+  })
+}
+
+for (const route of ['ranked summary', 'late blockers', 'accept blockers']) {
+  test(`SQLite TEXT ${route} rejects corrupt evidence before its consumer`, t => {
+    const store = tempStore(t), id = store.openTask('text', 'run').task_id
+    if (route === 'late blockers') store.closeTask({ task_id: id, result: 'failed' }, 'run')
+    store.recordFact({ task_id: id, kind: 'blocker', statement: 'private\0sentinel' }, 'run')
+    if (route === 'accept blockers') store.submitTask({ task_id: id }, 'run')
+    const db = store.open(), prepare = db.prepare.bind(db)
+    const matches = sql => route === 'ranked summary' ? sql.startsWith('WITH ranked AS')
+      : route === 'late blockers' ? sql.startsWith('SELECT t.id AS task_id, t.title, t.status, t.owner,')
+        : sql.startsWith('SELECT b.id, b.statement, b.created_by, b.created_at')
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      if (matches(sql)) {
+        const all = statement.all.bind(statement)
+        statement.all = (...args) => all(...args).map(row => { row.__imperator_nul_statement = '"private sentinel"'; return row })
+      }
+      return statement
+    }
+    assert.throws(() => route === 'accept blockers' ? store.acceptTask({ task_id: id }, 'run', 'lead') : store.board({}, 'run'),
+      { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(db.isTransaction, false)
+  })
+}

@@ -1,0 +1,15 @@
+# fork继承历史与子会话观测设计
+
+基线0.4.1/main3b88ba73f65379ca77cde0ff2ad2978638ff199b。用户已授权持续工程实现、完整审核、PR与合并。
+
+两固定SDK真实Session、fork provider纯prepare和实际插件hooks/SQLite的有界复现确认：父事件的六次明确失败可在child零工具调用时产生ECHO指导；父未结算派发使child估计2而自身0；父turn/end被记录为child lifecycle。该证据未启动完整agent loop，不证明实际生产停止原因或频率。
+
+观测域使用真实 `Session.inheritedEventCount` 持久fork切点，将现有同步读取返回的canonical events分为继承前缀与本会话后缀。缺省字段视为legacy切点0；非safe integer、负值、超当前历史范围或不可读的切点使本会话活动历史不可用，不把继承历史重新解释为本会话活动。不能用transient firstLiveSeq；restore应保留先前本会话自己的事件。
+
+guard STALL/ECHO及working-context派发/结算近似只折叠owned后缀。生命周期turn/start/end只从owned后缀写入，并保留原seq与真实child authority、去重和256窗口；非法切点记固定observation gap。未知效果保守屏障、own ECHO acknowledgment、正常root/freshchild及真实scope规则保持。
+
+完整visible context历史仍用于working-context状态消息去重、compaction可见性、旧投影显式supersede；不盲目把全部sessionEvents导出都改成后缀。不删除、改写或迁移既有错误归属audit行，本轮新观测修复不能认证旧历史。TODO投影的继承语义保持现有context合同，活动计数与可见文本历史需明确分开。
+
+共享小工具仅接收现有reader数组和session元数据，不新增deprecated Session API调用。输出保留事件引用/seq，切点变化、mutable/replacement/truncation与既有projection reset/full-replay语义一致；只复制必要owned后缀，不能为了切片遍历完整继承前缀。无新依赖/schema/能力、命名/DB/Node pins/DSH pins变化；60000ms验收、12000ms清理、full-tree关闭。
+
+验收：root0cut/child0cut、fork父completedprefix/当前forkcall排除；own0无ECHO/dispatch/lifecycle父seq，own追加正常；restore own历史保留、未知效应及ack仍正确；非法/改变切点、mutable历史/reset、完整context继承状态旧投影去重/unknownsupersede/compaction仍正确；两pins native Session控制与真实SQLite去重，全量离线与pack矩阵。

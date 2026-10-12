@@ -1899,6 +1899,140 @@ test('model observation v3 loses owned authority after a failed disposal identit
 })
 
 test('model observation rejects inherited or discontinuous publications and bounds event and lifetime coverage', async () => {
+  const matrix = [], expectedCoverage = []
+  const fresh = async () => {
+    const fixture = await taskCollectorFixture()
+    fixture.collector.beginObservations(0)
+    return fixture
+  }
+  const capture = (label, fixture, fault, expected, coverage = 'partial') => {
+    const before = fixture.collector.observationSnapshot()
+    assert.equal(before.coverage, 'complete', `${label}: independent complete precondition`)
+    assert.equal(before.taskDropped, 0); assert.equal(before.ordinaryDropped, 0)
+    fault()
+    const after = fixture.collector.observationSnapshot(), legacy = fixture.collector.snapshot()
+    assert.ok(after, `${label}: owned authority remains available`)
+    assertTaskPartition(legacy)
+    const empty = { calls: 0, nativeResults: 0, ptcResults: 0, envelopeOk: 0, envelopeError: 0, transportError: 0, unavailableResults: 0 }
+    const row = { ...empty, ...expected.row }, tool = expected.tool ?? 'task_board'
+    for (const name of taskToolNames) assert.deepEqual(legacy.byTool[name], name === tool ? row : empty, `${label}: ${name} legacy partition`)
+    assert.equal(legacy.unattributedResults, expected.unattributed ?? 0, `${label}: legacy unattributed`)
+    assert.deepEqual(legacy.byRole, { root: row.calls, worker: 0, unknown: 0 })
+    assert.ok(Object.values(legacy.errorCounts).every(value => value === 0))
+    assert.equal(legacy.details.length, Math.min(20, row.nativeResults + row.ptcResults + (expected.unattributed ?? 0)))
+    assert.equal(legacy.truncated, expected.truncated ?? false); assert.equal(legacy.saturated, false)
+    assert.equal(after.firstFailure, null, `${label}: refusal is not an invented application failure`)
+    assert.equal(after.taskDropped, 0); assert.equal(after.ordinaryDropped, 0)
+    assert.doesNotMatch(JSON.stringify(after), /SECRET_|private-|wrapper|inner|padding/)
+    matrix.push({ label, before: before.coverage, after: after.coverage, calls: row.calls,
+      nativeResults: row.nativeResults, ptcResults: row.ptcResults, envelopeOk: row.envelopeOk,
+      unavailableResults: row.unavailableResults, unattributedResults: legacy.unattributedResults, legacyTruncated: legacy.truncated })
+    expectedCoverage.push({ label, before: 'complete', after: coverage })
+    return after
+  }
+  {
+    const fixture = await fresh(); fixture.step(); fixture.call(fixture.root, 'task_board', 'same')
+    capture('duplicate-native', fixture, () => fixture.call(fixture.root, 'task_board', 'same'), { row: { calls: 2 } })
+  }
+  {
+    const fixture = await fresh(), p = ptcFixture(fixture); p.start()
+    capture('duplicate-ptc', fixture, () => p.start(), { row: { calls: 2 } })
+  }
+  for (const [label, change] of [
+    ['empty-call-id', { callId: '' }], ['oversized-call-id', { callId: 'x'.repeat(257) }],
+    ['invalid-turn', { turn: -1 }], ['invalid-step', { step: -1 }],
+    ['empty-name', { name: '' }], ['oversized-name', { name: 'x'.repeat(257) }],
+    ['utf8-name', { name: '界'.repeat(100) }],
+  ]) {
+    const fixture = await fresh(); fixture.step()
+    capture(`native-${label}`, fixture,
+      () => fixture.emit(fixture.root, 'tool/call', { turn: 1, step: 1, callId: 'valid', name: 'task_board', ...change }),
+      { row: { calls: change.name === undefined ? 1 : 0 } })
+  }
+  for (const phase of ['start', 'result']) {
+    for (const [label, change] of [
+      ['root', { rootCallId: 'unknown' }], ['parent', { parentCallId: '' }], ['sub', { subCallId: '' }],
+      ['name', { name: '' }], ['oversized-name', { name: 'x'.repeat(257) }],
+      ['turn', { turn: 2 }], ['step', { step: 2 }],
+    ]) {
+      const fixture = await fresh(), p = ptcFixture(fixture)
+      const data = phase === 'result' ? p.start() : { rootCallId: 'wrapper', parentCallId: 'wrapper', subCallId: 'inner', name: 'task_board' }
+      capture(`ptc-${phase}-${label}`, fixture, () => phase === 'result' ? p.result(data, change)
+        : fixture.emit(fixture.root, 'tool/ptc-dispatch-start', { ...data, ...change }),
+      { row: { calls: phase === 'result' ? 1 : 0 }, unattributed: phase === 'result' ? 1 : 0 })
+    }
+  }
+  for (const [label, change] of [['name-mismatch', { name: 'task_open' }], ['orphan', { subCallId: 'unknown' }]]) {
+    const fixture = await fresh(), p = ptcFixture(fixture), data = p.start()
+    capture(`ptc-result-${label}`, fixture, () => p.result(data, change), { row: { calls: 1 }, unattributed: 1 })
+  }
+  for (const nonunique of [false, true]) {
+    const fixture = await fresh(), p = ptcFixture(fixture)
+    if (nonunique) {
+      p.start('parent-a'); p.start('shared', 'task_board', 'parent-a')
+      p.start('parent-b'); p.start('shared', 'task_board', 'parent-b')
+    }
+    capture(`ptc-start-${nonunique ? 'nonunique' : 'unknown'}-parent`, fixture,
+      () => p.start('child', 'task_board', nonunique ? 'shared' : 'unknown'), { row: { calls: nonunique ? 4 : 0 } })
+  }
+  for (const [label, padding, characters, bytes] of [
+    ['character-cap', 'x'.repeat(65537), 65561, 65561], ['utf8-cap', '界'.repeat(30000), 30024, 90024],
+  ]) {
+    const fixture = await fresh(); fixture.step()
+    const body = { ok: true, padding }, text = JSON.stringify(body), call = fixture.call(fixture.root, 'task_board')
+    assert.equal(text.length, characters); assert.equal(Buffer.byteLength(text, 'utf8'), bytes)
+    capture(label, fixture, () => fixture.result(fixture.root, call, body),
+      { row: { calls: 1, nativeResults: 1, unavailableResults: 1 }, truncated: true })
+  }
+  {
+    const fixture = await fresh(); fixture.step()
+    const body = { ok: true, padding: 'x'.repeat(65500) }
+    assert.equal(Buffer.byteLength(JSON.stringify(body), 'utf8'), 65524)
+    for (let i = 0; i < 32; i++) fixture.result(fixture.root, fixture.call(fixture.root, 'task_board', `budget-${i}`), body)
+    const beforeReset = fixture.collector.observationSnapshot()
+    assert.equal(beforeReset.coverage, 'complete'); assert.equal(beforeReset.taskTail.length, 64)
+    assert.equal(beforeReset.taskDropped, 0); assert.equal(fixture.collector.snapshot().details.length, 20)
+    assert.equal(fixture.collector.snapshot().truncated, true, 'old detail truncation alone is not additive coverage loss')
+    fixture.collector.beginObservations(1) // Clear only diagnostic tails; keep the spent decode budget.
+    assert.deepEqual(fixture.collector.observationSnapshot().taskTail, [])
+    const after = capture('cumulative-decode-cap', fixture,
+      () => fixture.result(fixture.root, fixture.call(fixture.root, 'task_board', 'budget-32'), body),
+      { row: { calls: 33, nativeResults: 33, envelopeOk: 32, unavailableResults: 1 }, truncated: true })
+    assert.equal(after.taskTail.length, 2)
+  }
+  for (const name of ['read', 'private-unknown-tool']) {
+    const fixture = await fresh(); fixture.step()
+    const after = capture(name === 'read' ? 'ordinary-unattributed-control' : 'unknown-tool-control', fixture,
+      () => fixture.result(fixture.root, fixture.call(fixture.root, name), { private: 'SECRET_BODY' }),
+      { row: {}, unattributed: 1 }, 'complete')
+    const rows = after.ordinaryTail.filter(row => row.kind === 'call' || row.kind === 'result')
+    assert.equal(rows.length, 2); assert.equal(rows[1].outcome, 'transport-ok')
+    if (name !== 'read') assert.ok(rows.every(row => row.toolName === null))
+  }
+  for (const [label, content] of [
+    ['malformed-json', [{ type: 'text', text: '{SECRET_BROKEN' }]],
+    ['missing-ok', [{ type: 'text', text: '{"private":"SECRET_BODY"}' }]],
+    ['unsupported-content', [{ type: 'image', data: 'SECRET_BODY' }]],
+  ]) {
+    const fixture = await fresh(); fixture.step()
+    const call = fixture.call(fixture.root, 'task_board')
+    const after = capture(`${label}-control`, fixture,
+      () => fixture.result(fixture.root, call, {}, { message: { content } }),
+      { row: { calls: 1, nativeResults: 1, unavailableResults: 1 } }, 'complete')
+    assert.equal(after.taskTail.at(-1).outcome, 'unavailable')
+  }
+  {
+    const fixture = await fresh(); fixture.step()
+    const after = capture('omitted-replay-fields-control', fixture,
+      () => fixture.result(fixture.root, fixture.call(fixture.root, 'task_child_send'),
+        { ok: true, operation: { status: 'accepted', durable: true, replayed: true, target_id: 'private-unknown-target' } }),
+      { tool: 'task_child_send', row: { calls: 1, nativeResults: 1, envelopeOk: 1 } }, 'complete')
+    assert.deepEqual(after.taskTail.at(-1).control, { status: 'accepted', durable: true, replayed: true,
+      targetSlot: null, inboxIdPresent: null, mode: null, activityBefore: null, currentTurn: null, routeReported: null })
+  }
+  // All independent refusals execute before the single coverage assertion, including during RED.
+  console.log('model-observation-refusal-matrix ' + JSON.stringify(matrix))
+  assert.deepEqual(matrix.map(({ label, before, after }) => ({ label, before, after })), expectedCoverage)
   for (const fault of ['inherited', 'gap']) {
     const f = await taskCollectorFixture(), worker = f.create('private-worker', 'root', { cut: 5, seq: 5 })
     f.collector.beginObservations(0)

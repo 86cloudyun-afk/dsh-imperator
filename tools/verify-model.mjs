@@ -658,14 +658,14 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
   }
   const callKey = (turn, step, id) => count(turn) && count(step) && taskCoordinate(id) ? JSON.stringify([turn, step, id]) : null
   function retain(map, key, record) {
-    if (map.has(key)) { map.get(key).ambiguous = true; return }
+    if (map.has(key)) { map.get(key).ambiguous = true; observation.partial(); return }
     if (associations === 4096) { report.truncated = true; observation.partial(); return }
     associations++; map.set(key, record)
   }
   function recordCall(state, map, key, name, seq, extra = {}) {
     const toolName = taskTools.includes(name) ? name : null
     if (toolName) { increment(report.byTool[toolName], 'calls'); increment(report.byRole, state.role) }
-    if (key === null || !taskCoordinate(name)) return
+    if (key === null || !taskCoordinate(name)) { observation.partial(); return }
     const ordinal = callOrdinal < 4096 ? callOrdinal++ : null
     if (ordinal === null) observation.partial()
     retain(map, key, { toolName, name, role: state.role, seq, stageCursor, resolved: false, ambiguous: false,
@@ -691,10 +691,10 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
       const content = data.content
       if (Array.isArray(content) && content.length === 1 && content[0]?.type === 'text' && typeof content[0].text === 'string') {
         const text = content[0].text
-        if (text.length > 65536) report.truncated = true
+        if (text.length > 65536) { report.truncated = true; observation.partial() }
         else {
           const bytes = Buffer.byteLength(text, 'utf8')
-          if (bytes > 65536 || bytes + decodedBytes > 2097152) report.truncated = true
+          if (bytes > 65536 || bytes + decodedBytes > 2097152) { report.truncated = true; observation.partial() }
           else {
             decodedBytes += bytes
             try {
@@ -772,12 +772,12 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
       const rootKey = callKey(state.turn, state.step, data?.rootCallId), root = state.calls.get(rootKey)
       if (!root || root.ambiguous || root.resolved || !taskCoordinate(data?.parentCallId) || !taskCoordinate(data?.subCallId) || !taskCoordinate(data?.name)
         || data.turn !== undefined && data.turn !== state.turn || data.step !== undefined && data.step !== state.step) {
-        if (isResult) unattributed('ptc', event.seq); return
+        observation.partial(); if (isResult) unattributed('ptc', event.seq); return
       }
       const key = JSON.stringify([root.seq, state.turn, state.step, data.rootCallId, data.parentCallId, data.subCallId])
       if (isResult) {
         const record = state.ptc.get(key)
-        if (record?.name !== data.name) unattributed('ptc', event.seq)
+        if (record?.name !== data.name) { observation.partial(); unattributed('ptc', event.seq) }
         else result(state, record, 'ptc', data, event.seq, budget)
         return
       }
@@ -788,6 +788,7 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
         parentValid = matches === 1
       }
       if (budget && parentValid) recordCall(state, state.ptc, key, data.name, event.seq, { rootSeq: root.seq, subCallId: data.subCallId })
+      else if (budget) observation.partial()
     } catch { invalidate(state) }
   }
   return { created, disposed, published,

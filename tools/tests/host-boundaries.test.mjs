@@ -1038,11 +1038,16 @@ for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'c
     const { createUserMessage, isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
     const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-stream-loop-'))
     t.after(() => rm(workspace, { recursive: true, force: true }))
-    let dispatches = 0, admitted = 0, latched = 0
-    const seen = []
+    let dispatches = 0, admitted = 0, latched = 0, heldStreams = 0
+    const seen = [], admissions = []
+    const releaseStreams = nativeGate()
+    let exercise
     const harness = await createNativeHarness({ installAnchor: anchor,
       packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
-      onRequest() { if (scenario === 'cap' && admitted === 1) throw new Error('request-cap'); admitted++ },
+      onRequest(coordinates) {
+        if (scenario === 'cap' && admitted === 1) throw new Error('request-cap')
+        admitted++; admissions.push(coordinates)
+      },
       onFailure() { latched++ },
     }, { inspectNative: async ({ ctx, root }) => {
       ctx.on('llm/stream', request => (async function* () {
@@ -1052,6 +1057,10 @@ for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'c
         seen.push({ maxTokens: request.maxTokens, effort: request.reasoningEffort })
         yield { type: 'block-end', index: 0, block: { type: 'text', text: '137' } }
         if (scenario !== 'missing-usage') yield { type: 'usage', usage: { inputTokens: scenario === 'invalid-usage' ? -1 : 2, outputTokens: 3 } }
+        if (scenario === 'success') {
+          heldStreams++
+          await signalGate(request.signal, releaseStreams.promise)
+        }
         yield { type: 'finish', reason: { kind: scenario === 'error' ? 'error' : 'stop' } }
       })(), { global: true })
       const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
@@ -1065,19 +1074,55 @@ for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'c
         agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Reply 137.' }] }))
         await agent.whenIdle()
       }
-      try {
-        if (scenario === 'success') await Promise.all([turn(root), turn(child.agent)])
-        else { await turn(root); await turn(child.agent) }
-        assert.equal(dispatches, scenario === 'success' ? 2 : 1)
-        assert.equal(admitted, dispatches)
-        assert.equal(latched > 0, scenario !== 'success')
-        if (scenario === 'success') {
-          assert.equal(seen[0].effort, seen[1].effort)
-          for (const agent of [root, child.agent]) assert.equal(agent.session.snapshotEvents().findLast(e => e.type === 'turn/end').data.reason.kind, 'completed')
+      exercise = async () => {
+        let pending
+        try {
+          if (scenario === 'success') {
+            pending = Promise.all([turn(root), turn(child.agent)])
+            pending.catch(() => {})
+            await nativeCondition(() => heldStreams === 2)
+            const observation = harness.modelObservationSnapshot?.('stage-end') ?? null
+            assert.ok(observation, 'two real consumed streams need distinct primitive owners while both are active')
+            const rootRow = observation.agents.find(row => row.role === 'root')
+            const childRow = observation.agents.find(row => row.role === 'worker' && row.parentSlot === rootRow?.agentSlot)
+            assert.ok(rootRow); assert.ok(childRow)
+            assert.notEqual(rootRow.agentSlot, childRow.agentSlot)
+            assert.equal(observation.requests.length, 2)
+            assert.equal(new Set(observation.requests.map(row => row.requestIndex)).size, 2)
+            for (const [agent, owner] of [[root, rootRow], [child.agent, childRow]]) {
+              const coordinate = admissions.find(row => row.agentId === agent.id)
+              const request = observation.requests.find(row => row.agentSlot === owner.agentSlot)
+              assert.ok(coordinate); assert.ok(request)
+              assert.equal(request.lifetime, owner.lifetime)
+              assert.equal(request.turn, coordinate.turn); assert.equal(request.step, coordinate.step)
+              assert.equal(request.usageSeen, true); assert.equal(request.finishSeen, false)
+              assert.equal(request.ended, false); assert.equal(request.complete, false)
+              assert.equal(request.cancelAlreadyRequested, false)
+              assert.equal(JSON.stringify(observation).includes(agent.id), false, 'raw Session IDs stay private')
+            }
+            releaseStreams.resolve()
+            await pending
+          } else { await turn(root); await turn(child.agent) }
+          assert.equal(dispatches, scenario === 'success' ? 2 : 1)
+          assert.equal(admitted, dispatches)
+          assert.equal(latched > 0, scenario !== 'success')
+          if (scenario === 'success') {
+            assert.equal(seen[0].effort, seen[1].effort)
+            for (const agent of [root, child.agent]) assert.equal(agent.session.snapshotEvents().findLast(e => e.type === 'turn/end').data.reason.kind, 'completed')
+            const observation = harness.modelObservationSnapshot('stage-end')
+            assert.ok(observation.requests.every(row => row.complete && row.ended && row.assistantMessageSeen))
+            assert.ok(observation.requests.every(row => Number.isSafeInteger(row.assistantSeq)))
+          }
+        } finally {
+          releaseStreams.resolve()
+          if (pending) await pending.catch(() => {})
+          await child.dispose()
         }
-      } finally { await child.dispose() }
+      }
     } })
     try {
+      harness.beginModelObservationStage?.(0)
+      await exercise()
       const snapshot = harness.snapshot()
       assert.equal(snapshot.streamAccounting.records.length, admitted)
       if (scenario === 'success') {
@@ -1380,7 +1425,15 @@ test('native settlement diagnostics follow mounted continuable child, live send,
   const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-settlement-'))
   t.after(() => rm(workspace, { recursive: true, force: true }))
   let root, ctx, agents, fixtureRoot, childId, stage = 0, rootRequests = 0, localRequests = 0, completed = false
-  const children = [], disposed = [], observations = [], releases = []
+  const children = [], disposed = [], observations = [], releases = [], admissions = [], childOwners = []
+  const coldMessage = 'Return 137 again.', coldRequestKey = 'local-cold-observation-key'
+  const assertAggregate = (observation, settlement) => {
+    if (observation.coverage !== 'complete') { assert.equal(observation.coverage, 'partial'); return }
+    assert.equal(observation.agents.length, settlement.trackedAgents)
+    for (const key of ['requiredNotices', 'deliveredNotices', 'missingNotices', 'pendingIdleWaits']) {
+      assert.equal(observation.agents.reduce((sum, row) => sum + row[key], 0), settlement[key])
+    }
+  }
   let childGate, flushGate, parentGate, childEntered, flushEntered, parentEntered, childEnded = false, backgroundArgument
   const arrived = async (promise, boundary) => {
     let timer
@@ -1396,7 +1449,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
   const notices = () => root.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data?.source?.kind === 'subagent-settled' && e.data.source.senderSessionId === childId).length
   const harness = await createNativeHarness({ installAnchor: anchor,
     packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
-    onRequest() {},
+    onRequest(coordinates) { admissions.push({ stage, agent: agents.get(coordinates.agentId), ...coordinates }) },
   }, { inspectNative: nativeState => {
     root = nativeState.root; ctx = nativeState.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
     const schema = root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent')
@@ -1425,8 +1478,9 @@ test('native settlement diagnostics follow mounted continuable child, live send,
         rootRequests++
         if (rootRequests === 1) block = stage === 1
           ? { type: 'tool-call', id: `local-spawn-${stage}`, name: 'subagent', arguments: JSON.stringify({ description: 'local settlement worker', prompt: 'Return 137.', ...backgroundArgument }) }
-          : { type: 'tool-call', id: `local-cold-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Return 137 again.' }) }
+          : { type: 'tool-call', id: `local-cold-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: coldMessage, request_key: coldRequestKey }) }
         else if (stage === 1 && rootRequests === 2) block = { type: 'tool-call', id: 'local-live-send', name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Continue with the same answer.' }) }
+        else if (stage === 2 && rootRequests === 2) block = { type: 'tool-call', id: 'local-cold-replay', name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: coldMessage, request_key: coldRequestKey }) }
         else if (notices() >= stage) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
       } else {
         assert.equal(request.sessionId, childId)
@@ -1445,6 +1499,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
     for (stage = 1; stage <= 2; stage++) {
       reset()
       harness.beginTaskToolDiagnosticsStage()
+      harness.beginModelObservationStage?.(stage - 1)
       const beforeNotices = notices()
       pending = harness.runStage({ name: 'local-settlement', prompt: 'Exercise the local child lifecycle.' }).then(() => { completed = true })
       pending.catch(() => {})
@@ -1456,6 +1511,35 @@ test('native settlement diagnostics follow mounted continuable child, live send,
       assert.equal(active.requiredNotices, 1)
       assert.equal(active.missingNotices, 1)
       assert.ok(active.runningAgents >= 1)
+      const activeObservation = harness.modelObservationSnapshot?.('stage-end') ?? null
+      assert.ok(activeObservation, 'actual native cold activation needs its own primitive request owner')
+      assert.equal(activeObservation.stageIndex, stage - 1)
+      assertAggregate(activeObservation, active)
+      const rootOwner = activeObservation.agents.find(row => row.role === 'root')
+      const childOwner = activeObservation.agents.filter(row => row.role === 'worker' && row.parentSlot === rootOwner?.agentSlot)
+        .sort((a, b) => b.lifetime - a.lifetime)[0]
+      assert.ok(rootOwner); assert.ok(childOwner)
+      assert.equal(childOwner.status, 'running')
+      assert.equal(childOwner.mode, 'continuable'); assert.equal(childOwner.activations, 1)
+      assert.equal(childOwner.requiredNotices, 1); assert.equal(childOwner.deliveredNotices, 0); assert.equal(childOwner.missingNotices, 1)
+      childOwners.push({ agentSlot: childOwner.agentSlot, lifetime: childOwner.lifetime })
+      if (stage === 2) {
+        assert.equal(childOwner.agentSlot, childOwners[0].agentSlot)
+        assert.ok(childOwner.lifetime > childOwners[0].lifetime, 'a new Agent object cannot inherit the old lifetime')
+        assert.equal(children[0].id, children[1].id)
+        assert.notEqual(children[0], children[1])
+        assert.ok(children[1].session.snapshotEvents().some(event => event.type === 'turn/start' && event.seq < children[1].session.firstLiveSeq), 'cold Session includes historical turns before this activation')
+      }
+      const childAdmission = admissions.find(row => row.stage === stage && row.agent === children[stage - 1])
+      const childRequest = activeObservation.requests.find(row => row.stageIndex === stage - 1 && row.agentSlot === childOwner.agentSlot && row.lifetime === childOwner.lifetime)
+      assert.ok(childAdmission); assert.ok(childRequest)
+      assert.equal(childRequest.turn, childAdmission.turn); assert.equal(childRequest.step, childAdmission.step)
+      assert.equal(childRequest.ended, false); assert.equal(childRequest.complete, false)
+      assert.equal(childRequest.assistantMessageSeen, false, 'historical own assistant output cannot complete a new held request')
+      assert.equal(childRequest.assistantSeq, null)
+      assert.ok(Number.isSafeInteger(childOwner.lastSeq))
+      assert.equal(children[stage - 1].session.isOwnSeq(childOwner.lastSeq), true)
+      assert.ok(childOwner.lastSeq >= children[stage - 1].session.firstLiveSeq)
       observations.push({ stage, boundary: 'child-stream', ...active })
       childGate.resolve()
       await arrived(flushEntered.promise, 'final-flush')
@@ -1466,6 +1550,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
       assert.equal(heldFlush.deliveredNotices, 0)
       assert.equal(heldFlush.missingNotices, 1)
       assert.equal(completed, false)
+      assertAggregate(harness.modelObservationSnapshot('stage-end'), heldFlush)
       observations.push({ stage, boundary: 'final-flush', ...heldFlush })
       flushGate.resolve()
       await arrived(parentEntered.promise, 'parent-wake')
@@ -1475,6 +1560,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
       assert.equal(completed, false, 'notice delivery cannot bypass the reawakened parent')
       const awake = harness.settlementSnapshot()
       assert.equal(awake.deliveredNotices, 1); assert.equal(awake.missingNotices, 0)
+      assertAggregate(harness.modelObservationSnapshot('stage-end'), awake)
       observations.push({ stage, boundary: 'parent-wake', ...awake })
       parentGate.resolve()
       await pending
@@ -1486,8 +1572,58 @@ test('native settlement diagnostics follow mounted continuable child, live send,
       assert.equal(final.pendingIdleWaits, 0)
       const taskDiagnostics = harness.taskToolDiagnosticsSnapshot()
       assert.ok(taskDiagnostics, 'legal cold Session lifecycle keeps task observations available')
-      assert.equal(taskDiagnostics.byTool.task_child_send.calls, 1)
-      assert.equal(taskDiagnostics.byTool.task_child_send.envelopeOk, 1)
+      assert.equal(taskDiagnostics.byTool.task_child_send.calls, stage === 1 ? 1 : 2)
+      assert.equal(taskDiagnostics.byTool.task_child_send.envelopeOk, stage === 1 ? 1 : 2)
+      const finalObservation = harness.modelObservationSnapshot('stage-end')
+      assertAggregate(finalObservation, final)
+      const settledChild = finalObservation.agents.find(row => row.agentSlot === childOwner.agentSlot)
+      assert.equal(settledChild.requiredNotices, 1); assert.equal(settledChild.deliveredNotices, 1); assert.equal(settledChild.missingNotices, 0)
+      const stageRequests = finalObservation.requests.filter(row => row.stageIndex === stage - 1)
+      assert.equal(stageRequests.length, admissions.filter(row => row.stage === stage).length)
+      assert.ok(stageRequests.every(row => row.complete && row.ended && row.assistantMessageSeen))
+      for (const request of stageRequests) {
+        const agent = request.agentSlot === rootOwner.agentSlot ? root : children[stage - 1]
+        assert.ok(admissions.some(row => row.stage === stage && row.agent === agent && row.turn === request.turn && row.step === request.step))
+        assert.equal(request.lifetime, request.agentSlot === rootOwner.agentSlot ? rootOwner.lifetime : childOwner.lifetime)
+        assert.equal(agent.session.isOwnSeq(request.assistantSeq), true)
+        assert.ok(agent.session.snapshotEvents().some(event => event.seq === request.assistantSeq && event.type === 'assistant/message'))
+      }
+      const serialized = JSON.stringify(finalObservation)
+      for (const privateValue of [root.id, childId, coldMessage, coldRequestKey, `local-cold-${stage}`, 'local-cold-replay']) {
+        assert.equal(serialized.includes(privateValue), false, 'model observations must not serialize private IDs, keys or content')
+      }
+      if (stage === 2) {
+        const controlResults = finalObservation.taskTail.filter(row => row.kind === 'result' && row.toolName === 'task_child_send')
+        assert.equal(controlResults.length, 2)
+        const fresh = controlResults.find(row => row.control?.replayed === false)
+        const replay = controlResults.find(row => row.control?.replayed === true)
+        assert.ok(fresh); assert.ok(replay)
+        for (const result of [fresh, replay]) {
+          assert.equal(result.outcome, 'envelope-ok')
+          assert.equal(result.control.status, 'accepted'); assert.equal(result.control.durable, true)
+          assert.equal(result.control.targetSlot, childOwner.agentSlot)
+          assert.equal(result.control.inboxIdPresent, true)
+        }
+        assert.equal(fresh.control.mode, 'continuable'); assert.equal(fresh.control.routeReported, false)
+        assert.equal(replay.control.mode, null); assert.equal(replay.control.activityBefore, null)
+        assert.equal(replay.control.currentTurn, null); assert.equal(replay.control.routeReported, null)
+        const receipts = ['local-cold-2', 'local-cold-replay'].map(callId => {
+          const result = root.session.snapshotEvents().find(event => event.type === 'tool/result' && event.data.message?.source?.callId === callId)
+          assert.ok(result)
+          assert.equal(result.data.message.isError, false)
+          return JSON.parse(result.data.message.content[0].text)
+        })
+        assert.ok(receipts.every(value => value.ok === true && value.operation.status === 'accepted'))
+        assert.equal(fresh.control.activityBefore, receipts[0].target.activity_before)
+        assert.equal(fresh.control.currentTurn, receipts[0].target.current_turn)
+        assert.ok(['running', 'inactive', 'unknown'].includes(fresh.control.activityBefore))
+        assert.ok(['running', 'inactive', 'unknown'].includes(fresh.control.currentTurn))
+        assert.equal(receipts[0].operation.operation_id, receipts[1].operation.operation_id)
+        assert.equal(receipts[0].operation.message_id, receipts[1].operation.message_id)
+        assert.equal(receipts[1].operation.invoke, false)
+        assert.equal(Object.hasOwn(receipts[1], 'route'), false, 'a replay has no new native route receipt')
+        assert.equal(children.length, 2, 'accepted replay creates no third child activation')
+      }
       observations.push({ stage, boundary: 'settled', ...final, taskDiagnostics })
     }
     assert.equal(children[0].id, children[1].id)
@@ -1495,7 +1631,7 @@ test('native settlement diagnostics follow mounted continuable child, live send,
     assert.equal(notices(), 2)
     const calls = root.session.snapshotEvents().filter(e => e.type === 'tool/call')
     assert.equal(calls.filter(e => e.data.name === 'subagent').length, 1)
-    assert.equal(calls.filter(e => e.data.name === 'task_child_send').length, 2)
+    assert.equal(calls.filter(e => e.data.name === 'task_child_send').length, 3)
     assert.deepEqual(diagnoseModelRuntime(harness.snapshot()).failureCodes, [])
     t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0,
       realParentNotices: notices(), sameSessionDifferentAgents: true, observations }))
@@ -1516,7 +1652,7 @@ test('native settlement timeout snapshots the held local stream before signal ca
   const { createNativeHarness, runModelVerification } = await import('../verify-model.mjs')
   const outputDir = await mkdtemp(join(tmpdir(), 'taskforce-native-settlement-timeout-'))
   t.after(() => rm(outputDir, { recursive: true, force: true }))
-  let localRequests = 0, aborted = 0, drained = 0, root, ctx, agents, fixtureRoot, actualBeforeCancel, nativeHarness
+  let localRequests = 0, aborted = 0, drained = 0, root, ctx, agents, fixtureRoot, actualBeforeCancel, nativeHarness, frozenBeforeCancel
   const report = await runModelVerification({ modelCalls: true, installAnchor: anchor, provider: 'deepseek-official', model: 'deepseek-flash', outputDir, stageTimeoutMs: 100 }, {
     createHarness: async config => {
       nativeHarness = await createNativeHarness(config, { inspectNative: state => {
@@ -1537,7 +1673,8 @@ test('native settlement timeout snapshots the held local stream before signal ca
       } })
       const cancel = nativeHarness.cancel
       nativeHarness.cancel = () => {
-        actualBeforeCancel ??= { status: root.status, observation: nativeHarness.settlementSnapshot(), taskDiagnostics: nativeHarness.taskToolDiagnosticsSnapshot() }
+        actualBeforeCancel ??= { status: root.status, observation: nativeHarness.settlementSnapshot(), taskDiagnostics: nativeHarness.taskToolDiagnosticsSnapshot(), modelObservation: nativeHarness.modelObservationSnapshot?.('before-cancel') ?? null }
+        frozenBeforeCancel ??= JSON.stringify(actualBeforeCancel.modelObservation)
         cancel()
       }
       return nativeHarness
@@ -1551,6 +1688,40 @@ test('native settlement timeout snapshots the held local stream before signal ca
   assert.deepEqual(report.stages[0].timeoutProgress.settlement, actualBeforeCancel.observation)
   assert.deepEqual(report.stages[0].timeoutTaskToolDiagnostics, { source: 'custom-harness-unverified', ...actualBeforeCancel.taskDiagnostics })
   assert.equal(report.stages[0].taskToolDiagnostics.source, 'custom-harness-unverified', 'wrapping the native factory cannot establish native report authority')
+  const before = report.stages[0].timeoutObservations
+  assert.ok(before, 'the active native request needs a detached snapshot before cancellation')
+  assert.equal(before.source, 'custom-harness-unverified')
+  assert.equal(before.phase, 'before-cancel')
+  assert.ok(actualBeforeCancel.modelObservation)
+  // Separate synchronous snapshots may have different elapsed times. Ownership
+  // and stream state must agree without treating those clocks as identities.
+  assert.equal(before.requests.length, 1)
+  const activeRequest = before.requests[0]
+  const owner = before.agents.find(row => row.agentSlot === activeRequest.agentSlot)
+  assert.ok(owner); assert.equal(owner.role, 'root'); assert.equal(owner.status, 'running')
+  assert.equal(owner.lifetime, activeRequest.lifetime)
+  assert.equal(owner.pendingIdleWaits, 1)
+  assert.equal(activeRequest.usageSeen, true); assert.equal(activeRequest.finishSeen, false)
+  assert.equal(activeRequest.ended, false); assert.equal(activeRequest.complete, false)
+  assert.equal(activeRequest.assistantMessageSeen, false); assert.equal(activeRequest.assistantSeq, null)
+  assert.equal(activeRequest.cancelAlreadyRequested, false)
+  assert.equal(activeRequest.firstFailure, null); assert.equal(activeRequest.failurePhase, null)
+  const cancelRequest = actualBeforeCancel.modelObservation.requests[0]
+  for (const key of ['requestIndex', 'agentSlot', 'lifetime', 'turn', 'step', 'usageSeen', 'finishSeen', 'ended', 'complete', 'assistantMessageSeen', 'cancelAlreadyRequested', 'firstFailure', 'failurePhase']) {
+    assert.equal(activeRequest[key], cancelRequest[key])
+  }
+  assert.equal(JSON.stringify(actualBeforeCancel.modelObservation), frozenBeforeCancel, 'draining after cancellation cannot rewrite the held snapshot')
+  assert.equal(report.stages[0].observations.phase, 'final-before-dispose')
+  const after = report.stages[0].postDisposeObservations
+  assert.ok(after); assert.equal(after.phase, 'after-dispose')
+  assert.equal(after.source, 'custom-harness-unverified')
+  for (const key of ['agents', 'taskTail', 'ordinaryTail']) assert.deepEqual(after[key], [])
+  assert.deepEqual(after.tasks, { available: false, observedPhase: null, elapsedMs: null, rows: [], truncated: false })
+  assert.equal(after.requests.length, 1)
+  assert.equal(after.requests[0].requestIndex, activeRequest.requestIndex)
+  assert.equal(after.requests[0].ended, true)
+  assert.equal(before.requests[0].ended, false, 'post-dispose stream state remains a separate phase')
+  for (const snapshot of [before, report.stages[0].observations, after]) assert.equal(JSON.stringify(snapshot).includes(root.id), false)
   assert.equal(report.stages[0].timeoutProgress.settlement.phase, 'waiting-idle')
   assert.equal(report.stages[0].timeoutProgress.settlement.runningAgents, 1)
   assert.equal(report.stages[0].timeoutProgress.settlement.pendingIdleWaits, 1)
@@ -1738,6 +1909,7 @@ test('native task action diagnostics distinguish registered business outcomes an
   const listeners = listenerEvents.map(name => process.rawListeners(name))
   let localRequests = 0, child, root, ctx, fixtureRoot
   const publications = []
+  const privateMarker = 'PRIVATE_NATIVE_OBSERVATION_MARKER', ordinaryCount = 21
   const harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
     workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
   }, { inspectNative: state => {
@@ -1755,18 +1927,25 @@ test('native task action diagnostics distinguish registered business outcomes an
       const step = (steps.get(request.sessionId) ?? 0) + 1
       steps.set(request.sessionId, step)
       let block = { type: 'text', text: '137' }
+      let ordinaryBlocks = null
       if (request.sessionId === root.id && step === 1) block = { type: 'tool-call', id: 'root-board', name: 'task_board', arguments: '{}' }
       if (request.sessionId !== root.id) {
-        if (step <= 3) block = { type: 'tool-call', id: `native-board-${step}`, name: 'task_board', arguments: JSON.stringify(step === 1 ? {} : { task_id: step === 2 ? 999999 : 424242 }) }
-        if (step === 4) block = { type: 'tool-call', id: 'ptc-board', name: 'run_code', arguments: JSON.stringify({ description: 'Exercise task outcomes locally', code: 'await tools.task_board({}); await tools.task_board({task_id:999999}); try { await tools.task_board({task_id:424242}); } catch {} return "done";' }) }
+        if (step === 1) ordinaryBlocks = Array.from({ length: ordinaryCount }, (_, index) => ({
+          type: 'tool-call', id: `ordinary-before-task-${index}`, name: 'run_code',
+          arguments: JSON.stringify({ description: 'Local ordinary result before task outcomes', code: `return "${privateMarker}";` }),
+        }))
+        const taskStep = step - 1
+        if (taskStep >= 1 && taskStep <= 3) block = { type: 'tool-call', id: `native-board-${taskStep}`, name: 'task_board', arguments: JSON.stringify(taskStep === 1 ? {} : { task_id: taskStep === 2 ? 999999 : 424242 }) }
+        if (taskStep === 4) block = { type: 'tool-call', id: 'ptc-board', name: 'run_code', arguments: JSON.stringify({ description: 'Exercise task outcomes locally', code: 'await tools.task_board({}); await tools.task_board({task_id:999999}); try { await tools.task_board({task_id:424242}); } catch {} return "done";' }) }
       }
-      yield { type: 'block-end', index: 0, block }
+      for (const [index, value] of (ordinaryBlocks ?? [block]).entries()) yield { type: 'block-end', index, block: value }
       yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
-      yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+      yield { type: 'finish', reason: { kind: ordinaryBlocks || block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
     })(), { global: true })
   } })
   try {
     harness.beginTaskToolDiagnosticsStage?.()
+    harness.beginModelObservationStage?.(0)
     root.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Exercise local root task diagnostics.' }] }))
     await root.whenIdle()
     const seed = root.session.snapshotEvents()
@@ -1782,18 +1961,23 @@ test('native task action diagnostics distinguish registered business outcomes an
       await agent.whenIdle()
     }
     const results = publications.filter(row => row.event.type === 'tool/result' || row.event.type === 'tool/ptc-dispatch')
-    t.diagnostic(JSON.stringify({ rawTaskPublications: publications }))
+    const ordinaryResults = results.filter(({ event }) => event.type === 'tool/result' && event.data.message?.source?.callId?.startsWith('ordinary-before-task-'))
+    assert.equal(ordinaryResults.length, ordinaryCount)
+    assert.ok(ordinaryResults.every(({ event }) => event.data.message.isError === false))
+    assert.ok(ordinaryResults.every(({ event }) => event.data.message.content.some(block => block.type === 'text' && block.text.includes(privateMarker))), 'the private marker really traverses native result content')
+    const firstWorkerTask = publications.find(({ session, event }) => session === 'worker' && event.type === 'tool/call' && event.data.name === 'task_board')
+    assert.ok(firstWorkerTask)
+    assert.ok(ordinaryResults.every(({ event }) => event.seq < firstWorkerTask.event.seq), 'more than 20 actual ordinary results precede the worker task outcomes')
     const business = results.filter(({ event }) => {
       const content = event.data.message?.content ?? event.data.content
       try { return content?.length === 1 && content[0].type === 'text' && JSON.parse(content[0].text).ok === false } catch { return false }
     })
-    assert.equal(business.length, 2, JSON.stringify(publications))
+    assert.equal(business.length, 2)
     assert.ok(business.every(({ event }) => (event.data.message?.isError ?? event.data.isError) === false))
     assert.equal(results.filter(({ event }) => event.data.message?.isError === true || event.data.isError === true).length, 2)
-    // On the unchanged verifier this assertion fails after real registered
-    // native/PTC results have already proved the semantic transport mismatch.
+    // Existing classifiers retain their exact counts despite the additional
+    // ordinary results and the separate primitive observation tail.
     const diagnostics = harness.taskToolDiagnosticsSnapshot?.() ?? null
-    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0, publications, diagnostics }))
     assert.equal(diagnostics?.byTool.task_board.envelopeError, 2)
     assert.equal(diagnostics.byTool.task_board.envelopeOk, 3)
     assert.equal(diagnostics.byTool.task_board.transportError, 2)
@@ -1803,6 +1987,31 @@ test('native task action diagnostics distinguish registered business outcomes an
     assert.equal(diagnostics.byRole.worker, 6)
     assert.equal(diagnostics.errorCounts.E_NOT_FOUND, 2)
     assert.equal(diagnostics.unattributedResults, 0, 'run_code is a wrapper, not a task result')
+    const observation = harness.modelObservationSnapshot?.('stage-end') ?? null
+    assert.ok(observation, 'ordinary result traffic cannot hide primitive native/PTC task receipts')
+    const taskResults = observation.taskTail.filter(row => row.kind === 'result' && row.toolName === 'task_board')
+    assert.equal(taskResults.length, 7, 'the inherited root result is not counted as a worker result')
+    assert.equal(taskResults.filter(row => row.presentation === 'native').length, 4)
+    assert.equal(taskResults.filter(row => row.presentation === 'ptc').length, 3)
+    assert.equal(taskResults.filter(row => row.outcome === 'envelope-ok').length, 3)
+    assert.equal(taskResults.filter(row => row.outcome === 'envelope-error').length, 2)
+    assert.equal(taskResults.filter(row => row.outcome === 'transport-error').length, 2)
+    assert.equal(taskResults.filter(row => row.errorCode === 'E_NOT_FOUND').length, 2)
+    const rootOwner = observation.agents.find(row => row.role === 'root')
+    const workerOwner = observation.agents.find(row => row.role === 'worker' && row.parentSlot === rootOwner?.agentSlot)
+    assert.ok(rootOwner); assert.ok(workerOwner)
+    assert.equal(taskResults.filter(row => row.agentSlot === rootOwner.agentSlot).length, 1)
+    assert.equal(taskResults.filter(row => row.agentSlot === workerOwner.agentSlot).length, 6)
+    assert.equal(observation.taskDropped, 0)
+    assert.ok(observation.ordinaryTail.length <= 32); assert.ok(observation.taskTail.length <= 64)
+    assert.ok(observation.firstFailure, 'first task failure remains available independently of either tail')
+    const serialized = JSON.stringify(observation)
+    for (const privateValue of [privateMarker, root.id, child.agent.id, 'ordinary-before-task-', 'LOCAL_TRANSPORT_FAILURE', 'await tools.task_board', 'native-board-']) {
+      assert.equal(serialized.includes(privateValue), false, 'native observations contain only the bounded primitive projection')
+    }
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0,
+      ordinaryResults: ordinaryResults.length, nativeTaskResults: 4, ptcTaskResults: 3, diagnostics,
+      primitiveTaskResults: taskResults.length, privateMarkerExcluded: true }))
   } catch (error) {
     t.diagnostic(JSON.stringify({ originalAssertion: error.message, stack: error.stack }))
     throw error

@@ -63,6 +63,61 @@ function setup(t, fault, afterStage = () => {}) {
   return { options: { modelCalls: true, installAnchor: '/unused/native/package.json', provider: 'test-provider', model: 'test-model', outputDir, stageTimeoutMs: 3000 }, factory, disposed: () => disposed, outputDir }
 }
 
+function modelObservationProjection(agentSlot = 0) {
+  return { stageIndex: 0, phase: 'before-cancel', elapsedMs: 1, coverage: 'complete', truncated: false, saturated: false,
+    agents: [0, 1].map(slot => ({ agentSlot: slot, parentSlot: slot ? 0 : null, role: slot ? 'worker' : 'root',
+      lifetime: slot, status: slot === agentSlot ? 'running' : 'idle', turn: slot === agentSlot ? 7 : null,
+      step: slot === agentSlot ? 2 : null, lastEvent: null, lastSeq: null, lastElapsedMs: null,
+      requests: slot === agentSlot ? 1 : 0, turnStarts: 0, turnEnds: 0, lastEndReason: null, pendingIdleWaits: slot === agentSlot ? 1 : 0,
+      mode: slot ? 'continuable' : 'unknown', activations: 0, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0 })),
+    requests: [{ requestIndex: 0, stageIndex: 0, agentSlot, lifetime: agentSlot, turn: 7, step: 2,
+      admittedElapsedMs: 0, lastChunkElapsedMs: 1, chunks: 1, usageSeen: false, finishSeen: false,
+      finishKind: null, ended: false, complete: false, assistantMessageSeen: false, assistantSeq: null,
+      cancelAlreadyRequested: false, firstFailure: null, failurePhase: null }],
+    tasks: { available: false, observedPhase: null, elapsedMs: null, rows: [], truncated: false },
+    taskTail: [], ordinaryTail: [], taskDropped: 0, ordinaryDropped: 0, firstFailure: null }
+}
+
+test('model observation preserves the request owner before cancellation independently of identical legacy counters', async t => {
+  const { runModelVerification } = await api()
+  const reports = []
+  for (const agentSlot of [0, 1]) {
+    const h = setup(t, 'timeout'), projection = modelObservationProjection(agentSlot)
+    reports.push(await runModelVerification({ ...h.options, stageTimeoutMs: 20 }, { createHarness: async config => {
+      const harness = await h.factory(config)
+      harness.snapshot().sessions.push({ id: 'worker', parent: 'root', events: [] })
+      return { ...harness, beginModelObservationStage() {},
+        async runStage() {
+          config.onRequest({ agentId: agentSlot === 0 ? 'root' : 'worker', turn: 7, step: 2 })
+          return new Promise(() => {})
+        },
+        modelObservationSnapshot(phase) { return { ...projection, phase } },
+        cancel() { projection.requests[0].ended = true; projection.requests[0].firstFailure = 'stream-error'; projection.requests[0].failurePhase = 'after-cancel' },
+      }
+    } }))
+  }
+  assert.deepEqual(reports.map(r => r.failure), ['timeout', 'timeout'])
+  assert.deepEqual(reports.map(r => r.stages[0].requests), [1, 1])
+  assert.deepEqual(reports.map(r => r.stages[0].timeoutObservations?.requests[0].agentSlot), [0, 1],
+    'the saved pre-cancel report must distinguish the actual observed request owners')
+  for (const report of reports) {
+    const stage = report.stages[0]
+    assert.equal(stage.timeoutObservations.requests[0].ended, false)
+    assert.equal(stage.timeoutObservations.requests[0].firstFailure, null)
+    const request = stage.timeoutObservations.requests[0]
+    const owner = stage.timeoutObservations.agents.find(row => row.agentSlot === request.agentSlot)
+    assert.equal(owner.status, 'running')
+    assert.equal(owner.requests, 1)
+    assert.equal(owner.lifetime, request.lifetime)
+    assert.equal(owner.turn, request.turn)
+    assert.equal(owner.step, request.step)
+    assert.equal(stage.observations.requests[0].ended, true)
+    assert.equal(stage.observations.requests[0].failurePhase, 'after-cancel')
+    assert.equal(stage.timeoutObservations.source, 'custom-harness-unverified')
+    assert.deepEqual(Object.keys(stage.timeoutProgress).sort(), ['lastRequestElapsedMs', 'settlement'])
+  }
+})
+
 test('runner is import-safe and requires explicit model opt-in before constructing a harness', async () => {
   const { runModelVerification } = await api()
   assert.equal(typeof runModelVerification, 'function', 'missing import-safe runModelVerification')
@@ -1498,6 +1553,374 @@ function assertTaskPartition(report) {
   for (const row of Object.values(report.byTool)) assert.equal(row.nativeResults + row.ptcResults, row.envelopeOk + row.envelopeError + row.transportError + row.unavailableResults)
   assert.doesNotMatch(JSON.stringify(report), /SECRET_|private-path|private-id/)
 }
+
+test('model observation collector reserves control receipts and preserves cold lifetime ownership without text', async () => {
+  const f = await taskCollectorFixture(), worker = f.create('private-worker', 'root')
+  f.collector.beginObservations?.(0)
+  f.step(); f.step(worker, 7, 2)
+  for (let i = 0; i < 24; i++) f.result(f.root, f.call(f.root, 'read', `read-${i}`), { private: 'SECRET_BODY' })
+  const operation = { status: 'accepted', durable: true, replayed: false, target_id: worker.id, message_id: 'SECRET_MESSAGE' }
+  f.result(f.root, f.call(f.root, 'task_child_send', 'fresh'), { ok: true, operation,
+    sent: { target_id: worker.id, message_id: 'SECRET_MESSAGE' },
+    target: { id: worker.id, mode: 'continuable', activity_before: 'inactive', current_turn: 'running' }, route: { reported: false } })
+  f.result(f.root, f.call(f.root, 'task_child_send', 'replay'), { ok: true, operation: { ...operation, replayed: true } })
+  const before = f.collector.observationSnapshot?.('before-cancel')
+  assert.equal(before?.taskTail.filter(row => row.kind === 'result' && row.toolName === 'task_child_send').length, 2,
+    'ordinary results must not erase the reserved control receipts')
+  const [fresh, replay] = before.taskTail.filter(row => row.kind === 'result')
+  assert.equal(fresh.control.replayed, false); assert.equal(replay.control.replayed, true)
+  assert.equal(fresh.control.targetSlot, 1); assert.equal(replay.control.targetSlot, 1)
+  assert.equal(replay.control.mode, null); assert.equal(replay.control.activityBefore, null)
+  assert.equal(replay.control.currentTurn, null); assert.equal(replay.control.routeReported, null)
+  assert.equal(fresh.control.routeReported, false); assert.equal(replay.control.inboxIdPresent, true)
+  assertTaskPartition(f.collector.snapshot()); assert.equal(f.collector.snapshot().byTool.task_child_send.envelopeOk, 2)
+  const oldAgent = f.agents.get(worker.id)
+  f.collector.observeIdle?.(oldAgent, 1)
+  f.collector.disposed(worker)
+  const restored = f.create(worker.id, 'root', { seq: worker.seq + 2 })
+  f.step(restored, 8, 1)
+  f.collector.observeIdle?.(oldAgent, 0)
+  const after = f.collector.observationSnapshot('stage-end')
+  assert.equal(after.agents[1].agentSlot, before.agents[1].agentSlot)
+  assert.ok(after.agents[1].lifetime > before.agents[1].lifetime)
+  assert.equal(before.agents[1].turn, 7); assert.equal(after.agents[1].turn, 8)
+  assert.equal(after.coverage, 'partial', 'an old Agent idle wait cannot be attributed to the replacement lifetime')
+  assert.doesNotMatch(JSON.stringify(after), /SECRET_|private-worker|read-\d/)
+})
+
+test('model observation stream links consumed requests to own messages and isolates cancellation phases', async () => {
+  const { createModelStreamBoundary } = await api()
+  const f = await taskCollectorFixture(), worker = f.create('private-worker', 'root')
+  f.collector.beginObservations?.(0); f.step(); f.step(worker, 2, 1)
+  const marked = new WeakSet(), signal = new AbortController().signal
+  let admitted = 0
+  const boundary = createModelStreamBoundary({ tracked: f.agents, provider: 'p', model: 'm',
+    isAgentLoopRequest: options => marked.has(options), onRequest() { admitted++ },
+    observe: data => f.collector.observeStream?.(data), onFailure() { f.collector.noteCancel?.() } })
+  const run = (session, turn, next) => {
+    const agent = f.agents.get(session.id)
+    boundary.observeRequest({ agent, turn, step: 1, signal })
+    const options = Object.freeze({ sessionId: session.id, provider: 'p', model: 'm', maxTokens: 8192, signal })
+    marked.add(options)
+    return boundary.intercept(options, next)
+  }
+  const root = run(f.root, 1, async function* () { yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }; yield { type: 'finish', reason: { kind: 'stop' } } })
+  assert.equal(admitted, 0)
+  for await (const chunk of root) {}
+  const message = f.emit(f.root, 'assistant/message', { turn: 1, step: 1, message: { content: [{ type: 'text', text: 'SECRET_MODEL' }] } })
+  const child = run(worker, 2, async function* () { yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }; yield { type: 'text', text: 'SECRET_MODEL' } })
+  await child.next()
+  const before = f.collector.observationSnapshot?.('before-cancel')
+  assert.equal(before?.requests.length, 2, 'both actual consumed request admissions must retain their own coordinates')
+  assert.equal(before.requests[0].agentSlot, 0); assert.equal(before.requests[1].agentSlot, 1)
+  assert.equal(before.requests[0].assistantSeq, message.seq); assert.equal(before.requests[0].assistantMessageSeen, true)
+  assert.equal(before.requests[0].complete, true); assert.equal(before.requests[1].ended, false)
+  f.collector.noteCancel(); await child.return()
+  const after = f.collector.observationSnapshot('after-dispose')
+  assert.equal(before.requests[1].firstFailure, null)
+  assert.equal(after.requests[1].firstFailure, 'stream-error'); assert.equal(after.requests[1].failurePhase, 'after-cancel')
+  assert.deepEqual(after.agents, []); assert.deepEqual(after.taskTail, []); assert.equal(after.tasks.available, false)
+  assert.doesNotMatch(JSON.stringify(after), /SECRET_|private-worker/)
+})
+
+for (const fault of ['hook-getter', 'extra', 'accessor', 'proxy', 'inherited', 'thenable', 'promise', 'request-limit', 'agent-limit', 'unknown-enum']) {
+  test(`model observation refuses ${fault} without changing timeout or invoking foreign properties`, async t => {
+    const { runModelVerification } = await api(), h = setup(t, 'timeout')
+    let traps = 0, cancels = 0
+    const trap = () => { traps++; throw new Error('SECRET_DIAGNOSTIC') }
+    const report = await runModelVerification({ ...h.options, stageTimeoutMs: 10 }, { createHarness: async config => {
+      const harness = await h.factory(config)
+      harness.beginModelObservationStage = () => {}
+      harness.cancel = () => { cancels++ }
+      let value = modelObservationProjection()
+      if (fault === 'extra') value.source = 'native-own-published-events'
+      if (fault === 'accessor') Object.defineProperty(value, 'requests', { get: trap })
+      if (fault === 'proxy') value.requests = new Proxy(value.requests, { get: trap, ownKeys: trap, getOwnPropertyDescriptor: trap })
+      if (fault === 'inherited') value = Object.assign(Object.create({ extra: 'SECRET_DIAGNOSTIC' }), value)
+      if (fault === 'thenable') Object.defineProperty(value, 'then', { get: trap })
+      if (fault === 'request-limit') value.requests = Array.from({ length: 81 }, () => value.requests[0])
+      if (fault === 'agent-limit') value.agents = Array.from({ length: 17 }, () => value.agents[0])
+      if (fault === 'unknown-enum') value.requests[0].firstFailure = 'SECRET_CODE'
+      if (fault === 'hook-getter') Object.defineProperty(harness, 'modelObservationSnapshot', { get: trap })
+      else harness.modelObservationSnapshot = () => fault === 'promise' ? Promise.reject(new Error('SECRET_DIAGNOSTIC')) : value
+      return harness
+    } })
+    assert.equal(report.failure, 'timeout'); assert.equal(report.ok, false)
+    assert.equal(report.stages[0].timeoutObservations, null)
+    assert.equal(traps, 0); assert.ok(cancels >= 2)
+    assert.doesNotMatch(JSON.stringify(report), /SECRET_/)
+  })
+}
+
+test('model observation bounds tails and keeps the first task failure plus a detached cached task view', async () => {
+  const f = await taskCollectorFixture(), worker = f.create('private-worker', 'root')
+  f.collector.beginObservations(0); f.step()
+  const rows = [{ id: 1, status: 'claimed', owner_session: worker.id, evidence: 4, waived: false, evidence_policy: 'legacy', strictVerified: false }]
+  f.collector.observeTasks(rows)
+  rows[0].status = 'SECRET_MUTATION'
+  f.result(f.root, f.call(f.root, 'task_submit', 'failure'), { ok: false, code: 'E_STATUS', error: 'SECRET_REASON' })
+  for (let i = 0; i < 70; i++) f.result(f.root, f.call(f.root, 'task_board', `board-${i}`))
+  const snapshot = f.collector.observationSnapshot()
+  assert.equal(snapshot.taskTail.length, 64); assert.ok(snapshot.taskDropped > 0)
+  assert.equal(snapshot.firstFailure.errorCode, 'E_STATUS')
+  assert.equal(snapshot.firstFailure.toolName, 'task_submit')
+  assert.equal(snapshot.tasks.rows[0].status, 'claimed'); assert.equal(snapshot.tasks.rows[0].ownerSlot, 1)
+  snapshot.tasks.rows[0].status = 'mutated'; snapshot.taskTail[0].kind = 'mutated'
+  assert.equal(f.collector.observationSnapshot().tasks.rows[0].status, 'claimed')
+  assert.notEqual(f.collector.observationSnapshot().taskTail[0].kind, 'mutated')
+  assert.equal(f.collector.snapshot().byTool.task_board.envelopeOk, 70)
+  assert.equal(f.collector.snapshot().errorCounts.E_STATUS, 1)
+  f.collector.beginObservations(1)
+  assert.equal(f.collector.observationSnapshot().tasks.available, false)
+  assert.equal(f.collector.observationSnapshot().taskTail.length, 0)
+})
+
+test('model observation saturates cached evidence counts and labels the first task error phase', async () => {
+  for (const phase of ['before-cancel', 'after-cancel']) {
+    const f = await taskCollectorFixture()
+    f.collector.beginObservations(0); f.step()
+    f.collector.observeTasks([{ id: 1, status: 'claimed', owner_session: 'root', evidence: 65536, waived: false, evidence_policy: 'legacy', strictVerified: false }])
+    if (phase === 'after-cancel') f.collector.noteCancel()
+    f.result(f.root, f.call(f.root, 'task_submit', 'failure'), { ok: false, code: 'E_STATUS' })
+    const snapshot = f.collector.observationSnapshot()
+    assert.equal(snapshot.firstFailure.failurePhase, phase)
+    assert.equal(snapshot.tasks.rows[0].evidenceCount, 65535)
+    assert.equal(snapshot.saturated, true); assert.equal(snapshot.coverage, 'partial')
+    assert.equal(f.collector.snapshot().byTool.task_submit.envelopeError, 1)
+  }
+})
+
+test('model observation reserves allowlisted child controls and retains fixed transport error codes', async () => {
+  const f = await taskCollectorFixture()
+  f.collector.beginObservations(0); f.step()
+  const controls = ['task_child_spawn', 'task_child_fork', 'task_child_interrupt', 'task_child_list']
+  for (const name of controls) f.result(f.root, f.call(f.root, name, name))
+  for (let i = 0; i < 24; i++) f.result(f.root, f.call(f.root, 'read', `read-${i}`))
+  f.result(f.root, f.call(f.root, 'read', 'failure'), {}, { message: { isError: true }, data: { error: { code: 'FS_NOT_FOUND', message: 'SECRET_ERROR' } } })
+  const snapshot = f.collector.observationSnapshot()
+  assert.deepEqual(snapshot.taskTail.filter(row => row.kind === 'result').map(row => row.toolName), controls)
+  assert.equal(snapshot.firstFailure.errorCode, 'FS_NOT_FOUND')
+  assert.equal(snapshot.firstFailure.failurePhase, 'before-cancel')
+  assert.equal(snapshot.firstFailure.toolName, 'read')
+  assert.doesNotMatch(JSON.stringify(snapshot), /SECRET_ERROR/)
+  assertTaskPartition(f.collector.snapshot())
+})
+
+test('model observation retains the first owned runtime failure after ordinary tail truncation', async () => {
+  for (const [type, data, kind] of [
+    ['step/error', { turn: 1, step: 1, error: 'SECRET_ERROR' }, 'step-error'],
+    ['compaction/summary', { text: 'SECRET_ERROR' }, 'auxiliary-call'],
+    ['compaction/end', { error: 'SECRET_ERROR' }, 'compaction-error'],
+    ['turn/end', { turn: 1, reason: { kind: 'error', message: 'SECRET_ERROR' } }, 'turn-end'],
+  ]) {
+    const f = await taskCollectorFixture()
+    f.collector.beginObservations(0); f.step()
+    const failed = f.emit(f.root, type, data)
+    for (let i = 0; i < 35; i++) f.emit(f.root, 'other/event', { text: 'SECRET_NOISE' })
+    const snapshot = f.collector.observationSnapshot()
+    assert.equal(snapshot.firstFailure?.kind, kind)
+    assert.equal(snapshot.firstFailure.seq, failed.seq)
+    assert.equal(snapshot.firstFailure.failurePhase, 'before-cancel')
+    assert.doesNotMatch(JSON.stringify(snapshot), /SECRET_/)
+  }
+})
+
+test('model observation v2 degrades failed settlement refreshes without replacing native idle promises', async () => {
+  const { waitForNativeSettlement } = await api()
+  for (const fault of ['history', 'mixed-status', 'obligations', 'projection', 'collector']) {
+    const f = await taskCollectorFixture(), child = f.create('private-child', 'root')
+    f.collector.beginObservations(0)
+    const rootIdle = deferred(), childIdle = deferred()
+    const gates = [rootIdle, childIdle], originalAll = Promise.all
+    let read, exactInputs, calls = 0, broken = false, unavailable = 0
+    const observation = { ...f.collector, observationUnavailable() { unavailable++; f.collector.observationUnavailable?.() } }
+    for (const [index, agent] of [...f.agents.values()].entries()) {
+      agent.status = 'idle'; agent.session.snapshotEvents = () => {
+        if (broken && fault === 'history') throw new Error('SECRET_HISTORY')
+        return []
+      }
+      agent.whenIdle = () => { calls++; return gates[index].promise }
+    }
+    const activationCounts = new Map([['private-child', 1]])
+    const beforeCounts = new Map([['private-child', 1]])
+    let pending
+    try {
+      Promise.all = function (inputs) { exactInputs = [...inputs]; return originalAll.call(this, exactInputs) }
+      pending = waitForNativeSettlement({ tracked: f.agents, rootId: 'root', activationCounts, beforeCounts,
+        beforeNotices: new Map(), isDisposed: () => false, observation, observe: value => { read = value } })
+    } finally { Promise.all = originalAll }
+    try {
+      assert.equal(read().idleAgents, 2)
+      assert.equal(f.collector.observationSnapshot().coverage, 'complete')
+      assert.equal(f.collector.observationSnapshot().agents[1].requiredNotices, 0)
+      broken = true
+      if (fault === 'mixed-status') {
+        f.agents.get('root').status = 'running'
+        Object.defineProperty(f.agents.get(child.id), 'status', { configurable: true, get() { throw new Error('SECRET_STATUS') } })
+      }
+      if (fault === 'obligations') activationCounts.get = () => { throw new Error('SECRET_OBLIGATIONS') }
+      if (fault === 'projection') activationCounts.get = () => NaN
+      if (fault === 'collector') child.isOwnSeq = () => false
+      if (fault === 'collector') f.emit(child, 'turn/start', { turn: 1 })
+      const progress = read(), diagnostic = f.collector.observationSnapshot('before-cancel')
+      if (fault !== 'collector') assert.equal(progress, null)
+      if (fault !== 'collector') assert.ok(unavailable > 0)
+      assert.ok(diagnostic === null || diagnostic.coverage === 'partial', 'failed or mixed refresh cannot retain complete cached authority')
+      assert.equal(exactInputs[0], rootIdle.promise); assert.equal(exactInputs[1], childIdle.promise)
+      assert.equal(calls, 2)
+    } finally {
+      broken = false
+      delete activationCounts.get
+      for (const agent of f.agents.values()) Object.defineProperty(agent, 'status', { configurable: true, writable: true, value: 'idle' })
+      rootIdle.resolve(); childIdle.resolve(); await pending
+    }
+  }
+})
+
+test('model observation v2 records only stable matching ended correspondence and preserves pending timeout evidence', async t => {
+  const { runModelVerification, createModelStreamBoundary } = await api()
+  for (const mode of ['stable', 'unmatched', 'pending', 'late']) {
+    const f = await taskCollectorFixture(), h = setup(t, 'timeout'), active = []
+    let afterSecond = null
+    const report = await runModelVerification({ ...h.options, stageTimeoutMs: 40 }, { createHarness: async config => {
+      const marked = new WeakSet(), signal = new AbortController().signal
+      let settled = false
+      const sessions = [{ id: 'root', parent: null, events: [] }]
+      const boundary = createModelStreamBoundary({ tracked: f.agents, provider: config.provider, model: config.model,
+        isAgentLoopRequest: options => marked.has(options), onRequest: config.onRequest,
+        observe: data => f.collector.observeStream(data), onFailure() { f.collector.noteCancel() } })
+      const streamSnapshot = () => {
+        const value = boundary.snapshot()
+        return mode === 'unmatched' ? { ...value, records: value.records.map(row => ({ ...row, key: 'unproved-coordinate' })) } : value
+      }
+      const consume = async (session, turn, held) => {
+        f.step(session, turn, 1)
+        boundary.observeRequest({ agent: f.agents.get(session.id), turn, step: 1, signal })
+        const options = Object.freeze({ sessionId: session.id, provider: config.provider, model: config.model, maxTokens: 8192, signal })
+        marked.add(options)
+        const stream = boundary.intercept(options, async function* () {
+          yield { type: 'usage', usage: { inputTokens: 1, outputTokens: 1 } }
+          yield { type: 'finish', reason: { kind: 'stop' } }
+        })
+        active.push(stream)
+        if (held) await stream.next()
+        else for await (const chunk of stream) {}
+      }
+      return { hostVersion: '0.2.0-rc.2', rootId: 'root',
+        snapshot: () => ({ sessions, tasks: [], settled, streamAccounting: streamSnapshot() }), streamSnapshot,
+        beginModelObservationStage: index => f.collector.beginObservations(index),
+        modelObservationSnapshot: phase => f.collector.observationSnapshot(phase),
+        observeModelAccounting: value => f.collector.observeAccounting?.(value),
+        async runStage() {
+          await consume(f.root, 1, mode === 'pending')
+          if (mode === 'pending') {
+            const worker = f.create('private-worker', 'root'); sessions.push({ id: worker.id, parent: 'root', events: [] })
+            await consume(worker, 1, true)
+            afterSecond = f.collector.observationSnapshot('stage-end')
+            return new Promise(() => {})
+          }
+          if (mode === 'late') return new Promise(() => {})
+          settled = true
+        },
+        cancel() { f.collector.noteCancel(); if (mode === 'late') settled = true },
+        async dispose() { f.collector.noteDisposing(); for (const stream of active) await stream.return() },
+      }
+    } })
+    const stage = report.stages[0]
+    assert.equal(report.ok, false)
+    assert.equal(report.runtimeDiagnostics.counts['missing-message'], mode === 'pending' ? 2 : 1)
+    if (mode === 'stable') {
+      assert.equal(report.failure, 'usage-or-runtime-error')
+      assert.equal(stage.observations.firstFailure?.kind, 'missing-message', 'stable accounting failure must reach first observed evidence')
+      assert.equal(stage.observations.firstFailure.requestIndex, 0)
+      assert.equal(stage.observations.requests[0].firstFailure, 'missing-message')
+      assert.equal(stage.observations.requests[0].failurePhase, 'before-cancel')
+      assert.deepEqual([stage.observations.firstFailure.agentSlot, stage.observations.firstFailure.turn, stage.observations.firstFailure.step], [0, 1, 1])
+    } else if (mode === 'unmatched') {
+      assert.equal(report.failure, 'usage-or-runtime-error')
+      assert.equal(stage.observations.firstFailure, null)
+      assert.equal(stage.observations.coverage, 'partial')
+    } else if (mode === 'pending') {
+      assert.equal(report.failure, 'timeout'); assert.equal(stage.requests, 2)
+      assert.equal(afterSecond.firstFailure, null)
+      assert.ok(afterSecond.requests.every(row => row.firstFailure === null && row.ended === false))
+      assert.equal(stage.timeoutObservations.firstFailure, null)
+      assert.ok(stage.timeoutObservations.requests.every(row => row.firstFailure === null && row.ended === false))
+      assert.ok(stage.postDisposeObservations.requests.every(row => row.firstFailure === 'stream-error' && row.failurePhase === 'during-dispose'))
+    } else {
+      assert.equal(report.failure, 'timeout')
+      assert.equal(stage.timeoutObservations.firstFailure, null)
+      assert.equal(stage.timeoutObservations.requests[0].firstFailure, null)
+      assert.equal(stage.observations.firstFailure.kind, 'missing-message')
+      assert.equal(stage.observations.requests[0].failurePhase, 'after-cancel')
+    }
+    assert.equal(stage.postDisposeObservations.coverage, 'partial', 'retained sessions plus later streams do not prove a simultaneous observation')
+    assert.doesNotMatch(JSON.stringify(report), /private-worker|unproved-coordinate/)
+  }
+})
+
+test('model observation v2 accounting intake refuses malformed primitives without invoking foreign properties', async () => {
+  for (const fault of ['accessor', 'proxy', 'extra', 'limit', 'count']) {
+    const f = await taskCollectorFixture()
+    f.collector.beginObservations(0)
+    let traps = 0
+    const trap = () => { traps++; throw new Error('SECRET_ACCOUNTING') }
+    const value = { stable: true, mixed: false, truncated: false, missingCount: 0, otherFailures: false, missing: [] }
+    if (fault === 'accessor') Object.defineProperty(value, 'missing', { get: trap })
+    if (fault === 'proxy') value.missing = new Proxy([], { get: trap, ownKeys: trap })
+    if (fault === 'extra') value.extra = 'SECRET_ACCOUNTING'
+    if (fault === 'limit') value.missing = Array.from({ length: 21 }, () => ({ requestIndex: 0, matchedEnded: true }))
+    if (fault === 'count') value.missingCount = 65536
+    f.collector.observeAccounting(value)
+    const snapshot = f.collector.observationSnapshot()
+    assert.equal(snapshot.coverage, 'partial'); assert.equal(snapshot.firstFailure, null)
+    assert.equal(traps, 0); assert.doesNotMatch(JSON.stringify(snapshot), /SECRET_ACCOUNTING/)
+  }
+})
+
+test('model observation v3 loses owned authority after a failed disposal identity read', async () => {
+  const f = await taskCollectorFixture(), worker = f.create('private-worker', 'root')
+  const agent = f.agents.get(worker.id)
+  f.collector.beginObservations(0); f.step(worker, 4, 1)
+  f.collector.observeStatus(agent, 'running'); f.collector.observeIdle(agent, 1)
+  const before = f.collector.observationSnapshot('before-cancel'), frozen = JSON.stringify(before)
+  assert.equal(before.coverage, 'complete')
+  assert.equal(before.agents[1].status, 'running'); assert.equal(before.agents[1].pendingIdleWaits, 1)
+  assert.notEqual(f.collector.snapshot(), null)
+  Object.defineProperty(worker, 'id', { get() { throw new Error('SECRET_DISPOSAL_ID') } })
+  assert.doesNotThrow(() => f.collector.disposed(worker))
+  assert.equal(f.collector.snapshot(), null, 'legacy failed disposal observation remains unavailable')
+  assert.equal(f.collector.observationSnapshot('stage-end'), null,
+    'failed owned disposal identity must invalidate stale additive authority')
+  assert.equal(JSON.stringify(before), frozen, 'earlier detached evidence stays immutable')
+  f.collector.beginObservations(1)
+  assert.equal(f.collector.observationSnapshot(), null, 'stage reset cannot recover unobserved disposal authority')
+  assert.doesNotMatch(frozen, /private-worker|SECRET_DISPOSAL_ID/)
+})
+
+test('model observation rejects inherited or discontinuous publications and bounds event and lifetime coverage', async () => {
+  for (const fault of ['inherited', 'gap']) {
+    const f = await taskCollectorFixture(), worker = f.create('private-worker', 'root', { cut: 5, seq: 5 })
+    f.collector.beginObservations(0)
+    if (fault === 'gap') worker.seq++
+    else worker.isOwnSeq = () => false
+    f.emit(worker, 'turn/start', { turn: 1 })
+    assert.equal(f.collector.observationSnapshot(), null)
+  }
+  const f = await taskCollectorFixture()
+  f.collector.beginObservations(0)
+  for (let i = 0; i < 4100; i++) f.emit(f.root, 'other/event', { body: 'SECRET_BODY' })
+  const bounded = f.collector.observationSnapshot()
+  assert.equal(bounded.ordinaryTail.length, 32); assert.equal(bounded.coverage, 'partial')
+  assert.equal(f.collector.snapshot().observedEvents, 4096)
+  let worker = f.create('private-worker', 'root')
+  for (let i = 0; i < 257; i++) {
+    f.collector.disposed(worker)
+    worker = f.create(worker.id, 'root', { seq: worker.seq })
+  }
+  assert.equal(f.collector.observationSnapshot().coverage, 'partial')
+  assert.ok(f.collector.observationSnapshot().agents.every(row => row.lifetime < 256))
+})
 
 test('published task collector uses own native coordinates, role lineage, stages and exact envelope partition', async () => {
   const f = await taskCollectorFixture(), worker = f.create('private-id', 'root', { cut: 8, seq: 10 })

@@ -349,9 +349,272 @@ function taskDiagnostics(harness, native) {
   } catch { return null }
 }
 
+// Separate exact primitive projection. No legacy diagnostic schema is widened.
+const observationPhases = ['stage-end', 'before-cancel', 'final-before-dispose', 'after-dispose']
+const observationFailurePhases = ['before-cancel', 'after-cancel', 'during-dispose', 'after-dispose']
+const observationKinds = ['call', 'result', 'turn-start', 'turn-end', 'step-start', 'step-end', 'assistant-message', 'notice', 'other', ...runtimeCategories]
+const observationStatuses = ['open', 'claimed', 'submitted', 'accepted', 'rejected', 'cancelled', 'done', 'partial', 'failed', 'unknown']
+const observationNumber = value => count(value) && !Object.is(value, -0)
+const observationNullable = check => value => value === null || check(value)
+const observationEnum = values => value => values.includes(value)
+const observationBoolean = value => typeof value === 'boolean'
+const observationCoordinate = observationNullable(observationNumber)
+const observationSlot = observationNullable(value => observationNumber(value) && value < 16)
+const observationTime = observationNullable(value => observationNumber(value) && value <= 2147483647)
+const observationCount = value => observationNumber(value) && value <= 65535
+function observationRecord(value, schema) {
+  const fields = diagnosticFields(value, Object.keys(schema))
+  if (!fields || Object.entries(schema).some(([key, check]) => !check(fields[key]))) return null
+  return fields
+}
+function observationArray(value, limit, project) {
+  if (!Array.isArray(value) || types.isProxy(value) || Object.getPrototypeOf(value) !== Array.prototype) return null
+  const length = Object.getOwnPropertyDescriptor(value, 'length')?.value
+  if (!observationNumber(length) || length > limit || Reflect.ownKeys(value).length !== length + 1) return null
+  const result = []
+  for (let i = 0; i < length; i++) {
+    const field = Object.getOwnPropertyDescriptor(value, String(i))
+    if (!field || !Object.hasOwn(field, 'value')) return null
+    const row = project(field.value)
+    if (!row) return null
+    result.push(row)
+  }
+  return result
+}
+const observationControlSchema = {
+  status: observationNullable(observationEnum(['pending', 'accepted', 'rejected', 'unknown'])),
+  durable: observationNullable(observationBoolean), replayed: observationNullable(observationBoolean), targetSlot: observationSlot,
+  inboxIdPresent: observationNullable(observationBoolean), mode: observationNullable(observationEnum(['continuable', 'one-shot', 'unknown'])),
+  activityBefore: observationNullable(observationEnum(['running', 'inactive', 'unknown'])),
+  currentTurn: observationNullable(observationEnum(['running', 'inactive', 'unknown'])), routeReported: value => value === null || value === false,
+}
+const observationEventSchema = {
+  order: observationCount, elapsedMs: observationTime, agentSlot: observationSlot, lifetime: observationCoordinate,
+  seq: observationCoordinate, turn: observationCoordinate, step: observationCoordinate, callOrdinal: observationCoordinate,
+  requestIndex: observationNullable(value => observationNumber(value) && value < 80), kind: observationEnum(observationKinds),
+  toolName: value => value === null || diagnosticTools.has(value), presentation: observationNullable(observationEnum(['native', 'ptc'])),
+  outcome: observationNullable(observationEnum(['call', ...taskOutcomes, 'transport-ok'])),
+  errorCode: value => value === null || taskCodes.includes(value) || diagnosticErrorCodes.has(value),
+  reasonKind: observationNullable(observationEnum(['completed', ...noncompletedReasons, 'unknown'])),
+  senderSlot: observationSlot, failurePhase: observationNullable(observationEnum(observationFailurePhases)), control: value => value === null || !!observationRecord(value, observationControlSchema),
+}
+function projectObservationEvent(value) {
+  const row = observationRecord(value, observationEventSchema)
+  return row && { ...row, control: row.control === null ? null : observationRecord(row.control, observationControlSchema) }
+}
+const observationAgentSchema = {
+  agentSlot: value => observationNumber(value) && value < 16, parentSlot: observationSlot, role: observationEnum(['root', 'worker']),
+  lifetime: value => observationNumber(value) && value < 256, status: observationEnum(['idle', 'running', 'unknown']),
+  turn: observationCoordinate, step: observationCoordinate, lastEvent: observationNullable(observationEnum(observationKinds)),
+  lastSeq: observationCoordinate, lastElapsedMs: observationTime, requests: observationCount, turnStarts: observationCount, turnEnds: observationCount,
+  lastEndReason: observationNullable(observationEnum(['completed', ...noncompletedReasons, 'unknown'])), pendingIdleWaits: observationCount,
+  mode: observationEnum(['continuable', 'one-shot', 'unknown']), activations: observationCount,
+  requiredNotices: observationCount, deliveredNotices: observationCount, missingNotices: observationCount,
+}
+const observationRequestSchema = {
+  requestIndex: value => observationNumber(value) && value < 80, stageIndex: observationNumber, agentSlot: observationSlot,
+  lifetime: observationCoordinate, turn: observationCoordinate, step: observationCoordinate,
+  admittedElapsedMs: observationTime, lastChunkElapsedMs: observationTime, chunks: observationCount,
+  usageSeen: observationBoolean, finishSeen: observationBoolean, finishKind: observationNullable(observationEnum(['stop', 'tool-calls', 'unknown'])),
+  ended: observationBoolean, complete: observationBoolean, assistantMessageSeen: observationBoolean, assistantSeq: observationCoordinate,
+  cancelAlreadyRequested: observationBoolean, firstFailure: observationNullable(observationEnum(runtimeCategories)),
+  failurePhase: observationNullable(observationEnum(observationFailurePhases)),
+}
+const observationTaskSchema = {
+  taskId: observationCoordinate, status: observationEnum(observationStatuses), ownerSlot: observationSlot, ownerMatches: observationNullable(observationBoolean),
+  evidenceCount: observationNullable(observationCount), waived: observationBoolean, evidencePolicy: observationEnum(['legacy', 'execution', 'unknown']), strictVerified: observationBoolean,
+}
+function projectModelObservations(value) {
+  if (types.isProxy(value) || discardTaskDiagnosticPromise(value)) return null
+  const fields = diagnosticFields(value, ['stageIndex', 'phase', 'elapsedMs', 'coverage', 'truncated', 'saturated', 'agents', 'requests', 'tasks', 'taskTail', 'ordinaryTail', 'taskDropped', 'ordinaryDropped', 'firstFailure'])
+  if (!fields || !observationNumber(fields.stageIndex) || !observationPhases.includes(fields.phase) || !observationTime(fields.elapsedMs)
+    || !['complete', 'partial'].includes(fields.coverage) || !observationBoolean(fields.truncated) || !observationBoolean(fields.saturated)
+    || !observationCount(fields.taskDropped) || !observationCount(fields.ordinaryDropped)) return null
+  const agents = observationArray(fields.agents, 16, row => observationRecord(row, observationAgentSchema))
+  const requests = observationArray(fields.requests, 80, row => observationRecord(row, observationRequestSchema))
+  const taskTail = observationArray(fields.taskTail, 64, projectObservationEvent), ordinaryTail = observationArray(fields.ordinaryTail, 32, projectObservationEvent)
+  const tasks = diagnosticFields(fields.tasks, ['available', 'observedPhase', 'elapsedMs', 'rows', 'truncated'])
+  if (!agents || !requests || !taskTail || !ordinaryTail || !tasks || !observationBoolean(tasks.available)
+    || ![null, 'snapshot'].includes(tasks.observedPhase) || !observationTime(tasks.elapsedMs) || !observationBoolean(tasks.truncated)) return null
+  const rows = observationArray(tasks.rows, 20, row => observationRecord(row, observationTaskSchema))
+  const firstFailure = fields.firstFailure === null ? null : projectObservationEvent(fields.firstFailure)
+  if (!rows || (fields.firstFailure !== null && !firstFailure)) return null
+  if (fields.phase === 'after-dispose' && (agents.length || rows.length || tasks.available || taskTail.length || ordinaryTail.length)) return null
+  return { ...fields, agents, requests, tasks: { ...tasks, rows }, taskTail, ordinaryTail, firstFailure }
+}
+function modelObservationHook(harness, name, args = []) {
+  if (!harness || types.isProxy(harness)) return null
+  const field = Object.getOwnPropertyDescriptor(harness, name)
+  if (!field || !Object.hasOwn(field, 'value') || typeof field.value !== 'function' || types.isProxy(field.value)) return null
+  return taskApply(field.value, harness, args)
+}
+function modelObservations(harness, native, phase) {
+  try {
+    const value = projectModelObservations(modelObservationHook(harness, 'modelObservationSnapshot', [phase]))
+    return value && value.phase === phase ? { source: native ? 'native-own-published-events' : 'custom-harness-unverified', ...value } : null
+  } catch { return null }
+}
+function observeModelSide(observer, method, ...args) {
+  try { observer?.[method]?.(...args) } catch { /* side observations cannot change native control flow */ }
+}
+
+// This private cache never queries native state. Owned publication/stream and
+// existing settlement/task reads feed it; snapshots only copy primitive rows.
+function createModelObservationCache() {
+  const agents = [], requests = []
+  let stageIndex = 0, started = Date.now(), lifetimes = 0, order = 0, lost = false, partial = false, saturated = false
+  let taskTail = [], ordinaryTail = [], taskDropped = 0, ordinaryDropped = 0, firstFailure = null, failurePhase = 'before-cancel'
+  const emptyTasks = () => ({ available: false, observedPhase: null, elapsedMs: null, rows: [], truncated: false })
+  let tasks = emptyTasks()
+  const elapsed = () => { const n = Date.now() - started; if (!observationNumber(n) || n > 2147483647) { partial = true; return null } return n }
+  const increment = (row, key) => { if (row[key] === 65535) saturated = partial = true; else row[key]++ }
+  const event = (row, values = {}, reserved = false) => {
+    const result = { order, elapsedMs: elapsed(), agentSlot: row?.agentSlot ?? null, lifetime: row?.lifetime ?? null,
+      seq: null, turn: row?.turn ?? null, step: row?.step ?? null, callOrdinal: null, requestIndex: null,
+      kind: 'other', toolName: null, presentation: null, outcome: null, errorCode: null, reasonKind: null,
+      senderSlot: null, failurePhase: null, control: null, ...values }
+    if (order === 65535) saturated = partial = true; else order++
+    const tail = reserved ? taskTail : ordinaryTail, limit = reserved ? 64 : 32
+    if (tail.length === limit) { tail.shift(); partial = true; if (reserved) taskDropped = Math.min(65535, taskDropped + 1); else ordinaryDropped = Math.min(65535, ordinaryDropped + 1) }
+    tail.push(result)
+    if (result.errorCode !== null || ['envelope-error', 'transport-error'].includes(result.outcome) || runtimeCategories.includes(result.kind)
+      || result.kind === 'turn-end' && result.reasonKind !== 'completed') {
+      result.failurePhase ??= failurePhase
+      if (!firstFailure) firstFailure = { ...result }
+    }
+    return result
+  }
+  return {
+    lost() { lost = true }, partial() { partial = true },
+    created(state, previous) {
+      if (lifetimes === 256) { partial = true; return null }
+      const row = previous?.observationRow ?? { agentSlot: agents.length, parentSlot: null, role: state.role,
+        lifetime: 0, status: 'unknown', turn: null, step: null, lastEvent: null, lastSeq: null, lastElapsedMs: null,
+        requests: 0, turnStarts: 0, turnEnds: 0, lastEndReason: null, pendingIdleWaits: 0, mode: 'unknown',
+        activations: 0, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0 }
+      if (!previous?.observationRow) agents.push(row)
+      if (row.pendingIdleWaits) partial = true
+      row.parentSlot = state.parentRow?.agentSlot ?? null; row.lifetime = lifetimes++; row.status = 'unknown'; row.turn = row.step = null; row.pendingIdleWaits = 0
+      return row
+    },
+    begin(index) {
+      if (!observationNumber(index)) { lost = true; return }
+      stageIndex = index; started = Date.now(); taskTail = []; ordinaryTail = []; taskDropped = ordinaryDropped = 0; firstFailure = null; tasks = emptyTasks()
+      for (const row of agents) { row.requests = row.turnStarts = row.turnEnds = 0; row.lastEvent = row.lastSeq = row.lastElapsedMs = row.lastEndReason = null }
+    },
+    cancel() { if (failurePhase === 'before-cancel') failurePhase = 'after-cancel' }, disposing() { failurePhase = 'during-dispose' },
+    accounting(value) {
+      const fields = observationRecord(value, { stable: observationBoolean, mixed: observationBoolean, truncated: observationBoolean,
+        missingCount: observationCount, otherFailures: observationBoolean, missing: value => Array.isArray(value) && !types.isProxy(value) })
+      const missing = fields && observationArray(fields.missing, 20, row => observationRecord(row, {
+        requestIndex: value => observationNumber(value) && value < 80, matchedEnded: observationBoolean }))
+      if (!fields || !missing) { partial = true; return }
+      if (fields.mixed || !fields.stable) { partial = true; return }
+      if (fields.truncated || fields.otherFailures || missing.length !== fields.missingCount) partial = true
+      for (const item of missing) {
+        const request = requests[item.requestIndex]
+        if (!item.matchedEnded || !request?.ended || !request.complete || request.agentSlot === null || request.lifetime === null) { partial = true; continue }
+        if (request.firstFailure !== null) continue
+        request.firstFailure = 'missing-message'; request.failurePhase = failurePhase
+        event(null, { kind: 'missing-message', requestIndex: item.requestIndex, agentSlot: request.agentSlot,
+          lifetime: request.lifetime, turn: request.turn, step: request.step, failurePhase })
+      }
+    },
+    publication(row, kind, seq, turn, step, reasonKind = null, senderSlot = null) {
+      if (!row) { partial = true; return }
+      row.lastEvent = kind; row.lastSeq = seq; row.lastElapsedMs = elapsed(); row.turn = turn; row.step = step
+      if (kind === 'turn-start') increment(row, 'turnStarts')
+      if (kind === 'turn-end') { increment(row, 'turnEnds'); row.lastEndReason = reasonKind }
+      if (kind === 'assistant-message') for (const request of requests) {
+        if (request.agentSlot === row.agentSlot && request.lifetime === row.lifetime && request.turn === turn && request.step === step) {
+          request.assistantMessageSeen = true; request.assistantSeq = seq
+        }
+      }
+      event(row, { kind, seq, turn, step, reasonKind, senderSlot })
+      if (kind === 'turn-end') row.turn = row.step = null
+      if (kind === 'step-end') row.step = null
+    },
+    tool(row, values, reserved) {
+      if (row) { row.lastEvent = values.kind; row.lastSeq = values.seq; row.lastElapsedMs = elapsed() }
+      return event(row, values, reserved)
+    },
+    stream(row, data) {
+      const request = requests[data.requestIndex]
+      if (data.kind === 'admitted') {
+        if (data.requestIndex !== requests.length || requests.length === 80) { partial = true; return }
+        requests.push({ requestIndex: data.requestIndex, stageIndex, agentSlot: row?.agentSlot ?? null, lifetime: row?.lifetime ?? null,
+          turn: observationNumber(data.turn) ? data.turn : null, step: observationNumber(data.step) ? data.step : null,
+          admittedElapsedMs: elapsed(), lastChunkElapsedMs: null, chunks: 0, usageSeen: false, finishSeen: false, finishKind: null,
+          ended: false, complete: false, assistantMessageSeen: false, assistantSeq: null, cancelAlreadyRequested: failurePhase !== 'before-cancel', firstFailure: null, failurePhase: null })
+        if (row) increment(row, 'requests'); else partial = true
+      } else if (data.kind === 'failure') {
+        if (request && request.firstFailure === null) { request.firstFailure = data.category; request.failurePhase = failurePhase }
+        event(row, { kind: data.category, requestIndex: observationNumber(data.requestIndex) ? data.requestIndex : null, turn: data.turn ?? null, step: data.step ?? null, failurePhase })
+      } else if (request) {
+        if (data.kind === 'chunk') {
+          increment(request, 'chunks'); request.lastChunkElapsedMs = elapsed()
+          if (data.chunkType === 'usage') request.usageSeen = true
+          if (data.chunkType === 'finish') { request.finishSeen = true; request.finishKind = ['stop', 'tool-calls'].includes(data.finishKind) ? data.finishKind : 'unknown' }
+        }
+        if (data.kind === 'usage') request.usageSeen = true
+        if (data.kind === 'finish') { request.finishSeen = true; request.finishKind = ['stop', 'tool-calls'].includes(data.finishKind) ? data.finishKind : 'unknown' }
+        if (data.kind === 'ended') { request.ended = true; request.complete = data.complete === true }
+      } else partial = true
+    },
+    snapshot(phase) {
+      if (lost || !observationPhases.includes(phase)) return null
+      const after = phase === 'after-dispose'
+      return projectModelObservations({ stageIndex, phase, elapsedMs: elapsed(), coverage: partial ? 'partial' : 'complete', truncated: partial, saturated,
+        agents: after ? [] : agents, requests, tasks: after ? emptyTasks() : tasks, taskTail: after ? [] : taskTail,
+        ordinaryTail: after ? [] : ordinaryTail, taskDropped, ordinaryDropped, firstFailure })
+    },
+    tasks(rows) {
+      tasks = { available: true, observedPhase: 'snapshot', elapsedMs: elapsed(), rows: rows.slice(0, 20), truncated: rows.length > 20 }
+      for (const row of tasks.rows) if (row.evidenceCount > 65535) { row.evidenceCount = 65535; saturated = partial = true }
+    },
+    status(row, status) { if (row) row.status = ['idle', 'running'].includes(status) ? status : 'unknown' },
+    idle(row, pending) { if (row) row.pendingIdleWaits = pending },
+    obligations(row, values) {
+      if (!row) return
+      row.mode = ['continuable', 'one-shot'].includes(values.mode) ? values.mode : 'unknown'
+      for (const key of ['activations', 'requiredNotices', 'deliveredNotices', 'missingNotices']) {
+        if (!observationNumber(values[key])) { lost = true; return }
+        if (values[key] > 65535) saturated = partial = true
+        row[key] = Math.min(65535, values[key])
+      }
+    },
+  }
+}
+
 /** Public Session publications only: no history/store reads, arguments or raw text retained. */
 export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
-  const sessions = new Map()
+  const sessions = new Map(), observation = createModelObservationCache()
+  let callOrdinal = 0
+  const observe = work => { try { return work() } catch { observation.lost(); return undefined } }
+  const observedAgent = agent => {
+    const state = sessions.get(agent?.id)
+    if (!state || !state.valid || state.agent !== agent) { observation.partial(); return null }
+    return state.observationRow
+  }
+  const reservedTool = name => taskTools.includes(name) || ['subagent', 'fork', 'subagent_fork', 'send_message', 'interrupt_agent', 'task_child_spawn', 'task_child_fork', 'task_child_interrupt', 'task_child_list'].includes(name)
+  const observedResult = (state, record, presentation, outcome, errorCode, seq, control = null) => observe(() => observation.tool(state?.observationRow, {
+    kind: 'result', seq, turn: record?.turn ?? state?.turn ?? null, step: record?.step ?? state?.step ?? null,
+    callOrdinal: record?.callOrdinal ?? null, toolName: diagnosticTools.has(record?.name) ? record.name : null,
+    presentation, outcome, errorCode, control }, reservedTool(record?.name)))
+  function observedControl(envelope, state) {
+    if (!envelope || typeof envelope !== 'object') return null
+    const operation = envelope.operation
+    const candidates = [operation?.target_id, envelope.sent?.target_id, envelope.target?.id].filter(value => value !== undefined)
+    const id = candidates[0], target = taskCoordinate(id) && candidates.every(value => value === id) ? sessions.get(id) : null
+    const inbox = operation && Object.hasOwn(operation, 'message_id') ? operation.message_id : envelope.sent?.message_id
+    const literal = (value, choices) => choices.includes(value) ? value : null
+    return { status: literal(operation?.status, ['pending', 'accepted', 'rejected', 'unknown']),
+      durable: typeof operation?.durable === 'boolean' ? operation.durable : null, replayed: typeof operation?.replayed === 'boolean' ? operation.replayed : null,
+      targetSlot: target?.valid && target.parent === state.id ? target.observationRow?.agentSlot ?? null : null,
+      inboxIdPresent: inbox === undefined ? null : taskCoordinate(inbox), mode: literal(envelope.target?.mode, ['continuable', 'one-shot', 'unknown']),
+      activityBefore: literal(envelope.target?.activity_before, ['running', 'inactive', 'unknown']), currentTurn: literal(envelope.target?.current_turn, ['running', 'inactive', 'unknown']),
+      routeReported: envelope.route?.reported === false ? false : null }
+  }
   let report = emptyTaskDiagnostics(), unavailable = false, limitedSessions = false, associations = 0, stageCursor = 0, decodedBytes = 0
   const increment = (object, key) => {
     if (object[key] === 65535) report.saturated = true
@@ -365,7 +628,7 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
   const unattributed = (presentation, seq) => {
     increment(report, 'unattributedResults'); detail(null, presentation, 'unavailable', null, seq)
   }
-  const invalidate = state => { if (state) state.valid = false; unavailable = true }
+  const invalidate = state => { if (state) state.valid = false; unavailable = true; observation.lost() }
   function clearCalls(state) { associations -= state.calls.size + state.ptc.size; state.calls.clear(); state.ptc.clear() }
   function created(session) {
     try {
@@ -383,36 +646,46 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
         // A cold lifecycle can add unpublished seed/setup suffixes. None of
         // its unresolved prior calls is evidence for a newly published result.
         clearCalls(prior)
-      } else if (sessions.size === 16) { limitedSessions = true; report.truncated = true; return }
-      sessions.set(id, { session, agent, parent, cut: session.inheritedEventCount, next: session.seq,
-        valid: prior?.valid ?? true, closed: false, role: id === rootId ? 'root' : 'worker', calls: new Map(), ptc: new Map(), turn: null, step: null })
-    } catch { unavailable = true }
+      } else if (sessions.size === 16) { limitedSessions = true; report.truncated = true; observation.partial(); return }
+      const state = { id, session, agent, parent, cut: session.inheritedEventCount, next: session.seq,
+        valid: prior?.valid ?? true, closed: false, role: id === rootId ? 'root' : 'worker', calls: new Map(), ptc: new Map(), turn: null, step: null }
+      sessions.set(id, state)
+      state.observationRow = observe(() => observation.created({ role: state.role, parentRow: parentState?.observationRow }, prior))
+    } catch { unavailable = true; observation.lost() }
   }
   function disposed(session) {
-    try { const state = sessions.get(session?.id); if (state?.session === session) state.closed = true } catch { unavailable = true }
+    try { const state = sessions.get(session?.id); if (state?.session === session) state.closed = true } catch { unavailable = true; observation.lost() }
   }
   const callKey = (turn, step, id) => count(turn) && count(step) && taskCoordinate(id) ? JSON.stringify([turn, step, id]) : null
   function retain(map, key, record) {
     if (map.has(key)) { map.get(key).ambiguous = true; return }
-    if (associations === 4096) { report.truncated = true; return }
+    if (associations === 4096) { report.truncated = true; observation.partial(); return }
     associations++; map.set(key, record)
   }
   function recordCall(state, map, key, name, seq, extra = {}) {
     const toolName = taskTools.includes(name) ? name : null
     if (toolName) { increment(report.byTool[toolName], 'calls'); increment(report.byRole, state.role) }
     if (key === null || !taskCoordinate(name)) return
-    retain(map, key, { toolName, name, role: state.role, seq, stageCursor, resolved: false, ambiguous: false, ...extra })
+    const ordinal = callOrdinal < 4096 ? callOrdinal++ : null
+    if (ordinal === null) observation.partial()
+    retain(map, key, { toolName, name, role: state.role, seq, stageCursor, resolved: false, ambiguous: false,
+      turn: state.turn, step: state.step, callOrdinal: ordinal, ...extra })
+    observe(() => observation.tool(state.observationRow, { kind: 'call', seq, turn: extra.turn ?? state.turn, step: extra.step ?? state.step, callOrdinal: ordinal,
+      toolName: diagnosticTools.has(name) ? name : null, presentation: map === state.ptc ? 'ptc' : 'native', outcome: 'call' }, reservedTool(name)))
   }
-  function result(record, presentation, data, seq, budget) {
-    if (!record || record.ambiguous || record.resolved) { unattributed(presentation, seq); return }
+  function result(state, record, presentation, data, seq, budget, eventData = data) {
+    if (!record || record.ambiguous || record.resolved) { unattributed(presentation, seq); if (budget) observedResult(state, null, presentation, 'unavailable', null, seq); return }
     record.resolved = true
+    const transportCode = budget && data?.isError === true
+      ? observe(() => diagnosticErrorCodes.has(eventData?.error?.code) ? eventData.error.code : 'unknown') ?? null : null
     if (!record.toolName) {
       if (record.name !== 'run_code') unattributed(presentation, seq)
+      if (budget) observedResult(state, record, presentation, data?.isError === true ? 'transport-error' : data?.isError === false ? 'transport-ok' : 'unavailable', transportCode, seq)
       return // The native run_code wrapper is never another TaskForce outcome.
     }
     const row = report.byTool[record.toolName]
     increment(row, presentation === 'native' ? 'nativeResults' : 'ptcResults')
-    let outcome = 'unavailable', errorCode = null
+    let outcome = 'unavailable', errorCode = null, decodedEnvelope = null
     if (budget && data?.isError === true) outcome = 'transport-error'
     else if (budget && data?.isError === false) {
       const content = data.content
@@ -427,6 +700,7 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
             try {
               const envelope = JSON.parse(text)
               if (envelope && typeof envelope === 'object' && !Array.isArray(envelope) && Object.hasOwn(envelope, 'ok') && typeof envelope.ok === 'boolean') {
+                decodedEnvelope = envelope
                 outcome = envelope.ok ? 'envelope-ok' : 'envelope-error'
                 if (!envelope.ok) { errorCode = Object.hasOwn(envelope, 'code') && taskCodes.includes(envelope.code) ? envelope.code : 'unknown'; increment(report.errorCounts, errorCode) }
               }
@@ -437,6 +711,8 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
     }
     increment(row, { 'envelope-ok': 'envelopeOk', 'envelope-error': 'envelopeError', 'transport-error': 'transportError', unavailable: 'unavailableResults' }[outcome])
     detail(record, presentation, outcome, errorCode, seq)
+    if (budget) observe(() => observedResult(state, record, presentation, outcome, outcome === 'transport-error' ? transportCode : errorCode, seq,
+      ['task_child_send', 'task_child_stop'].includes(record.name) ? observedControl(decodedEnvelope, state) : null))
   }
   function published(session, event) {
     let state
@@ -458,14 +734,25 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
         || session.seq !== event.seq + 1 || session.isOwnSeq(event.seq) !== true) { invalidate(state); return }
       state.next++
       const budget = report.observedEvents < 4096
-      if (budget) increment(report, 'observedEvents'); else report.truncated = true
+      if (budget) increment(report, 'observedEvents'); else { report.truncated = true; observation.partial() }
       const data = event.data
+      const observedTurn = count(data?.turn) ? data.turn : state.turn, observedStep = count(data?.step) ? data.step : state.step
       if (event.type === 'turn/start') { state.turn = count(data?.turn) ? data.turn : null; state.step = null }
       if (event.type === 'step/start') { state.turn = count(data?.turn) ? data.turn : null; state.step = count(data?.step) ? data.step : null }
       if (event.type === 'step/end' || event.type === 'turn/end') state.step = null
       if (event.type === 'turn/end') state.turn = null
+      if (budget && !['tool/call', 'tool/result', 'tool/ptc-dispatch-start', 'tool/ptc-dispatch'].includes(event.type)) observe(() => {
+        const kinds = { 'turn/start': 'turn-start', 'turn/end': 'turn-end', 'step/start': 'step-start', 'step/end': 'step-end', 'assistant/message': 'assistant-message',
+          'step/error': 'step-error', 'compaction/summary': 'auxiliary-call' }
+        const notice = event.type === 'user/message' && data?.source?.kind === 'subagent-settled'
+        const sender = notice ? sessions.get(data.source.senderSessionId) : null
+        const reason = event.type === 'turn/end' ? ['completed', ...noncompletedReasons].includes(data?.reason?.kind) ? data.reason.kind : 'unknown' : null
+        const kind = event.type === 'compaction/end' && data?.error !== undefined ? 'compaction-error' : kinds[event.type] ?? 'other'
+        observation.publication(state.observationRow, notice ? 'notice' : kind, event.seq, observedTurn, observedStep, reason,
+          sender?.valid && sender.parent === state.id ? sender.observationRow?.agentSlot ?? null : null)
+      })
       if (event.type === 'tool/call') {
-        if (budget) recordCall(state, state.calls, callKey(data?.turn, data?.step, data?.callId), data?.name, event.seq)
+        if (budget) recordCall(state, state.calls, callKey(data?.turn, data?.step, data?.callId), data?.name, event.seq, { turn: data?.turn, step: data?.step })
         return
       }
       if (event.type === 'tool/result') {
@@ -476,9 +763,9 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
           || data.name !== undefined && data.name !== record.name
           || source.toolName !== undefined && source.toolName !== record.name
           || !Array.isArray(event.sourceEventSeqs) || event.sourceEventSeqs.length !== 1 || event.sourceEventSeqs[0] !== record.seq || record.seq >= event.seq) {
-          unattributed('native', event.seq); return
+          unattributed('native', event.seq); if (budget) observedResult(state, null, 'native', 'unavailable', null, event.seq); return
         }
-        result(record, 'native', message, event.seq, budget); return
+        result(state, record, 'native', message, event.seq, budget, data); return
       }
       if (event.type !== 'tool/ptc-dispatch-start' && event.type !== 'tool/ptc-dispatch') return
       const isResult = event.type === 'tool/ptc-dispatch'
@@ -491,7 +778,7 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
       if (isResult) {
         const record = state.ptc.get(key)
         if (record?.name !== data.name) unattributed('ptc', event.seq)
-        else result(record, 'ptc', data, event.seq, budget)
+        else result(state, record, 'ptc', data, event.seq, budget)
         return
       }
       let parentValid = data.parentCallId === data.rootCallId
@@ -504,6 +791,22 @@ export function createTaskToolDiagnosticsCollector({ rootId, agents }) {
     } catch { invalidate(state) }
   }
   return { created, disposed, published,
+    beginObservations(index) { observe(() => observation.begin(index)) },
+    observationSnapshot(phase = 'stage-end') { return observe(() => observation.snapshot(phase)) ?? null },
+    noteCancel() { observe(() => observation.cancel()) }, noteDisposing() { observe(() => observation.disposing()) },
+    observationUnavailable() { observe(() => observation.partial()) },
+    observeAccounting(value) { observe(() => observation.accounting(value)) },
+    observeStream(data) { observe(() => observation.stream(observedAgent(data.agent), data)) },
+    observeStatus(agent, status) { observe(() => observation.status(observedAgent(agent), status)) },
+    observeIdle(agent, pending) { observe(() => observation.idle(observedAgent(agent), pending)) },
+    observeObligations(agent, values) { observe(() => observation.obligations(observedAgent(agent), values)) },
+    observeTasks(rows) { observe(() => {
+      const workers = [...sessions.values()].filter(state => state.valid && state.parent === rootId)
+      observation.tasks(rows.slice(0, 21).map(task => ({ taskId: count(task.id) ? task.id : null, status: observationStatuses.includes(task.status) ? task.status : 'unknown',
+        ownerSlot: sessions.get(task.owner_session)?.valid ? sessions.get(task.owner_session).observationRow?.agentSlot ?? null : null,
+        ownerMatches: workers.length === 1 ? task.owner_session === workers[0].id : null, evidenceCount: count(task.evidence) ? task.evidence : null,
+        waived: task.waived === true, evidencePolicy: ['legacy', 'execution'].includes(task.evidence_policy) ? task.evidence_policy : 'unknown', strictVerified: task.strictVerified === true })))
+    }) },
     // Reset counters, never revive coverage lost before a Session was retained.
     beginStage() { report = emptyTaskDiagnostics(); report.truncated = limitedSessions; decodedBytes = 0; stageCursor++ },
     snapshot() { try { return unavailable ? null : projectTaskDiagnostics(report) } catch { return null } },
@@ -517,7 +820,8 @@ export async function runModelVerification(options = {}, { createHarness = creat
   const requests = new Set()
   let harness, stopped = false, capHit = false, runtimeStopped = false, workerId
   let stageRecord, stageStart, stageRequestStart = 0, stageUsageStart, stageBefore, stagePreviousRequests
-  let lastRequestElapsedMs = null, stageTaskDiagnosticsReady = false
+  let lastRequestElapsedMs = null, stageTaskDiagnosticsReady = false, stageObservationsReady = false
+  const readObservations = phase => stageObservationsReady ? modelObservations(harness, createHarness === createNativeHarness, phase) : null
   const readTaskDiagnostics = () => stageTaskDiagnosticsReady ? taskDiagnostics(harness, createHarness === createNativeHarness) : null
   const report = { ok: false, provenance: {
     packageVersion: JSON.parse(readFileSync(join(ROOT, 'package.json'), 'utf8')).version,
@@ -547,13 +851,29 @@ export async function runModelVerification(options = {}, { createHarness = creat
     requests.add(key)
     if (stageRecord) lastRequestElapsedMs = Math.max(0, Date.now() - stageStart)
   }
-  function recordObservation(after) {
+  function recordObservation(after, observationPhase = 'stage-end') {
     const total = accounting(after, requests, config)
     report.usage = total.usage
     report.runtimeDiagnostics = total.runtimeDiagnostics
     if (!stageRecord) return { total }
+    // Only an existing fresh stable boundary can prove absent correspondence.
+    // onRequest accounting and retained-session/late-stream joins cannot do so.
+    try {
+      const keys = [...requests]
+      const result = modelObservationHook(harness, 'observeModelAccounting', [{
+        stable: after.settled === true, mixed: observationPhase === null, truncated: total.runtimeDiagnostics.truncated,
+        missingCount: total.runtimeDiagnostics.counts['missing-message'],
+        otherFailures: total.runtimeDiagnostics.failureCodes.some(category => category !== 'missing-message'),
+        missing: total.runtimeDiagnostics.details.filter(row => row.category === 'missing-message').map(row => {
+          const record = after.streamAccounting?.records[row.requestIndex]
+          return { requestIndex: row.requestIndex, matchedEnded: record?.ended === true && record.complete === true && record.key === keys[row.requestIndex] }
+        }),
+      }])
+      if (discardTaskDiagnosticPromise(result) || result !== undefined && result !== null) stageObservationsReady = false
+    } catch { stageObservationsReady = false }
     stageRecord.progress = settlementProgress(harness, lastRequestElapsedMs)
     stageRecord.taskToolDiagnostics = readTaskDiagnostics()
+    if (observationPhase !== null) stageRecord.observations = readObservations(observationPhase)
     const workers = after.sessions.filter(s => s.id !== harness.rootId)
     const newWorkers = workers.filter(s => !stageBefore.sessions.some(old => old.id === s.id)).length
     const newTasks = after.tasks.filter(t => !stageBefore.tasks.some(old => old.id === t.id))
@@ -594,13 +914,18 @@ export async function runModelVerification(options = {}, { createHarness = creat
       stageUsageStart = beforeUsage
       lastRequestElapsedMs = null
       stageTaskDiagnosticsReady = beginTaskDiagnostics(harness)
-      stageRecord = { name: stage.name, ok: false, requests: 0, usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, newWorkers: 0, reuse: 0, rework: 0, facts: 0, accepted: 0, independentChecks: 0, strictVerified: false, progress: settlementProgress(harness, lastRequestElapsedMs), timeoutProgress: null, taskToolDiagnostics: readTaskDiagnostics(), timeoutTaskToolDiagnostics: null }
+      try {
+        const begun = modelObservationHook(harness, 'beginModelObservationStage', [report.stages.length])
+        stageObservationsReady = !discardTaskDiagnosticPromise(begun) && begun === undefined
+      } catch { stageObservationsReady = false }
+      stageRecord = { name: stage.name, ok: false, requests: 0, usage: Object.fromEntries(usageKeys.map(key => [key, 0])), durationMs: 0, newWorkers: 0, reuse: 0, rework: 0, facts: 0, accepted: 0, independentChecks: 0, strictVerified: false, progress: settlementProgress(harness, lastRequestElapsedMs), timeoutProgress: null, taskToolDiagnostics: readTaskDiagnostics(), timeoutTaskToolDiagnostics: null, observations: null, timeoutObservations: null, postDisposeObservations: null }
       report.stages.push(stageRecord)
       await deadline(() => harness.runStage(stage), config.stageTimeoutMs, () => {
         // Capture a fresh primitive copy before cancellation mutates native state.
         try {
           stageRecord.timeoutProgress = settlementProgress(harness, lastRequestElapsedMs)
           stageRecord.timeoutTaskToolDiagnostics = readTaskDiagnostics()
+          stageRecord.timeoutObservations = readObservations('before-cancel')
         }
         finally { stopped = true; harness.cancel() }
       })
@@ -638,11 +963,12 @@ export async function runModelVerification(options = {}, { createHarness = creat
     stopped = true
     let finalSnapshot
     if (harness) {
-      try { finalSnapshot = safeSnapshot(harness); recordObservation(finalSnapshot) } catch { /* retain last confirmed counters */ }
+      try { finalSnapshot = safeSnapshot(harness); recordObservation(finalSnapshot, 'final-before-dispose') } catch { /* retain last confirmed counters */ }
     }
     if (stageRecord) {
       stageRecord.progress = settlementProgress(harness, lastRequestElapsedMs)
       stageRecord.taskToolDiagnostics = readTaskDiagnostics()
+      stageRecord.observations = readObservations('final-before-dispose')
       stageRecord.requests = requests.size - stageRequestStart
       stageRecord.durationMs = Date.now() - stageStart
       stageRecord.usage = Object.fromEntries(usageKeys.map(key => [key, report.usage[key] - stageUsageStart[key]]))
@@ -663,11 +989,12 @@ export async function runModelVerification(options = {}, { createHarness = creat
     if (finalSnapshot && harness?.streamSnapshot) {
       const durationMs = stageRecord?.durationMs
       try {
-        const { total } = recordObservation({ ...finalSnapshot, streamAccounting: harness.streamSnapshot() })
+        const { total } = recordObservation({ ...finalSnapshot, streamAccounting: harness.streamSnapshot() }, null)
         if (report.ok && (runtimeStopped || !total.valid)) { report.ok = false; report.failure = 'usage-or-runtime-error' }
       } catch { report.ok = false; report.failure = 'invalid-observation' }
       if (stageRecord) stageRecord.durationMs = durationMs
     }
+    if (stageRecord) stageRecord.postDisposeObservations = readObservations('after-dispose')
     report.requests = requests.size
     report.durationMs = Date.now() - started
     mkdirSync(config.outputDir, { recursive: true })
@@ -880,12 +1207,15 @@ export function nativeCreationReader({ Session, SessionQueryEngine, host, sessio
 
 // The compatibility seam without a classifier keeps its original all-notice
 // contract. The actual native harness always supplies the authoritative reader.
-function nativeSettlementObligations({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode }, sessions) {
+function nativeSettlementObligations({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, observation }, sessions) {
   const notices = settlementCounts(sessions)
   let requiredNotices = 0, deliveredNotices = 0, missingNotices = 0, unknown = false
   for (const child of sessions.filter(session => session.id !== rootId)) {
     const activations = Math.max(0, (activationCounts.get(child.id) ?? 0) - (beforeCounts.get(child.id) ?? 0))
-    if (activations === 0) continue
+    if (activations === 0) {
+      observeModelSide(observation, 'observeObligations', tracked.get(child.id), { mode: 'unknown', activations: 0, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0 })
+      continue
+    }
     let mode = 'unknown'
     try { mode = classifyMode === undefined ? 'continuable' : classifyMode(tracked.get(child.id)) } catch { /* fail closed */ }
     if (mode !== 'one-shot' && mode !== 'continuable') unknown = true
@@ -896,6 +1226,7 @@ function nativeSettlementObligations({ tracked, rootId, activationCounts, before
     requiredNotices += needed
     deliveredNotices += delivered
     missingNotices += needed - delivered
+    observeModelSide(observation, 'observeObligations', tracked.get(child.id), { mode, activations, requiredNotices: needed, deliveredNotices: delivered, missingNotices: needed - delivered })
   }
   return { requiredNotices, deliveredNotices, missingNotices, ready: !unknown && missingNotices === 0 }
 }
@@ -908,19 +1239,22 @@ function nativeSettlementSnapshot(config, state) {
       pendingIdleWaits: state.pending.size, requiredNotices: 0, deliveredNotices: 0, missingNotices: 0 }
     for (const agent of agents) {
       const status = agent.status
+      observeModelSide(config.observation, 'observeStatus', agent, status)
       result[status === 'idle' ? 'idleAgents' : status === 'running' ? 'runningAgents' : 'unknownAgents']++
     }
     const { requiredNotices, deliveredNotices, missingNotices } = nativeSettlementObligations(config, sessions)
     Object.assign(result, { requiredNotices, deliveredNotices, missingNotices })
-    return projectSettlement(result)
-  } catch { return null }
+    const projected = projectSettlement(result)
+    if (projected === null) observeModelSide(config.observation, 'observationUnavailable')
+    return projected
+  } catch { observeModelSide(config.observation, 'observationUnavailable'); return null }
 }
 
 /** Wait through native asynchronous flush/dispose and the parent's resulting turn.
  * Continuable activations require their own notice at every depth and on cold
  * reuse. One-shot exemption never removes an Agent from the native idle tree. */
-export async function waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed, observe, classifyMode }) {
-  const config = { tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode }
+export async function waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, isDisposed, observe, classifyMode, observation }) {
+  const config = { tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, observation }
   const state = { phase: 'not-started', pending: new Set() }
   const read = () => nativeSettlementSnapshot(config, state)
   const publish = () => { try { discardDiagnosticPromise(observe?.(read)) } catch { /* observation cannot affect waiting */ } }
@@ -935,8 +1269,9 @@ export async function waitForNativeSettlement({ tracked, rootId, activationCount
       try {
         const token = {}
         cohort.add(token)
+        observeModelSide(observation, 'observeIdle', agent, 1)
         const finished = () => {
-          try { cohort.delete(token); if (state.pending === cohort) publish() } catch { /* side observation only */ }
+          try { cohort.delete(token); if (state.pending === cohort) { observeModelSide(observation, 'observeIdle', agent, 0); publish() } } catch { /* side observation only */ }
         }
         Promise.prototype.then.call(original, finished, finished)
         publish()
@@ -1009,15 +1344,16 @@ export function observeModelTasks(store, rootId, workspace) {
  * agent/request supplies coordinates and signal, never a request count. Only
  * consumption of its matching branded envelope can consume that admission.
  * Helpers (including the unchanged automatic compactor) fail closed. */
-export function createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure = () => {} }) {
+export function createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure = () => {}, observe }) {
   const pending = new Map(), records = [], failures = {}
   let stopped = false
-  const latch = category => {
+  const latch = (category, context = {}) => {
     failures[category] = (failures[category] ?? 0) + 1
+    observeModelSide({ observe }, 'observe', { kind: 'failure', category, ...context })
     stopped = true
     onFailure()
   }
-  const reject = category => { latch(category); fail('usage-or-runtime-error') }
+  const reject = (category, context) => { latch(category, context); fail('usage-or-runtime-error') }
   return {
     observeRequest(payload) {
       pending.set(payload.agent.id, { agent: payload.agent, turn: payload.turn, step: payload.step, signal: payload.signal })
@@ -1027,34 +1363,43 @@ export function createModelStreamBoundary({ tracked, provider, model, isAgentLoo
       // requests cannot silently reattribute a delayed/unused lazy iterator.
       const admission = pending.get(options.sessionId)
       return (async function* () {
+        const context = { agent: admission?.agent, turn: admission?.turn ?? null, step: admission?.step ?? null, requestIndex: null }
+        const note = data => observeModelSide({ observe }, 'observe', { ...context, ...data })
+        const refuse = category => reject(category, context)
         if (stopped) fail('usage-or-runtime-error')
-        if (!isAgentLoopRequest(options)) reject('auxiliary-call')
+        if (!isAgentLoopRequest(options)) refuse('auxiliary-call')
         if (!Object.isFrozen(options) || !admission || pending.get(options.sessionId) !== admission
           || tracked.get(options.sessionId) !== admission.agent || options.signal !== admission.signal
-          || !count(admission.turn) || !count(admission.step)) reject('stream-attribution')
-        if (options.provider !== provider || options.model !== model) reject('route-mismatch')
-        if (options.maxTokens !== MODEL_MAX_OUTPUT_TOKENS) reject('capacity-mismatch')
-        if (options.signal?.aborted) reject('stream-error')
+          || !count(admission.turn) || !count(admission.step)) refuse('stream-attribution')
+        if (options.provider !== provider || options.model !== model) refuse('route-mismatch')
+        if (options.maxTokens !== MODEL_MAX_OUTPUT_TOKENS) refuse('capacity-mismatch')
+        if (options.signal?.aborted) refuse('stream-error')
         pending.delete(options.sessionId)
         try { onRequest({ agentId: admission.agent.id, turn: admission.turn, step: admission.step }) }
-        catch (error) { latch('stream-admission-error'); throw error }
+        catch (error) { latch('stream-admission-error', context); throw error }
         const record = { key: `${admission.agent.id}:${admission.turn}:${admission.step}`, complete: false, ended: false, usage: null }
+        context.requestIndex = records.length
         records.push(record)
+        note({ kind: 'admitted' })
         let exhausted = false, terminal = false, failed = false
-        const bad = category => { failed = true; reject(category) }
+        const bad = category => { failed = true; refuse(category) }
         try {
           for await (const chunk of next()) {
+            note({ kind: 'chunk' })
             if (terminal) bad('stream-error')
             if (chunk.type === 'usage') {
               const value = chunk.usage
               if (!value || !count(value.inputTokens) || !count(value.outputTokens)
                 || usageKeys.some(field => value[field] !== undefined && !count(value[field]))) bad('invalid-usage')
               // SDK BlockAssembler uses the latest cumulative usage frame.
+              note({ kind: 'usage' })
               record.usage = Object.fromEntries(usageKeys.filter(field => value[field] !== undefined).map(field => [field, value[field]]))
             }
             if (chunk.type === 'finish') {
               terminal = true
-              if (!['stop', 'tool-calls'].includes(chunk.reason?.kind)) bad('stream-error')
+              const finishKind = chunk.reason?.kind
+              note({ kind: 'finish', finishKind: ['stop', 'tool-calls'].includes(finishKind) ? finishKind : 'unknown' })
+              if (!['stop', 'tool-calls'].includes(finishKind)) bad('stream-error')
             }
             yield chunk
           }
@@ -1063,13 +1408,14 @@ export function createModelStreamBoundary({ tracked, provider, model, isAgentLoo
           if (!record.usage) bad('missing-usage')
           record.complete = true
         } catch (error) {
-          if (!failed) { failed = true; latch('stream-error') }
+          if (!failed) { failed = true; latch('stream-error', context) }
           throw error
         } finally {
           // An early return/abort is not a complete consumed response, even if
           // a caller catches it or already saw a usage or terminal frame.
           record.ended = true
-          if (!exhausted && !failed) latch('stream-error')
+          if (!exhausted && !failed) latch('stream-error', context)
+          note({ kind: 'ended', complete: record.complete })
         }
       })()
     },
@@ -1084,12 +1430,13 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
   const fixture = await controlledProfile(anchor, packageRoot)
   const emergency = () => fixture.emergencyDispose()
   process.once('exit', emergency)
-  let app, handle, lifecycle
+  let app, handle, lifecycle, taskCollector
   const tracked = new Map()
   const activationCounts = new Map()
   const settlements = new Set()
   let disposed = false
   const cancel = () => {
+    observeModelSide(taskCollector, 'noteCancel')
     lifecycle?.cancel()
     for (const agent of tracked.values()) { try { agent.cancel({ kind: 'user' }) } catch { /* continue cancellation of other descendants */ } }
   }
@@ -1108,6 +1455,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     const exit = process.exitCode
     const failures = []
     cancel()
+    observeModelSide(taskCollector, 'noteDisposing')
     try {
       try {
         await deadline(() => fixture.teardown(async () => {
@@ -1137,7 +1485,8 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     writeFileSync(fixture.overlay, readFileSync(fixture.overlay, 'utf8') + `\n- id: session-title-llm\n  disabled: true\n- id: llm-retry\n  disabled: true\n- id: llm-deepseek\n  config:\n    maxTokens: ${MODEL_MAX_OUTPUT_TOKENS}\n    streamIdleTimeoutMs: 30000\n`)
     app = await fixture.runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web', patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     const { createUserMessage, isAgentLoopRequest } = await nativeModule(anchor, '@deepseek-ai/dsh-llm')
-    const boundary = createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure })
+    const boundary = createModelStreamBoundary({ tracked, provider, model, isAgentLoopRequest, onRequest, onFailure,
+      observe: data => observeModelSide(taskCollector, 'observeStream', data) })
     app.ctx.on('llm/stream', (options, next) => boundary.intercept(options, next), { global: true, prepend: true })
     const rootId = `taskforce-model-${randomUUID()}`
     const { Session } = await nativeModule(anchor, '@deepseek-ai/dsh-session')
@@ -1153,7 +1502,6 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     app.ctx.on('internal/status', fiber => {
       if (fiber === applicationFiber && fiber.state === 5) lifecycle.cancel()
     }, { global: true, prepend: true })
-    let taskCollector
     try {
       taskCollector = createTaskToolDiagnosticsCollector({ rootId, agents: app.ctx.get('agents') })
       app.ctx.on('session/created', taskCollector.created, { global: true, prepend: true })
@@ -1181,7 +1529,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     // live object; its durable session history contains prior usage and notices.
     const sessions = () => nativeSessions(tracked)
     let settled = true
-    let settlementSnapshot = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, classifyMode, beforeCounts: new Map(activationCounts), beforeNotices: settlementCounts(sessions()) }, { phase: 'not-started', pending: new Set() })
+    let settlementSnapshot = () => nativeSettlementSnapshot({ tracked, rootId, activationCounts, classifyMode, beforeCounts: new Map(activationCounts), beforeNotices: settlementCounts(sessions()), observation: taskCollector }, { phase: 'not-started', pending: new Set() })
     async function runStage(stage) {
       settled = false
       const beforeNotices = settlementCounts(sessions())
@@ -1190,7 +1538,7 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
       let work
       try {
         handle.agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: stage.prompt }] }))
-        const original = waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
+        const original = waitForNativeSettlement({ tracked, rootId, activationCounts, beforeCounts, beforeNotices, classifyMode, observation: taskCollector, isDisposed: () => disposed, observe: read => { settlementSnapshot = read } })
         work = { early: false, error: null }
         work.completion = original.then(() => {}, error => { work.error = error })
         settlements.add(work)
@@ -1208,9 +1556,13 @@ export async function createNativeHarness({ installAnchor, packageRoot, workspac
     function snapshot() {
       const store = app.ctx.get('taskforceStore')
       const tasks = observeModelTasks(store, rootId, workspace)
+      observeModelSide(taskCollector, 'observeTasks', tasks)
       return { sessions: sessions(), tasks, settled, streamAccounting: boundary.snapshot() }
     }
     return { hostVersion: installationVersion(anchor), rootId, runStage, snapshot, settlementSnapshot: () => settlementSnapshot(), streamSnapshot: boundary.snapshot,
+      beginModelObservationStage: index => taskCollector?.beginObservations(index),
+      modelObservationSnapshot: (phase = 'stage-end') => taskCollector?.observationSnapshot(phase) ?? null,
+      observeModelAccounting: value => taskCollector?.observeAccounting(value),
       beginTaskToolDiagnosticsStage: () => taskCollector?.beginStage(), taskToolDiagnosticsSnapshot: () => taskCollector?.snapshot() ?? null, cancel, dispose }
   } catch (error) {
     try { await dispose() } catch (cleanupError) { throw new AggregateError([error, cleanupError], 'native setup and cleanup failed') }

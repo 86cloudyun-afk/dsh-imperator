@@ -2,11 +2,11 @@ import assert from 'node:assert/strict'
 import { mkdtemp, access, rm } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { test } from 'node:test'
 import { TASKFORCE_DEFINITION } from '../../lib/preset.js'
-import { installationVersion } from '../host-runtime.mjs'
+import { controlledProfile, installationVersion } from '../host-runtime.mjs'
 import { apply as applyScope, DENY_CODE } from '../../lib/plugins/orchestrator-scope.mjs'
 
 // Integration supplies an explicit installation; offline checks never claim a
@@ -14,6 +14,188 @@ import { apply as applyScope, DENY_CODE } from '../../lib/plugins/orchestrator-s
 const anchor = process.env.DSH_INSTALL_ANCHOR
 const native = async (name) => import(pathToFileURL(createRequire(anchor).resolve(name)).href)
 const options = { skip: !anchor && 'requires DSH_INSTALL_ANCHOR' }
+
+test('twelve actual profile boots restore exact native listener baselines without requests or streams', options, async t => {
+  const events = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+  const snapshot = () => events.map(event => process.rawListeners(event))
+  const sentinel = () => {}, later = () => {}
+  for (const event of events) { process.once(event, sentinel); process.on(event, sentinel); process.on(event, sentinel) }
+  const baseline = snapshot(), observations = []
+  let requests = 0, streams = 0
+  try {
+    for (let boot = 0; boot < 12; boot++) {
+      const fixture = await controlledProfile(anchor, new URL('../..', import.meta.url).pathname)
+      const previousExitCode = process.exitCode
+      const emergency = () => fixture.emergencyDispose ? fixture.emergencyDispose() : fixture.dispose()
+      process.once('exit', emergency)
+      let app
+      try {
+        // The legacy fallback makes the RED reproduce the actual native leak,
+        // rather than fail merely because the new fixture method is absent.
+        const run = fixture.runProfile ?? (await import(new URL('./lib/profile-boot.js', pathToFileURL(anchor)))).runProfile
+        app = await run({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+          patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
+        app.ctx.on('agent/request', () => { requests++; throw new Error('lifecycle request forbidden') })
+        app.ctx.on('llm/stream', () => { streams++; throw new Error('lifecycle stream forbidden') }, { global: true, prepend: true })
+        for (const event of events) process.on(event, later)
+      } finally {
+        const cleanupDeadline = setTimeout(() => { console.error('FIXTURE_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+        try { if (fixture.shutdown) await fixture.shutdown(1); else await app?.shutdown.shutdown(1) }
+        finally {
+          try { fixture.dispose() }
+          finally { clearTimeout(cleanupDeadline); process.off('exit', emergency); process.exitCode = previousExitCode }
+        }
+      }
+      const after = snapshot()
+      observations.push({ boot: boot + 1, counts: after.map(row => row.length),
+        exact: after.every((row, index) => row.length === baseline[index].length + 1 && row.every((fn, i) => fn === [...baseline[index], later][i])) })
+      for (const event of events) process.off(event, later)
+      await assert.rejects(access(fixture.root), { code: 'ENOENT' })
+    }
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), observations, requests, streams }))
+    assert.equal(requests, 0); assert.equal(streams, 0)
+    assert.ok(observations.every(row => row.exact), 'actual native teardown retained boot callbacks')
+    assert.deepEqual(snapshot(), baseline)
+  } finally {
+    for (const event of events) { process.off(event, sentinel); process.off(event, sentinel); process.off(event, sentinel); process.off(event, later) }
+  }
+})
+
+// Native Session + pure fork preparation with explicitly authorized hook scope.
+// No agent loop, model/provider request or actual delegation runs in this fixture.
+async function forkObservationFixture() {
+  const [{ Session }, { createToolResultMessage }, forkProvider, guard, context] = await Promise.all([
+    native('@deepseek-ai/dsh-session'), native('@deepseek-ai/dsh-llm'), native('@deepseek-ai/dsh-subagent-fork-in-process'),
+    import('../../lib/plugins/guard.mjs'), import('../../lib/plugins/working-context.mjs'),
+  ])
+  let provider
+  forkProvider.apply({ subagents: { registerProvider: value => { provider = value } } }, { providerName: 'fork' })
+  const childHeader = (id, parent, isSeeded) => ({ version: 4, id, createdAt: 0, isSeeded,
+    origin: 'subagent', parentSession: parent.id, delegationDepth: 1 })
+  const fork = async (parent, id) => {
+    const { seed } = await provider.prepareContinuable({ parent: { session: parent } })
+    return Session.create(id, seed, childHeader(id, parent, seed !== undefined), seed?.length ?? 0)
+  }
+  const hook = (apply, session, config) => {
+    const hooks = new Map()
+    apply({ preset: 'taskforce', on: (name, fn) => hooks.set(name, fn),
+      get: name => name === 'agentPresets' ? { composedPreset: scope => scope?.preset } : undefined,
+    }, config)
+    const agent = { session, ctx: { preset: 'taskforce' } }
+    return { agent, pre: () => hooks.get('agent/pre-step')({ agent, turn: 1, step: 1 },
+      async () => ({ kind: 'enter', messages: [] })) }
+  }
+  const calls = (session, prefix, count, { failure = false, unknown = false, offset = 0 } = {}) => {
+    for (let index = 1; index <= count; index++) {
+      const step = offset + index, callId = `${prefix}-${step}`
+      session.append('step/start', { turn: 1, step })
+      const call = session.append('tool/call', { turn: 1, step, callId,
+        name: failure ? 'read_counter' : 'subagent', arguments: '{}' })
+      session.append('tool/result', { turn: 1, step,
+        message: createToolResultMessage({ callId, isError: failure, content: [{ type: 'text', text: 'fixture receipt' }] }),
+        ...(unknown ? { error: { name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' } } : {}),
+      }, { surfaceOp: 'append', sourceEventSeqs: [call.seq] })
+      session.append('step/end', { turn: 1, step })
+    }
+  }
+  const restore = session => Session.fromRestore(session.id, guard.sessionEvents(session), session.header,
+    session.inheritedEventCount, 'shared-frozen')
+  return { Session, guard, context, fork, hook, calls, restore, childHeader,
+    guardOptions: { stallAction: 'observe', stepDownRequests: 0 } }
+}
+
+test('native fork owned observation: completed prefix, dispatch append and restore', options, async () => {
+  const { Session, guard, context, fork, hook, calls, restore, childHeader } = await forkObservationFixture()
+  const text = value => value.messages.map(message => message.content[0].text).join('\n')
+  const parent = Session.create('owned-flow-parent')
+  const fresh = Session.create('owned-flow-fresh', undefined, childHeader('owned-flow-fresh', parent, false), 0)
+  for (const session of [parent, fresh]) {
+    assert.equal(session.inheritedEventCount, 0)
+    assert.deepEqual((await hook(context.apply, session).pre()).messages, [])
+  }
+  parent.append('turn/start', { turn: 1 })
+  assert.equal((await fork(parent, 'owned-no-prefix')).inheritedEventCount, 0)
+  calls(parent, 'parent', 2)
+  parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const completed = parent.seq
+  parent.append('turn/start', { turn: 2 })
+  parent.append('tool/call', { turn: 2, step: 1, callId: 'current-fork', name: 'subagent_fork', arguments: '{}' })
+  const child = await fork(parent, 'owned-flow-child')
+  assert.equal(child.inheritedEventCount, completed)
+  assert.equal(guard.sessionEvents(child)[completed].type, 'session/end-seed')
+  assert.equal(guard.sessionEvents(child).some(event => event.data?.callId === 'current-fork'), false)
+  const h = hook(context.apply, child)
+  assert.deepEqual((await h.pre()).messages, [], 'parent dispatches must not count as child activity')
+  child.append('turn/start', { turn: 1 })
+  calls(child, 'child', 1)
+  assert.match(text(await h.pre()), /未结算派发估计 1/)
+  const restored = restore(child)
+  assert.equal(restored.inheritedEventCount, completed)
+  assert.ok(restored.firstLiveSeq > restored.inheritedEventCount)
+  assert.match(text(await hook(context.apply, restored).pre()), /未结算派发估计 1/)
+})
+
+test('native fork owned observation: ECHO, own acknowledgment and unknown-effect barrier', options, async () => {
+  const { Session, guard, fork, hook, calls, restore, guardOptions } = await forkObservationFixture()
+  const parent = Session.create('owned-guard-parent')
+  parent.append('turn/start', { turn: 1 })
+  calls(parent, 'parent-failure', 6, { failure: true })
+  parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  assert.equal((await hook(guard.apply, restore(parent), guardOptions).pre()).messages[0]?.source.signal, 'echo',
+    'restored root retains its own failures')
+  const child = await fork(parent, 'owned-guard-child')
+  child.append('turn/start', { turn: 1 })
+  const h = hook(guard.apply, child, guardOptions)
+  assert.deepEqual((await h.pre()).messages, [], 'child with zero own calls has no inherited ECHO')
+  calls(child, 'own-failure', 6, { failure: true })
+  const warning = (await h.pre()).messages[0]
+  assert.equal(warning?.source.signal, 'echo')
+  assert.equal((await hook(guard.apply, restore(child), guardOptions).pre()).messages[0]?.source.signal, 'echo')
+  child.append('user/message', warning, { surfaceOp: 'append' })
+  assert.deepEqual((await hook(guard.apply, restore(child), guardOptions).pre()).messages, [], 'own persisted ACK survives restore')
+  const unknown = await fork(parent, 'owned-guard-unknown')
+  unknown.append('turn/start', { turn: 1 })
+  calls(unknown, 'before', 6, { failure: true })
+  calls(unknown, 'unknown', 1, { failure: true, unknown: true, offset: 6 })
+  calls(unknown, 'after', 4, { failure: true, offset: 7 })
+  assert.deepEqual((await hook(guard.apply, unknown, guardOptions).pre()).messages, [])
+})
+
+test('native fork owned observation: real SQLite excludes parent lifecycle and deduplicates restored child', options, async t => {
+  const [{ TaskforceStore }, { attachRecoveryLifecycle }, f] = await Promise.all([
+    import('../../lib/store/index.js'), import('../../lib/plugins/lifecycle.mjs'), forkObservationFixture(),
+  ])
+  const directory = await mkdtemp(join(tmpdir(), 'taskforce-native-owned-'))
+  const store = new TaskforceStore(directory)
+  t.after(async () => { store.close(); await rm(directory, { recursive: true, force: true }); await assert.rejects(access(directory), { code: 'ENOENT' }) })
+  const lifecycle = session => f.hook(ctx => attachRecoveryLifecycle(ctx, {
+    identity: () => ({ runId: 'owned-life-root' }), recovery: () => store.recovery,
+  }), session)
+  const rows = session => store.open().prepare("SELECT event_seq FROM lifecycle_event WHERE session_id=? AND source='session_event' ORDER BY id").all(session.id).map(row => row.event_seq)
+  const parent = f.Session.create('owned-life-root')
+  const fresh = f.Session.create('owned-life-fresh', undefined, f.childHeader('owned-life-fresh', parent, false), 0)
+  await lifecycle(parent).pre(); await lifecycle(fresh).pre()
+  assert.deepEqual(rows(parent), []); assert.deepEqual(rows(fresh), [])
+  parent.append('turn/start', { turn: 1 })
+  parent.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  const child = await f.fork(parent, 'owned-life-child')
+  const start = child.append('turn/start', { turn: 1 })
+  const h = lifecycle(child)
+  await h.pre()
+  assert.deepEqual(rows(child), [start.seq], 'parent seq 0 and 1 must never be attributed to child')
+  const end = child.append('turn/end', { turn: 1, reason: { kind: 'completed' } })
+  await h.pre(); await h.pre()
+  const restored = f.restore(child)
+  await lifecycle(restored).pre()
+  assert.equal(restored.inheritedEventCount, 2)
+  assert.ok(restored.firstLiveSeq > end.seq)
+  assert.deepEqual(rows(child), [start.seq, end.seq])
+  await lifecycle(f.restore(parent)).pre()
+  assert.deepEqual(rows(parent), [0, 1])
+  assert.deepEqual([...store.recovery.observationGaps], [])
+  t.diagnostic(JSON.stringify({ host: installationVersion(anchor), inheritedCut: 2, childSeqs: rows(child),
+    firstLiveSeq: restored.firstLiveSeq, modelRequests: 0, fixtureScope: 'native Session and SQLite; explicit preset registry' }))
+})
 
 test('actual native immutable Session appends match full folds; mutable restored seeds replay', options, async () => {
   const [{ Session }, { createToolResultMessage }, projections, guard, flow] = await Promise.all([
@@ -295,6 +477,98 @@ test('native task_verify awaits real bash, correlates its parent and retains nat
   store.submitTask({ task_id: id }, 'receipt-root', 'receipt-worker', 'receipt-worker')
   assert.throws(() => store.acceptTask({ task_id: id }, 'receipt-root', 'lead', 'receipt-root'), { code: 'E_VERIFICATION_RECEIPT' })
 })
+
+for (const scenario of ['foreground', 'promoted']) {
+  test(`native task_verify default job policy: ${scenario} observation and owner cleanup`, options, async t => {
+    const { ctx, agent } = await fixture(t)
+    const [{ LocalSubprocessRuntime }, { LocalBashExecutor }, { ShellEnvRegistry }, { LocalJobRegistry },
+      bash, { apply: applyTools }, { tempStore }, { writeFile, readFile }] = await Promise.all([
+      native('@deepseek-ai/dsh-subprocess-local'), native('@deepseek-ai/dsh-bash-local'),
+      native('@deepseek-ai/dsh-shell-env'), native('@deepseek-ai/dsh-jobs-local'), native('@deepseek-ai/dsh-tool-bash'),
+      import('../../lib/tools/index.js'), import('./helpers.mjs'), import('node:fs/promises'),
+    ])
+    const cwd = await mkdtemp(join(tmpdir(), 'taskforce-native-job-'))
+    t.after(() => rm(cwd, { recursive: true, force: true }))
+    await writeFile(join(cwd, 'source.js'), 'source\n')
+    const store = tempStore(t), run = `job-${scenario}-root`, owner = `job-${scenario}-worker`
+    const main = agent(run, undefined, { cwd })
+    const worker = agent(owner, undefined, { cwd, origin: 'subagent', delegationDepth: 1, parentSession: run })
+    // Native Bash binds job ownership to Agent.id; these scoped fixtures do not run an agent loop.
+    main.id = run; worker.id = owner
+    const byId = new Map([[run, main], [owner, worker]])
+    ctx.provide('taskforceStore', store)
+    ctx.provide('agents', { get: id => byId.get(id) })
+    new LocalSubprocessRuntime(ctx)
+    new ShellEnvRegistry(ctx)
+    new LocalBashExecutor(ctx, LocalBashExecutor.Config({ cwd, maxTimeoutMs: 120000 }))
+    await mountNativeWorkingDirectory(ctx, cwd)
+    new LocalJobRegistry(ctx, LocalJobRegistry.Config({ pumpPollMs: 5 }))
+    ctx.jobs.attachController('verification-boundary')
+    await ctx.plugin(bash)
+    applyTools(ctx)
+    const command = scenario === 'promoted'
+      ? "printf 'partial proof\\n'; sleep 1; printf 'finished\\n'" : "printf 'foreground proof\\n'"
+    const timeout_ms = scenario === 'promoted' ? 50 : 1000
+    const id = store.openTask({ title: scenario, evidence_policy: 'execution',
+      verification_files: ['source.js'], verification_command: command }, run, { sessionId: run, cwd, isRoot: true }).task_id
+    store.claimTask({ task_id: id, child_id: 'worker' }, run, owner, owner)
+    let observedBash, bashCalls = 0
+    ctx.tools.guard(exec => {
+      if (exec.name !== 'bash') return
+      bashCalls++
+      assert.equal(exec.agent, worker)
+      assert.equal(exec.arguments.run_in_background, false)
+    })
+    ctx.on('tools/result', (exec, result) => {
+      if (exec.name === 'bash') observedBash = structuredClone(result)
+    })
+    try {
+      const outer = await worker.ctx.tools.execute({ agent: worker, callId: `native-job-${scenario}`, name: 'task_verify',
+        arguments: { task_id: id, command, timeout_ms }, signal: new AbortController().signal })
+      assert.equal(outer.isError, false, outer.error?.message)
+      const result = JSON.parse(outer.value), row = store.board(id, run).receipts[0]
+      assert.equal(bashCalls, 1)
+      assert.equal(observedBash.isError, false)
+      assert.equal(observedBash.value.kind, scenario)
+      t.diagnostic(JSON.stringify({ host: installationVersion(anchor), scenario, native: observedBash,
+        result, modelRequests: 0 }))
+      store.submitTask({ task_id: id }, run, owner, owner)
+      if (scenario === 'foreground') {
+        assert.equal(result.verified, true)
+        assert.equal(Object.hasOwn(result, 'native_job'), false)
+        assert.equal(Object.hasOwn(result, 'next'), false)
+        assert.equal(await readFile(row.logs.stdout.path, 'utf8'), 'foreground proof\n')
+        assert.equal(store.acceptTask({ task_id: id }, run, 'lead', run).execution_verified, true)
+        assert.deepEqual(ctx.jobs.list(owner), [])
+      } else {
+        assert.equal(result.status, 'unknown'); assert.equal(result.verified, false)
+        assert.equal(result.output_complete, false)
+        assert.throws(() => store.acceptTask({ task_id: id }, run, 'lead', run), { code: 'E_VERIFICATION_RECEIPT' })
+        assert.equal(row.owner_session, owner); assert.equal(row.kind, 'promoted')
+        assert.equal(row.actual_timeout_ms, null)
+        assert.equal(await readFile(row.logs.stdout.path, 'utf8'), '')
+        assert.equal(await readFile(row.logs.stderr.path, 'utf8'), '')
+        assert.equal(Object.hasOwn(row, 'native_job'), false)
+        assert.match(observedBash.value.jobId, /^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$/)
+        assert.equal(observedBash.value.timeoutMs, timeout_ms)
+        assert.equal(ctx.jobs.get(observedBash.value.jobId, owner).id, observedBash.value.jobId)
+        assert.throws(() => ctx.jobs.get(observedBash.value.jobId, run), /belongs to another session/)
+        assert.deepEqual(result.native_job, { kind: 'promoted', job_id: observedBash.value.jobId,
+          timeout_ms, scope: 'current-owner-process', durable: false }, 'native promotion locator must reach the invoking owner')
+        assert.match(result.next, /发起本次验证的原生会话.*当前进程.*job_output\/job_kill.*确认 job 已结束后.*重新验证/)
+      }
+    } finally {
+      // Keep cleanup independent of the response assertion, including during RED.
+      for (const job of ctx.jobs.list(owner)) {
+        ctx.jobs.kill(job.id, owner, 'bounded native verifier test cleanup')
+        const settled = await ctx.jobs.wait(job.id, 2000, owner)
+        assert.notEqual(settled.status, 'running'); assert.notEqual(settled.status, 'stopping')
+        t.diagnostic(JSON.stringify({ host: installationVersion(anchor), cleanup: { job_id: job.id, status: settled.status } }))
+      }
+      assert.equal(ctx.jobs.list(owner).some(job => ['running', 'stopping'].includes(job.status)), false)
+    }
+  })
+}
 
 for (const operation of ['task_submit', 'task_close', 'task_claim']) {
   test(`native legal child session ID lead cannot ${operation} a sibling task`, options, async t => {
@@ -764,11 +1038,16 @@ for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'c
     const { createUserMessage, isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
     const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-stream-loop-'))
     t.after(() => rm(workspace, { recursive: true, force: true }))
-    let dispatches = 0, admitted = 0, latched = 0
-    const seen = []
+    let dispatches = 0, admitted = 0, latched = 0, heldStreams = 0
+    const seen = [], admissions = []
+    const releaseStreams = nativeGate()
+    let exercise
     const harness = await createNativeHarness({ installAnchor: anchor,
       packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
-      onRequest() { if (scenario === 'cap' && admitted === 1) throw new Error('request-cap'); admitted++ },
+      onRequest(coordinates) {
+        if (scenario === 'cap' && admitted === 1) throw new Error('request-cap')
+        admitted++; admissions.push(coordinates)
+      },
       onFailure() { latched++ },
     }, { inspectNative: async ({ ctx, root }) => {
       ctx.on('llm/stream', request => (async function* () {
@@ -778,6 +1057,10 @@ for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'c
         seen.push({ maxTokens: request.maxTokens, effort: request.reasoningEffort })
         yield { type: 'block-end', index: 0, block: { type: 'text', text: '137' } }
         if (scenario !== 'missing-usage') yield { type: 'usage', usage: { inputTokens: scenario === 'invalid-usage' ? -1 : 2, outputTokens: 3 } }
+        if (scenario === 'success') {
+          heldStreams++
+          await signalGate(request.signal, releaseStreams.promise)
+        }
         yield { type: 'finish', reason: { kind: scenario === 'error' ? 'error' : 'stop' } }
       })(), { global: true })
       const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
@@ -791,19 +1074,55 @@ for (const scenario of ['success', 'missing-usage', 'invalid-usage', 'error', 'c
         agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Reply 137.' }] }))
         await agent.whenIdle()
       }
-      try {
-        if (scenario === 'success') await Promise.all([turn(root), turn(child.agent)])
-        else { await turn(root); await turn(child.agent) }
-        assert.equal(dispatches, scenario === 'success' ? 2 : 1)
-        assert.equal(admitted, dispatches)
-        assert.equal(latched > 0, scenario !== 'success')
-        if (scenario === 'success') {
-          assert.equal(seen[0].effort, seen[1].effort)
-          for (const agent of [root, child.agent]) assert.equal(agent.session.snapshotEvents().findLast(e => e.type === 'turn/end').data.reason.kind, 'completed')
+      exercise = async () => {
+        let pending
+        try {
+          if (scenario === 'success') {
+            pending = Promise.all([turn(root), turn(child.agent)])
+            pending.catch(() => {})
+            await nativeCondition(() => heldStreams === 2)
+            const observation = harness.modelObservationSnapshot?.('stage-end') ?? null
+            assert.ok(observation, 'two real consumed streams need distinct primitive owners while both are active')
+            const rootRow = observation.agents.find(row => row.role === 'root')
+            const childRow = observation.agents.find(row => row.role === 'worker' && row.parentSlot === rootRow?.agentSlot)
+            assert.ok(rootRow); assert.ok(childRow)
+            assert.notEqual(rootRow.agentSlot, childRow.agentSlot)
+            assert.equal(observation.requests.length, 2)
+            assert.equal(new Set(observation.requests.map(row => row.requestIndex)).size, 2)
+            for (const [agent, owner] of [[root, rootRow], [child.agent, childRow]]) {
+              const coordinate = admissions.find(row => row.agentId === agent.id)
+              const request = observation.requests.find(row => row.agentSlot === owner.agentSlot)
+              assert.ok(coordinate); assert.ok(request)
+              assert.equal(request.lifetime, owner.lifetime)
+              assert.equal(request.turn, coordinate.turn); assert.equal(request.step, coordinate.step)
+              assert.equal(request.usageSeen, true); assert.equal(request.finishSeen, false)
+              assert.equal(request.ended, false); assert.equal(request.complete, false)
+              assert.equal(request.cancelAlreadyRequested, false)
+              assert.equal(JSON.stringify(observation).includes(agent.id), false, 'raw Session IDs stay private')
+            }
+            releaseStreams.resolve()
+            await pending
+          } else { await turn(root); await turn(child.agent) }
+          assert.equal(dispatches, scenario === 'success' ? 2 : 1)
+          assert.equal(admitted, dispatches)
+          assert.equal(latched > 0, scenario !== 'success')
+          if (scenario === 'success') {
+            assert.equal(seen[0].effort, seen[1].effort)
+            for (const agent of [root, child.agent]) assert.equal(agent.session.snapshotEvents().findLast(e => e.type === 'turn/end').data.reason.kind, 'completed')
+            const observation = harness.modelObservationSnapshot('stage-end')
+            assert.ok(observation.requests.every(row => row.complete && row.ended && row.assistantMessageSeen))
+            assert.ok(observation.requests.every(row => Number.isSafeInteger(row.assistantSeq)))
+          }
+        } finally {
+          releaseStreams.resolve()
+          if (pending) await pending.catch(() => {})
+          await child.dispose()
         }
-      } finally { await child.dispose() }
+      }
     } })
     try {
+      harness.beginModelObservationStage?.(0)
+      await exercise()
       const snapshot = harness.snapshot()
       assert.equal(snapshot.streamAccounting.records.length, admitted)
       if (scenario === 'success') {
@@ -1081,4 +1400,868 @@ for (const action of ['send', 'stop']) {
       }
     })
   }
+}
+
+const nativeGate = () => Promise.withResolvers()
+async function nativeCondition(predicate) {
+  const end = Date.now() + 5000
+  while (!predicate()) {
+    assert.ok(Date.now() < end, 'native lifecycle condition did not arrive')
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+}
+function signalGate(signal, gate) {
+  return new Promise((resolve, reject) => {
+    const aborted = () => { signal.removeEventListener('abort', aborted); reject(signal.reason) }
+    if (signal.aborted) return aborted()
+    signal.addEventListener('abort', aborted, { once: true })
+    gate.then(value => { signal.removeEventListener('abort', aborted); resolve(value) }, error => { signal.removeEventListener('abort', aborted); reject(error) })
+  })
+}
+
+test('native settlement diagnostics follow mounted continuable child, live send, real notice and cold reuse after stage baselines', options, async t => {
+  const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+  const { isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-settlement-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  let root, ctx, agents, fixtureRoot, childId, stage = 0, rootRequests = 0, localRequests = 0, completed = false
+  const children = [], disposed = [], observations = [], releases = [], admissions = [], childOwners = []
+  const coldMessage = 'Return 137 again.', coldRequestKey = 'local-cold-observation-key'
+  const assertAggregate = (observation, settlement) => {
+    if (observation.coverage !== 'complete') { assert.equal(observation.coverage, 'partial'); return }
+    assert.equal(observation.agents.length, settlement.trackedAgents)
+    for (const key of ['requiredNotices', 'deliveredNotices', 'missingNotices', 'pendingIdleWaits']) {
+      assert.equal(observation.agents.reduce((sum, row) => sum + row[key], 0), settlement[key])
+    }
+  }
+  let childGate, flushGate, parentGate, childEntered, flushEntered, parentEntered, childEnded = false, backgroundArgument
+  const arrived = async (promise, boundary) => {
+    let timer
+    try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(JSON.stringify({ boundary, stage, rootRequests, localRequests, children: children.length, progress: harness.settlementSnapshot(), events: root.session.snapshotEvents().filter(e => ['step/error', 'tool/result'].includes(e.type)).map(e => ({ type: e.type, code: e.data.error?.code, error: e.data.error?.message })) }))), 5000) })]) }
+    finally { clearTimeout(timer) }
+  }
+  const reset = () => {
+    rootRequests = 0; completed = false; childEnded = false
+    childGate = nativeGate(); flushGate = nativeGate(); parentGate = nativeGate()
+    childEntered = nativeGate(); flushEntered = nativeGate(); parentEntered = nativeGate()
+    releases.push(childGate, flushGate, parentGate)
+  }
+  const notices = () => root.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data?.source?.kind === 'subagent-settled' && e.data.source.senderSessionId === childId).length
+  const harness = await createNativeHarness({ installAnchor: anchor,
+    packageRoot: new URL('../..', import.meta.url).pathname, workspace, provider: 'deepseek-official', model: 'deepseek-flash',
+    onRequest(coordinates) { admissions.push({ stage, agent: agents.get(coordinates.agentId), ...coordinates }) },
+  }, { inspectNative: nativeState => {
+    root = nativeState.root; ctx = nativeState.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+    const schema = root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent')
+    const supportsBackground = Object.hasOwn(schema.parameters.properties, 'run_in_background')
+    assert.equal(supportsBackground, installationVersion(anchor) === '0.2.0-rc.2')
+    backgroundArgument = supportsBackground ? { run_in_background: true } : {}
+    // Registration only: every real creation and continuation below is caused
+    // by runStage's root loop after its activation and notice baselines exist.
+    ctx.on('agent/created', ({ agent }) => {
+      if (agent.session.header.parentSession !== root.id) return
+      childId = agent.id; children.push(agent)
+    }, { global: true })
+    ctx.on('agent/disposed', ({ agent }) => { if (agent.id === childId) disposed.push(agent) }, { global: true })
+    ctx.on('session/event', (session, event) => { if (session.id === childId && event.type === 'turn/end' && event.data.reason.kind === 'completed') childEnded = true }, { global: true })
+    ctx.on('session/flush', session => {
+      if (session.id !== childId || !childEnded) return
+      flushEntered.resolve()
+      return flushGate.promise
+    }, { global: true })
+    ctx.on('llm/stream', request => (async function* () {
+      localRequests++
+      assert.equal(isAgentLoopRequest(request), true)
+      assert.equal(request.maxTokens, 8192)
+      let block = { type: 'text', text: '137' }
+      if (request.sessionId === root.id) {
+        rootRequests++
+        if (rootRequests === 1) block = stage === 1
+          ? { type: 'tool-call', id: `local-spawn-${stage}`, name: 'subagent', arguments: JSON.stringify({ description: 'local settlement worker', prompt: 'Return 137.', ...backgroundArgument }) }
+          : { type: 'tool-call', id: `local-cold-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: coldMessage, request_key: coldRequestKey }) }
+        else if (stage === 1 && rootRequests === 2) block = { type: 'tool-call', id: 'local-live-send', name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Continue with the same answer.' }) }
+        else if (stage === 2 && rootRequests === 2) block = { type: 'tool-call', id: 'local-cold-replay', name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: coldMessage, request_key: coldRequestKey }) }
+        else if (notices() >= stage) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
+      } else {
+        assert.equal(request.sessionId, childId)
+        childEntered.resolve()
+        await signalGate(request.signal, childGate.promise)
+      }
+      yield { type: 'block-end', index: 0, block }
+      yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+      yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+    })(), { global: true })
+  } })
+  let pending
+  try {
+    assert.equal(children.length, 0)
+    assert.equal(harness.settlementSnapshot?.().phase, 'not-started')
+    for (stage = 1; stage <= 2; stage++) {
+      reset()
+      harness.beginTaskToolDiagnosticsStage()
+      harness.beginModelObservationStage?.(stage - 1)
+      const beforeNotices = notices()
+      pending = harness.runStage({ name: 'local-settlement', prompt: 'Exercise the local child lifecycle.' }).then(() => { completed = true })
+      pending.catch(() => {})
+      await arrived(childEntered.promise, 'child-stream')
+      await nativeCondition(() => root.status === 'idle')
+      assert.equal(children.length, stage, 'one activation for spawn/live-send, then one cold activation')
+      assert.equal(completed, false)
+      const active = harness.settlementSnapshot()
+      assert.equal(active.requiredNotices, 1)
+      assert.equal(active.missingNotices, 1)
+      assert.ok(active.runningAgents >= 1)
+      const activeObservation = harness.modelObservationSnapshot?.('stage-end') ?? null
+      assert.ok(activeObservation, 'actual native cold activation needs its own primitive request owner')
+      assert.equal(activeObservation.stageIndex, stage - 1)
+      assertAggregate(activeObservation, active)
+      const rootOwner = activeObservation.agents.find(row => row.role === 'root')
+      const childOwner = activeObservation.agents.filter(row => row.role === 'worker' && row.parentSlot === rootOwner?.agentSlot)
+        .sort((a, b) => b.lifetime - a.lifetime)[0]
+      assert.ok(rootOwner); assert.ok(childOwner)
+      assert.equal(childOwner.status, 'running')
+      assert.equal(childOwner.mode, 'continuable'); assert.equal(childOwner.activations, 1)
+      assert.equal(childOwner.requiredNotices, 1); assert.equal(childOwner.deliveredNotices, 0); assert.equal(childOwner.missingNotices, 1)
+      childOwners.push({ agentSlot: childOwner.agentSlot, lifetime: childOwner.lifetime })
+      if (stage === 2) {
+        assert.equal(childOwner.agentSlot, childOwners[0].agentSlot)
+        assert.ok(childOwner.lifetime > childOwners[0].lifetime, 'a new Agent object cannot inherit the old lifetime')
+        assert.equal(children[0].id, children[1].id)
+        assert.notEqual(children[0], children[1])
+        assert.ok(children[1].session.snapshotEvents().some(event => event.type === 'turn/start' && event.seq < children[1].session.firstLiveSeq), 'cold Session includes historical turns before this activation')
+      }
+      const childAdmission = admissions.find(row => row.stage === stage && row.agent === children[stage - 1])
+      const childRequest = activeObservation.requests.find(row => row.stageIndex === stage - 1 && row.agentSlot === childOwner.agentSlot && row.lifetime === childOwner.lifetime)
+      assert.ok(childAdmission); assert.ok(childRequest)
+      assert.equal(childRequest.turn, childAdmission.turn); assert.equal(childRequest.step, childAdmission.step)
+      assert.equal(childRequest.ended, false); assert.equal(childRequest.complete, false)
+      assert.equal(childRequest.assistantMessageSeen, false, 'historical own assistant output cannot complete a new held request')
+      assert.equal(childRequest.assistantSeq, null)
+      assert.ok(Number.isSafeInteger(childOwner.lastSeq))
+      assert.equal(children[stage - 1].session.isOwnSeq(childOwner.lastSeq), true)
+      assert.ok(childOwner.lastSeq >= children[stage - 1].session.firstLiveSeq)
+      observations.push({ stage, boundary: 'child-stream', ...active })
+      childGate.resolve()
+      await arrived(flushEntered.promise, 'final-flush')
+      await nativeCondition(() => harness.settlementSnapshot().phase === 'waiting-notices')
+      const heldFlush = harness.settlementSnapshot()
+      assert.equal(notices(), beforeNotices, 'the real SDK has not emitted a notice before its held final flush')
+      assert.equal(heldFlush.requiredNotices, 1)
+      assert.equal(heldFlush.deliveredNotices, 0)
+      assert.equal(heldFlush.missingNotices, 1)
+      assert.equal(completed, false)
+      assertAggregate(harness.modelObservationSnapshot('stage-end'), heldFlush)
+      observations.push({ stage, boundary: 'final-flush', ...heldFlush })
+      flushGate.resolve()
+      await arrived(parentEntered.promise, 'parent-wake')
+      assert.equal(notices() - beforeNotices, 1, 'actual native settlement notice reaches the direct parent')
+      assert.equal(disposed.length, stage)
+      assert.equal(root.status, 'running')
+      assert.equal(completed, false, 'notice delivery cannot bypass the reawakened parent')
+      const awake = harness.settlementSnapshot()
+      assert.equal(awake.deliveredNotices, 1); assert.equal(awake.missingNotices, 0)
+      assertAggregate(harness.modelObservationSnapshot('stage-end'), awake)
+      observations.push({ stage, boundary: 'parent-wake', ...awake })
+      parentGate.resolve()
+      await pending
+      const final = harness.settlementSnapshot()
+      assert.equal(final.phase, 'settled')
+      assert.equal(final.requiredNotices, 1)
+      assert.equal(final.deliveredNotices, 1)
+      assert.equal(final.idleAgents, 2)
+      assert.equal(final.pendingIdleWaits, 0)
+      const taskDiagnostics = harness.taskToolDiagnosticsSnapshot()
+      assert.ok(taskDiagnostics, 'legal cold Session lifecycle keeps task observations available')
+      assert.equal(taskDiagnostics.byTool.task_child_send.calls, stage === 1 ? 1 : 2)
+      assert.equal(taskDiagnostics.byTool.task_child_send.envelopeOk, stage === 1 ? 1 : 2)
+      const finalObservation = harness.modelObservationSnapshot('stage-end')
+      assertAggregate(finalObservation, final)
+      const settledChild = finalObservation.agents.find(row => row.agentSlot === childOwner.agentSlot)
+      assert.equal(settledChild.requiredNotices, 1); assert.equal(settledChild.deliveredNotices, 1); assert.equal(settledChild.missingNotices, 0)
+      const stageRequests = finalObservation.requests.filter(row => row.stageIndex === stage - 1)
+      assert.equal(stageRequests.length, admissions.filter(row => row.stage === stage).length)
+      assert.ok(stageRequests.every(row => row.complete && row.ended && row.assistantMessageSeen))
+      for (const request of stageRequests) {
+        const agent = request.agentSlot === rootOwner.agentSlot ? root : children[stage - 1]
+        assert.ok(admissions.some(row => row.stage === stage && row.agent === agent && row.turn === request.turn && row.step === request.step))
+        assert.equal(request.lifetime, request.agentSlot === rootOwner.agentSlot ? rootOwner.lifetime : childOwner.lifetime)
+        assert.equal(agent.session.isOwnSeq(request.assistantSeq), true)
+        assert.ok(agent.session.snapshotEvents().some(event => event.seq === request.assistantSeq && event.type === 'assistant/message'))
+      }
+      const serialized = JSON.stringify(finalObservation)
+      for (const privateValue of [root.id, childId, coldMessage, coldRequestKey, `local-cold-${stage}`, 'local-cold-replay']) {
+        assert.equal(serialized.includes(privateValue), false, 'model observations must not serialize private IDs, keys or content')
+      }
+      if (stage === 2) {
+        const controlResults = finalObservation.taskTail.filter(row => row.kind === 'result' && row.toolName === 'task_child_send')
+        assert.equal(controlResults.length, 2)
+        const fresh = controlResults.find(row => row.control?.replayed === false)
+        const replay = controlResults.find(row => row.control?.replayed === true)
+        assert.ok(fresh); assert.ok(replay)
+        for (const result of [fresh, replay]) {
+          assert.equal(result.outcome, 'envelope-ok')
+          assert.equal(result.control.status, 'accepted'); assert.equal(result.control.durable, true)
+          assert.equal(result.control.targetSlot, childOwner.agentSlot)
+          assert.equal(result.control.inboxIdPresent, true)
+        }
+        assert.equal(fresh.control.mode, 'continuable'); assert.equal(fresh.control.routeReported, false)
+        assert.equal(replay.control.mode, null); assert.equal(replay.control.activityBefore, null)
+        assert.equal(replay.control.currentTurn, null); assert.equal(replay.control.routeReported, null)
+        const receipts = ['local-cold-2', 'local-cold-replay'].map(callId => {
+          const result = root.session.snapshotEvents().find(event => event.type === 'tool/result' && event.data.message?.source?.callId === callId)
+          assert.ok(result)
+          assert.equal(result.data.message.isError, false)
+          return JSON.parse(result.data.message.content[0].text)
+        })
+        assert.ok(receipts.every(value => value.ok === true && value.operation.status === 'accepted'))
+        assert.equal(fresh.control.activityBefore, receipts[0].target.activity_before)
+        assert.equal(fresh.control.currentTurn, receipts[0].target.current_turn)
+        assert.ok(['running', 'inactive', 'unknown'].includes(fresh.control.activityBefore))
+        assert.ok(['running', 'inactive', 'unknown'].includes(fresh.control.currentTurn))
+        assert.equal(receipts[0].operation.operation_id, receipts[1].operation.operation_id)
+        assert.equal(receipts[0].operation.message_id, receipts[1].operation.message_id)
+        assert.equal(receipts[1].operation.invoke, false)
+        assert.equal(Object.hasOwn(receipts[1], 'route'), false, 'a replay has no new native route receipt')
+        assert.equal(children.length, 2, 'accepted replay creates no third child activation')
+      }
+      observations.push({ stage, boundary: 'settled', ...final, taskDiagnostics })
+    }
+    assert.equal(children[0].id, children[1].id)
+    assert.notEqual(children[0], children[1], 'cold reuse replaces the native Agent object')
+    assert.equal(notices(), 2)
+    const calls = root.session.snapshotEvents().filter(e => e.type === 'tool/call')
+    assert.equal(calls.filter(e => e.data.name === 'subagent').length, 1)
+    assert.equal(calls.filter(e => e.data.name === 'task_child_send').length, 3)
+    assert.deepEqual(diagnoseModelRuntime(harness.snapshot()).failureCodes, [])
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0,
+      realParentNotices: notices(), sameSessionDifferentAgents: true, observations }))
+  } finally {
+    for (const gate of releases) gate.resolve()
+    harness.cancel()
+    const deadline = setTimeout(() => { console.error('FIXTURE_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+    try { await harness.dispose() } finally { clearTimeout(deadline) }
+    if (pending) await pending.catch(() => {})
+    assert.equal(agents.get(root.id), undefined)
+    assert.equal(agents.get(childId), undefined)
+    await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+    t.diagnostic(JSON.stringify({ nativeSettlementCleanup: true, paidRequests: 0 }))
+  }
+})
+
+test('native settlement timeout snapshots the held local stream before signal cancellation and drains it', options, async t => {
+  const { createNativeHarness, runModelVerification } = await import('../verify-model.mjs')
+  const outputDir = await mkdtemp(join(tmpdir(), 'taskforce-native-settlement-timeout-'))
+  t.after(() => rm(outputDir, { recursive: true, force: true }))
+  let localRequests = 0, aborted = 0, drained = 0, root, ctx, agents, fixtureRoot, actualBeforeCancel, nativeHarness, frozenBeforeCancel
+  const report = await runModelVerification({ modelCalls: true, installAnchor: anchor, provider: 'deepseek-official', model: 'deepseek-flash', outputDir, stageTimeoutMs: 100 }, {
+    createHarness: async config => {
+      nativeHarness = await createNativeHarness(config, { inspectNative: state => {
+        root = state.root; ctx = state.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+        ctx.on('llm/stream', request => (async function* () {
+          localRequests++
+          try {
+            yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+            await new Promise(resolve => {
+              const cancel = () => { aborted++; resolve() }
+              if (request.signal.aborted) cancel()
+              else request.signal.addEventListener('abort', cancel, { once: true })
+            })
+            // Keep the boundary complete while the SDK consumes the abort.
+            yield { type: 'finish', reason: { kind: 'stop' } }
+          } finally { drained++ }
+        })(), { global: true })
+      } })
+      const cancel = nativeHarness.cancel
+      nativeHarness.cancel = () => {
+        actualBeforeCancel ??= { status: root.status, observation: nativeHarness.settlementSnapshot(), taskDiagnostics: nativeHarness.taskToolDiagnosticsSnapshot(), modelObservation: nativeHarness.modelObservationSnapshot?.('before-cancel') ?? null }
+        frozenBeforeCancel ??= JSON.stringify(actualBeforeCancel.modelObservation)
+        cancel()
+      }
+      return nativeHarness
+    },
+  })
+  assert.equal(report.ok, false)
+  assert.equal(report.failure, 'timeout')
+  assert.equal(localRequests, 1)
+  assert.equal(aborted, 1); assert.equal(drained, 1)
+  assert.equal(actualBeforeCancel.status, 'running')
+  assert.deepEqual(report.stages[0].timeoutProgress.settlement, actualBeforeCancel.observation)
+  assert.deepEqual(report.stages[0].timeoutTaskToolDiagnostics, { source: 'custom-harness-unverified', ...actualBeforeCancel.taskDiagnostics })
+  assert.equal(report.stages[0].taskToolDiagnostics.source, 'custom-harness-unverified', 'wrapping the native factory cannot establish native report authority')
+  const before = report.stages[0].timeoutObservations
+  assert.ok(before, 'the active native request needs a detached snapshot before cancellation')
+  assert.equal(before.source, 'custom-harness-unverified')
+  assert.equal(before.phase, 'before-cancel')
+  assert.ok(actualBeforeCancel.modelObservation)
+  // Separate synchronous snapshots may have different elapsed times. Ownership
+  // and stream state must agree without treating those clocks as identities.
+  assert.equal(before.requests.length, 1)
+  const activeRequest = before.requests[0]
+  const owner = before.agents.find(row => row.agentSlot === activeRequest.agentSlot)
+  assert.ok(owner); assert.equal(owner.role, 'root'); assert.equal(owner.status, 'running')
+  assert.equal(owner.lifetime, activeRequest.lifetime)
+  assert.equal(owner.pendingIdleWaits, 1)
+  assert.equal(activeRequest.usageSeen, true); assert.equal(activeRequest.finishSeen, false)
+  assert.equal(activeRequest.ended, false); assert.equal(activeRequest.complete, false)
+  assert.equal(activeRequest.assistantMessageSeen, false); assert.equal(activeRequest.assistantSeq, null)
+  assert.equal(activeRequest.cancelAlreadyRequested, false)
+  assert.equal(activeRequest.firstFailure, null); assert.equal(activeRequest.failurePhase, null)
+  const cancelRequest = actualBeforeCancel.modelObservation.requests[0]
+  for (const key of ['requestIndex', 'agentSlot', 'lifetime', 'turn', 'step', 'usageSeen', 'finishSeen', 'ended', 'complete', 'assistantMessageSeen', 'cancelAlreadyRequested', 'firstFailure', 'failurePhase']) {
+    assert.equal(activeRequest[key], cancelRequest[key])
+  }
+  assert.equal(JSON.stringify(actualBeforeCancel.modelObservation), frozenBeforeCancel, 'draining after cancellation cannot rewrite the held snapshot')
+  assert.equal(report.stages[0].observations.phase, 'final-before-dispose')
+  const after = report.stages[0].postDisposeObservations
+  assert.ok(after); assert.equal(after.phase, 'after-dispose')
+  assert.equal(after.source, 'custom-harness-unverified')
+  for (const key of ['agents', 'taskTail', 'ordinaryTail']) assert.deepEqual(after[key], [])
+  assert.deepEqual(after.tasks, { available: false, observedPhase: null, elapsedMs: null, rows: [], truncated: false })
+  assert.equal(after.requests.length, 1)
+  assert.equal(after.requests[0].requestIndex, activeRequest.requestIndex)
+  assert.equal(after.requests[0].ended, true)
+  assert.equal(before.requests[0].ended, false, 'post-dispose stream state remains a separate phase')
+  for (const snapshot of [before, report.stages[0].observations, after]) assert.equal(JSON.stringify(snapshot).includes(root.id), false)
+  assert.equal(report.stages[0].timeoutProgress.settlement.phase, 'waiting-idle')
+  assert.equal(report.stages[0].timeoutProgress.settlement.runningAgents, 1)
+  assert.equal(report.stages[0].timeoutProgress.settlement.pendingIdleWaits, 1)
+  assert.ok(Number.isSafeInteger(report.stages[0].timeoutProgress.lastRequestElapsedMs))
+  assert.equal(report.usage.inputTokens, 2)
+  assert.ok(nativeHarness.streamSnapshot().records.every(record => record.ended))
+  assert.equal(agents.get(root.id), undefined)
+  await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+  t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0, aborted, drained,
+    timeoutProgress: report.stages[0].timeoutProgress, fixtureDisposed: true }))
+})
+
+for (const route of ['spawn', 'fork', 'nested-fork']) {
+  test(`native delegation contract: rc2 foreground ${route} waits for real disposal and parent turns without a notice`, options, async t => {
+    if (installationVersion(anchor) !== '0.2.0-rc.2') return t.skip('alpha has no foreground parameter or one-shot mounted route')
+    const { createNativeHarness, diagnoseModelRuntime } = await import('../verify-model.mjs')
+    const { isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+    const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-foreground-'))
+    t.after(() => rm(workspace, { recursive: true, force: true }))
+    const nested = route === 'nested-fork', gates = []
+    const gate = () => { const value = nativeGate(); gates.push(value); return value }
+    const childGate = gate(), disposeGate = gate(), parentGate = gate(), rootGate = gate(), seedFlushGate = gate(), finalFlushGate = gate()
+    const childEntered = gate(), disposeEntered = gate(), parentEntered = gate(), rootEntered = gate(), seedFlushEntered = gate(), finalFlushEntered = gate()
+    const children = [], createdIdentities = [], observations = [], toolResults = new Map()
+    let root, ctx, agents, fixtureRoot, middle, leaf, stage = 'seed', rootRequests = 0, middleRequests = 0, middleEnds = 0
+    let localRequests = 0, completed = false, disposedLeaf = false, disposalReleased = false, seedFlushClaimed = false, pending
+    const identity = agent => ctx.sessionProjections.snapshot(agent.session, ['subagent']).values.subagent
+    const notices = agent => agent.session.snapshotEvents().filter(e => e.type === 'user/message' && e.data?.source?.kind === 'subagent-settled')
+    const toolResult = (agent, callId) => agent.session.snapshotEvents().find(e => e.type === 'tool/result' && e.data.message?.toolCallId === callId)?.data.message
+    const arrived = async (promise, boundary) => {
+      let timer
+      try { return await Promise.race([promise, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(JSON.stringify({ route, boundary, rootRequests, middleRequests, middleEnds, progress: harness.settlementSnapshot(), events: [root, middle].filter(Boolean).flatMap(a => a.session.snapshotEvents().filter(e => ['step/error', 'tool/result'].includes(e.type)).map(e => ({ type: e.type, data: e.data }))) }))), 5000) })]) }
+      finally { clearTimeout(timer) }
+    }
+    const harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+      workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+    }, { inspectNative: state => {
+      root = state.root; ctx = state.ctx; agents = ctx.agents; fixtureRoot = dirname(process.env.DSH_HOME)
+      assert.ok(root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent').parameters.properties.run_in_background)
+      ctx.on('tools/result', (exec, result) => { toolResults.set(exec.callId, result) }, { global: true })
+      ctx.on('agent/created', ({ agent }) => {
+        if (agent.session.header.parentSession !== root.id && agent.session.header.parentSession !== middle?.id) return
+        children.push(agent)
+        const initial = identity(agent)
+        createdIdentities.push({ mode: initial?.mode ?? null, own: initial ? agent.session.isOwnSeq(initial.seq) : false })
+        if (nested && agent.session.header.parentSession === root.id) middle = agent
+        else {
+          leaf = agent
+          // This is the real child's scope teardown, awaited by handle.dispose
+          // before JSONL close/unregister and the foreground tool return.
+          agent.ctx.effect(() => async () => { disposeEntered.resolve(); await disposeGate.promise; disposalReleased = true })
+        }
+      }, { global: true })
+      ctx.on('agent/disposed', ({ agent }) => { if (agent === leaf) disposedLeaf = true }, { global: true })
+      ctx.on('session/event', (session, event) => {
+        if (session.id === middle?.id && event.type === 'turn/end' && event.data.reason.kind === 'completed') middleEnds++
+      }, { global: true })
+      ctx.on('session/flush', session => {
+        if (session.id !== middle?.id || middleEnds === 0) return
+        if (middleEnds === 1) {
+          if (!seedFlushClaimed) { seedFlushClaimed = true; seedFlushEntered.resolve(); return seedFlushGate.promise }
+          return
+        }
+        finalFlushEntered.resolve(); return finalFlushGate.promise
+      }, { global: true })
+      ctx.on('llm/stream', request => (async function* () {
+        localRequests++
+        assert.equal(isAgentLoopRequest(request), true); assert.equal(request.maxTokens, 8192)
+        let block = { type: 'text', text: '137' }
+        if (stage !== 'seed' && request.sessionId === root.id) {
+          rootRequests++
+          if (rootRequests === 1) block = { type: 'tool-call', id: 'foreground-create', name: route === 'fork' ? 'subagent_fork' : 'subagent',
+            arguments: JSON.stringify({ description: 'local lifecycle worker', prompt: 'Return 137.', run_in_background: nested }) }
+          else if (nested && rootRequests === 2) {
+            await signalGate(request.signal, seedFlushEntered.promise)
+            block = { type: 'tool-call', id: 'middle-live-send', name: 'task_child_send', arguments: JSON.stringify({ target_id: middle.id, message: 'Now fork a foreground child.' }) }
+          } else if (nested && notices(root).length) { rootEntered.resolve(); await signalGate(request.signal, rootGate.promise) }
+          else if (!nested) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
+        } else if (request.sessionId === middle?.id) {
+          middleRequests++
+          if (middleRequests === 2) {
+            seedFlushGate.resolve()
+            block = { type: 'tool-call', id: 'foreground-leaf', name: 'subagent_fork', arguments: JSON.stringify({ description: 'local foreground leaf', prompt: 'Return 137.', run_in_background: false }) }
+          } else if (middleRequests > 2) { parentEntered.resolve(); await signalGate(request.signal, parentGate.promise) }
+        } else if (request.sessionId === leaf?.id) { childEntered.resolve(); await signalGate(request.signal, childGate.promise) }
+        yield { type: 'block-end', index: 0, block }
+        yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+        yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+      })(), { global: true })
+    } })
+    try {
+      assert.equal(children.length, 0)
+      await arrived(harness.runStage({ name: 'seed', prompt: 'Return a completed seed turn.' }), 'root-seed')
+      assert.equal(children.length, 0, 'all delegations follow the foreground stage baselines')
+      stage = 'foreground'
+      pending = harness.runStage({ name: stage, prompt: 'Exercise the actual mounted foreground lifecycle.' }).then(() => { completed = true })
+      pending.catch(() => {})
+      await arrived(childEntered.promise, 'child-stream')
+      assert.equal(children.length, nested ? 2 : 1)
+      assert.equal(completed, false)
+      const own = identity(leaf)
+      assert.equal(own.mode, 'one-shot'); assert.equal(leaf.session.isOwnSeq(own.seq), true)
+      assert.equal(createdIdentities.at(-1).own, false, 'creation precedes the own one-shot descriptor')
+      if (nested) {
+        assert.deepEqual(createdIdentities.at(-1), { mode: 'continuable', own: false }, 'fork seed carries the parent identity but does not own it')
+        assert.equal(identity(middle).mode, 'continuable')
+      }
+      assert.equal(harness.settlementSnapshot().requiredNotices, nested ? 1 : 0)
+      observations.push({ boundary: 'child-stream', ...harness.settlementSnapshot() })
+      childGate.resolve()
+      await arrived(disposeEntered.promise, 'scope-disposal')
+      assert.equal(completed, false); assert.equal(disposalReleased, false)
+      assert.equal(agents.get(leaf.id), leaf, 'actual unregister is still blocked by scope disposal')
+      assert.equal(toolResult(middle ?? root, nested ? 'foreground-leaf' : 'foreground-create'), undefined)
+      observations.push({ boundary: 'scope-disposal', ...harness.settlementSnapshot() })
+      disposeGate.resolve()
+      await arrived(parentEntered.promise, 'foreground-parent-turn')
+      assert.equal(disposalReleased, true); assert.equal(disposedLeaf, true)
+      assert.equal(agents.get(leaf.id), undefined)
+      const result = toolResult(middle ?? root, nested ? 'foreground-leaf' : 'foreground-create')
+      assert.equal(result?.isError, false)
+      assert.equal(result.content.filter(block => block.type === 'text').map(block => block.text).join(''), '137')
+      const value = toolResults.get(nested ? 'foreground-leaf' : 'foreground-create').value
+      assert.equal(value.kind, 'foreground'); assert.equal(value.runId, leaf.id)
+      assert.equal(notices(middle ?? root).filter(event => event.data.source.senderSessionId === leaf.id).length, 0)
+      assert.equal(completed, false, 'real foreground result cannot bypass the still-running parent')
+      observations.push({ boundary: 'parent-turn', ...harness.settlementSnapshot() })
+      parentGate.resolve()
+      if (nested) {
+        await arrived(finalFlushEntered.promise, 'continuable-parent-flush')
+        assert.equal(notices(root).length, 0); assert.equal(completed, false)
+        assert.equal(harness.settlementSnapshot().requiredNotices, 1)
+        assert.equal(harness.settlementSnapshot().missingNotices, 1)
+        observations.push({ boundary: 'continuable-parent-flush', ...harness.settlementSnapshot() })
+        finalFlushGate.resolve()
+        await arrived(rootEntered.promise, 'root-notice-turn')
+        assert.equal(notices(root).length, 1); assert.equal(completed, false)
+        rootGate.resolve()
+      }
+      await nativeCondition(() => root.status === 'idle' && children.every(agent => agent.status === 'idle') && harness.streamSnapshot().records.every(record => record.ended))
+      await arrived(pending, 'final-settlement')
+      const final = harness.settlementSnapshot()
+      t.diagnostic(JSON.stringify({ route, localRequests, paidRequests: 0, createdIdentities, observations, final, disposedLeaf, disposalReleased }))
+      assert.equal(completed, true, `completed foreground must settle without an inapplicable notice: ${JSON.stringify(final)}`)
+      await pending
+      assert.equal(final.phase, 'settled'); assert.equal(final.requiredNotices, nested ? 1 : 0)
+      assert.equal(final.deliveredNotices, nested ? 1 : 0); assert.equal(final.missingNotices, 0)
+      assert.equal(final.trackedAgents, nested ? 3 : 2); assert.equal(final.idleAgents, final.trackedAgents)
+      assert.ok(harness.streamSnapshot().records.every(record => record.ended))
+      assert.equal(identity(leaf).mode, 'one-shot', 'host identity remains authoritative after child scope disposal')
+      assert.deepEqual(diagnoseModelRuntime(harness.snapshot()).failureCodes, [])
+      // Actual owned-child guard refuses this exact settled one-shot id. It
+      // cannot satisfy later reuse by quietly creating a replacement worker.
+      const before = children.length
+      if (!nested) {
+        const refusal = await root.ctx.tools.execute({ agent: root, callId: 'foreground-reuse-refusal', name: 'task_child_send',
+          arguments: { target_id: leaf.id, message: 'Continue the same child.' }, signal: new AbortController().signal })
+        assert.equal(refusal.isError, false)
+        const denied = JSON.parse(refusal.value)
+        assert.equal(denied.ok, false); assert.equal(denied.code, 'E_CHILD_SETTLED')
+        assert.equal(children.length, before); assert.equal(agents.get(leaf.id), undefined)
+      }
+    } finally {
+      for (const item of gates) item.resolve()
+      harness.cancel()
+      const deadline = setTimeout(() => { console.error('FIXTURE_CLEANUP_DEADLINE_12S'); process.exit(125) }, 12000)
+      try { await harness.dispose() } finally { clearTimeout(deadline) }
+      if (pending) await pending.catch(() => {})
+      assert.equal(agents.get(root.id), undefined)
+      for (const agent of children) assert.equal(agents.get(agent.id), undefined)
+      await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+      t.diagnostic(JSON.stringify({ route, nativeForegroundCleanup: true, paidRequests: 0 }))
+    }
+  })
+}
+
+test('native task action diagnostics distinguish registered business outcomes and transport errors in native and PTC', options, async t => {
+  const { createNativeHarness } = await import('../verify-model.mjs')
+  const { createUserMessage } = await native('@deepseek-ai/dsh-llm')
+  const { resolveChildAgentOptions, applyChildComposition, childSessionMeta } = await native('@deepseek-ai/dsh-subagent')
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-task-diagnostics-'))
+  t.after(() => rm(workspace, { recursive: true, force: true }))
+  await native('@deepseek-ai/dsh-subprocess-local') // SDK module owns one process exit callback.
+  const listenerEvents = ['exit', 'unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT']
+  const listeners = listenerEvents.map(name => process.rawListeners(name))
+  let localRequests = 0, child, root, ctx, fixtureRoot
+  const publications = []
+  const privateMarker = 'PRIVATE_NATIVE_OBSERVATION_MARKER', ordinaryCount = 21
+  const harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+    workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+  }, { inspectNative: state => {
+    root = state.root; ctx = state.ctx; fixtureRoot = dirname(process.env.DSH_HOME)
+    ctx.on('session/event', (session, event) => {
+      if (['tool/call', 'tool/result', 'tool/ptc-dispatch-start', 'tool/ptc-dispatch'].includes(event.type)) publications.push({ session: session.id === root.id ? 'root' : 'worker', event })
+    }, { global: true })
+    ctx.on('tools/execute', (exec, next) => {
+      if (exec.name === 'task_board' && exec.arguments?.task_id === 424242) throw new Error('LOCAL_TRANSPORT_FAILURE')
+      return next()
+    }, { global: true })
+    const steps = new Map()
+    ctx.on('llm/stream', request => (async function* () {
+      localRequests++
+      const step = (steps.get(request.sessionId) ?? 0) + 1
+      steps.set(request.sessionId, step)
+      let block = { type: 'text', text: '137' }
+      let ordinaryBlocks = null
+      if (request.sessionId === root.id && step === 1) block = { type: 'tool-call', id: 'root-board', name: 'task_board', arguments: '{}' }
+      if (request.sessionId !== root.id) {
+        if (step === 1) ordinaryBlocks = Array.from({ length: ordinaryCount }, (_, index) => ({
+          type: 'tool-call', id: `ordinary-before-task-${index}`, name: 'run_code',
+          arguments: JSON.stringify({ description: 'Local ordinary result before task outcomes', code: `return "${privateMarker}";` }),
+        }))
+        const taskStep = step - 1
+        if (taskStep >= 1 && taskStep <= 3) block = { type: 'tool-call', id: `native-board-${taskStep}`, name: 'task_board', arguments: JSON.stringify(taskStep === 1 ? {} : { task_id: taskStep === 2 ? 999999 : 424242 }) }
+        if (taskStep === 4) block = { type: 'tool-call', id: 'ptc-board', name: 'run_code', arguments: JSON.stringify({ description: 'Exercise task outcomes locally', code: 'await tools.task_board({}); await tools.task_board({task_id:999999}); try { await tools.task_board({task_id:424242}); } catch {} return "done";' }) }
+      }
+      for (const [index, value] of (ordinaryBlocks ?? [block]).entries()) yield { type: 'block-end', index, block: value }
+      yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+      yield { type: 'finish', reason: { kind: ordinaryBlocks || block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+    })(), { global: true })
+  } })
+  try {
+    harness.beginTaskToolDiagnosticsStage?.()
+    harness.beginModelObservationStage?.(0)
+    root.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Exercise local root task diagnostics.' }] }))
+    await root.whenIdle()
+    const seed = root.session.snapshotEvents()
+    child = await ctx.agents.create({ sessionId: 'task-diagnostics-child', parentAgent: root, seed, inheritedEventCount: seed.length,
+      agentOptions: resolveChildAgentOptions(root, undefined, 1), meta: childSessionMeta(root, 1, true),
+      setup: childCtx => applyChildComposition(childCtx, root, {}),
+    })
+    child.agent.ctx.tools.presentAs('both')
+    assert.equal(child.agent.session.inheritedEventCount, seed.length)
+    assert.ok(seed.some(event => event.type === 'tool/result'), 'the real child inherits a completed parent task result')
+    for (const agent of [child.agent]) {
+      agent.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Exercise local task diagnostics.' }] }))
+      await agent.whenIdle()
+    }
+    const results = publications.filter(row => row.event.type === 'tool/result' || row.event.type === 'tool/ptc-dispatch')
+    const ordinaryResults = results.filter(({ event }) => event.type === 'tool/result' && event.data.message?.source?.callId?.startsWith('ordinary-before-task-'))
+    assert.equal(ordinaryResults.length, ordinaryCount)
+    assert.ok(ordinaryResults.every(({ event }) => event.data.message.isError === false))
+    assert.ok(ordinaryResults.every(({ event }) => event.data.message.content.some(block => block.type === 'text' && block.text.includes(privateMarker))), 'the private marker really traverses native result content')
+    const firstWorkerTask = publications.find(({ session, event }) => session === 'worker' && event.type === 'tool/call' && event.data.name === 'task_board')
+    assert.ok(firstWorkerTask)
+    assert.ok(ordinaryResults.every(({ event }) => event.seq < firstWorkerTask.event.seq), 'more than 20 actual ordinary results precede the worker task outcomes')
+    const business = results.filter(({ event }) => {
+      const content = event.data.message?.content ?? event.data.content
+      try { return content?.length === 1 && content[0].type === 'text' && JSON.parse(content[0].text).ok === false } catch { return false }
+    })
+    assert.equal(business.length, 2)
+    assert.ok(business.every(({ event }) => (event.data.message?.isError ?? event.data.isError) === false))
+    assert.equal(results.filter(({ event }) => event.data.message?.isError === true || event.data.isError === true).length, 2)
+    // Existing classifiers retain their exact counts despite the additional
+    // ordinary results and the separate primitive observation tail.
+    const diagnostics = harness.taskToolDiagnosticsSnapshot?.() ?? null
+    assert.equal(diagnostics?.byTool.task_board.envelopeError, 2)
+    assert.equal(diagnostics.byTool.task_board.envelopeOk, 3)
+    assert.equal(diagnostics.byTool.task_board.transportError, 2)
+    assert.equal(diagnostics.byTool.task_board.nativeResults, 4)
+    assert.equal(diagnostics.byTool.task_board.ptcResults, 3)
+    assert.equal(diagnostics.byRole.root, 1)
+    assert.equal(diagnostics.byRole.worker, 6)
+    assert.equal(diagnostics.errorCounts.E_NOT_FOUND, 2)
+    assert.equal(diagnostics.unattributedResults, 0, 'run_code is a wrapper, not a task result')
+    const observation = harness.modelObservationSnapshot?.('stage-end') ?? null
+    assert.ok(observation, 'ordinary result traffic cannot hide primitive native/PTC task receipts')
+    const taskResults = observation.taskTail.filter(row => row.kind === 'result' && row.toolName === 'task_board')
+    assert.equal(taskResults.length, 7, 'the inherited root result is not counted as a worker result')
+    assert.equal(taskResults.filter(row => row.presentation === 'native').length, 4)
+    assert.equal(taskResults.filter(row => row.presentation === 'ptc').length, 3)
+    assert.equal(taskResults.filter(row => row.outcome === 'envelope-ok').length, 3)
+    assert.equal(taskResults.filter(row => row.outcome === 'envelope-error').length, 2)
+    assert.equal(taskResults.filter(row => row.outcome === 'transport-error').length, 2)
+    assert.equal(taskResults.filter(row => row.errorCode === 'E_NOT_FOUND').length, 2)
+    const rootOwner = observation.agents.find(row => row.role === 'root')
+    const workerOwner = observation.agents.find(row => row.role === 'worker' && row.parentSlot === rootOwner?.agentSlot)
+    assert.ok(rootOwner); assert.ok(workerOwner)
+    assert.equal(taskResults.filter(row => row.agentSlot === rootOwner.agentSlot).length, 1)
+    assert.equal(taskResults.filter(row => row.agentSlot === workerOwner.agentSlot).length, 6)
+    assert.equal(observation.taskDropped, 0)
+    assert.ok(observation.ordinaryTail.length <= 32); assert.ok(observation.taskTail.length <= 64)
+    assert.ok(observation.firstFailure, 'first task failure remains available independently of either tail')
+    const serialized = JSON.stringify(observation)
+    for (const privateValue of [privateMarker, root.id, child.agent.id, 'ordinary-before-task-', 'LOCAL_TRANSPORT_FAILURE', 'await tools.task_board', 'native-board-']) {
+      assert.equal(serialized.includes(privateValue), false, 'native observations contain only the bounded primitive projection')
+    }
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), localRequests, paidRequests: 0,
+      ordinaryResults: ordinaryResults.length, nativeTaskResults: 4, ptcTaskResults: 3, diagnostics,
+      primitiveTaskResults: taskResults.length, privateMarkerExcluded: true }))
+  } catch (error) {
+    t.diagnostic(JSON.stringify({ originalAssertion: error.message, stack: error.stack }))
+    throw error
+  } finally {
+    let cleanupTimer
+    try {
+      await Promise.race([(async () => { await child?.dispose(); await harness.dispose() })(), new Promise((_, reject) => { cleanupTimer = setTimeout(() => reject(new Error('FIXTURE_CLEANUP_DEADLINE_12S')), 12000) })])
+    } finally { clearTimeout(cleanupTimer) }
+    await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+    for (const [index, name] of listenerEvents.entries()) {
+      if (name === 'exit' && process.rawListeners(name).length !== listeners[index].length) t.diagnostic(JSON.stringify({ addedExitCallbacks: process.rawListeners(name).filter(fn => !listeners[index].includes(fn)).map(fn => String(fn.listener ?? fn)) }))
+      assert.deepEqual(process.rawListeners(name), listeners[index], `exact ${name} callbacks restored`)
+    }
+  }
+})
+
+test('native unstarted disposal rejects early and a real same-session cold retry cannot erase the failure', options, async t => {
+  const { createNativeHarness, nativeSubagentMode } = await import('../verify-model.mjs')
+  const { createUserMessage, isAgentLoopRequest } = await native('@deepseek-ai/dsh-llm')
+  await native('@deepseek-ai/dsh-subprocess-local')
+  const listenerNames = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT', 'exit']
+  const baseline = listenerNames.map(name => process.rawListeners(name))
+  const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-unstarted-'))
+  const scopeEntered = nativeGate(), scopeRelease = nativeGate(), scopeFinished = nativeGate()
+  const children = [], agentDisposals = [], sessionDisposals = [], fibers = [], observerWork = [], streams = []
+  let harness, root, ctx, agents, sessions, fixtureRoot, childId, pending, fault = false, stage = 'initial', rootRequests = 0
+  let outcome = 'pending', rejected, retryRestoredTail = false, scopeHeld = false
+  const notices = () => root.session.snapshotEvents().filter(event => event.type === 'user/message'
+    && event.data?.source?.kind === 'subagent-settled' && event.data.source.senderSessionId === childId).length
+  const ownStarts = agent => agent.session.snapshotEvents().filter(event => event.type === 'turn/start'
+    && event.seq >= agent.session.firstLiveSeq && agent.session.isOwnSeq(event.seq)).length
+  try {
+    harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+      workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+    }, { inspectNative: state => {
+      root = state.root; ctx = state.ctx; agents = ctx.agents; sessions = ctx.sessions; fixtureRoot = dirname(process.env.DSH_HOME)
+      fibers.push(root.ctx.fiber)
+      const background = Object.hasOwn(root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent').parameters.properties, 'run_in_background')
+        ? { run_in_background: true } : {}
+      ctx.on('agent/created', ({ agent, source }) => {
+        if (agent.session.header.parentSession !== root.id) return
+        childId = agent.id; children.push(agent); fibers.push(agent.ctx.fiber)
+        assert.equal(nativeSubagentMode(ctx, agent), 'continuable')
+        assert.equal(agents.get(agent.id), agent)
+        if (children.length === 3) {
+          assert.equal(source, 'resume')
+          assert.notEqual(agent, children[1]); assert.notEqual(agent.session, children[1].session)
+          const failed = children[1].session, restored = agent.session.snapshotEvents(0, agent.session.firstLiveSeq)
+          assert.equal(agent.session.firstLiveSeq, failed.seq)
+          assert.deepEqual(restored, failed.snapshotEvents())
+          retryRestoredTail = true
+        }
+        if (fault && source === 'resume') {
+          fault = false
+          agent.ctx.effect(() => async () => {
+            scopeHeld = true; scopeEntered.resolve()
+            await scopeRelease.promise
+            scopeHeld = false; scopeFinished.resolve()
+          }, 'unstarted-disposal-cleanup-oracle')
+          throw new Error('LOCAL_UNSTARTED_PUBLICATION_FAULT')
+        }
+      }, { global: true })
+      ctx.on('agent/disposed', ({ agent }) => {
+        if (agent !== root && !children.includes(agent)) return
+        // The SDK emits without awaiting observers: retain and join our work.
+        observerWork.push((async () => {
+          agentDisposals.push(agent)
+          assert.equal(agents.get(agent.id), undefined)
+        })())
+      }, { global: true })
+      ctx.on('session/disposed', session => {
+        const agent = [root, ...children].find(item => item.session === session)
+        if (!agent) return
+        observerWork.push((async () => {
+          assert.ok(agentDisposals.includes(agent))
+          assert.equal(sessions.get(session.id), undefined)
+          sessionDisposals.push(session)
+        })())
+      }, { global: true })
+      ctx.on('llm/stream', request => (async function* () {
+        const record = { ended: false }; streams.push(record)
+        try {
+          assert.equal(isAgentLoopRequest(request), true); assert.equal(request.maxTokens, 8192)
+          let block = { type: 'text', text: '137' }
+          if (request.sessionId === root.id && ++rootRequests === 1) block = stage === 'initial'
+            ? { type: 'tool-call', id: 'unstarted-spawn', name: 'subagent', arguments: JSON.stringify({ description: 'local lifecycle worker', prompt: 'Return 137.', ...background }) }
+            : { type: 'tool-call', id: `unstarted-${stage}`, name: 'task_child_send', arguments: JSON.stringify({ target_id: childId, message: 'Return 137.' }) }
+          yield { type: 'block-end', index: 0, block }
+          yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+          yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+        } finally { record.ended = true }
+      })(), { global: true })
+    } })
+    // No optional diagnostic begin hook: runStage owns the activation baseline.
+    await harness.runStage({ name: 'initial', prompt: 'Create the local worker.' })
+    assert.equal(notices(), 1); assert.equal(children.length, 1)
+    assert.equal(ownStarts(children[0]), 1)
+    stage = 'fault'; rootRequests = 0; fault = true
+    pending = harness.runStage({ name: 'fault', prompt: 'Resume the same worker.' })
+    const observed = pending.then(() => { outcome = 'resolved' }, error => { outcome = 'rejected'; rejected = error })
+    await scopeEntered.promise
+    assert.equal(outcome, 'pending'); assert.equal(scopeHeld, true)
+    assert.equal(agents.get(childId), children[1])
+    assert.equal(agentDisposals.includes(children[1]), false)
+    assert.equal(sessionDisposals.includes(children[1].session), false)
+    scopeRelease.resolve(); await scopeFinished.promise
+    await nativeCondition(() => agentDisposals.includes(children[1]) && sessionDisposals.includes(children[1].session)
+      && root.status === 'idle' && harness.settlementSnapshot().phase === 'waiting-notices')
+    assert.equal(ownStarts(children[1]), 0)
+    assert.ok(children[1].session.snapshotEvents().some(event => event.type === 'turn/start' && event.seq < children[1].session.firstLiveSeq), 'a restored historical own turn does not start this Agent')
+    const afterFault = harness.settlementSnapshot()
+    assert.equal(afterFault.missingNotices, 1); assert.equal(afterFault.pendingIdleWaits, 0)
+    stage = 'retry'; rootRequests = 0
+    root.followup(createUserMessage({ source: { kind: 'user' }, content: [{ type: 'text', text: 'Try a fresh continuation of the same child.' }] }))
+    await nativeCondition(() => children.length === 3 && sessionDisposals.includes(children[2].session)
+      && notices() === 2 && root.status === 'idle' && harness.settlementSnapshot().phase === 'waiting-notices')
+    const afterRetry = harness.settlementSnapshot()
+    assert.equal(afterRetry.requiredNotices, 2); assert.equal(afterRetry.deliveredNotices, 1); assert.equal(afterRetry.missingNotices, 1)
+    assert.equal(ownStarts(children[2]), 1); assert.equal(retryRestoredTail, true)
+    assert.ok(children.every(agent => agent.id === childId)); assert.equal(new Set(children).size, 3)
+    const sendResults = root.session.snapshotEvents().filter(event => event.type === 'tool/result' && ['unstarted-fault', 'unstarted-retry'].includes(event.data.message?.source?.callId))
+      .map(event => ({ isError: event.data.message.isError === true, value: JSON.parse(event.data.message.content[0].text) }))
+    assert.equal(sendResults.length, 2); assert.equal(sendResults[0].isError, false)
+    assert.equal(sendResults[0].value.ok, false); assert.equal(sendResults[0].value.code, 'NOT_RESUMABLE')
+    assert.equal(sendResults[0].value.operation.status, 'unknown'); assert.equal(sendResults[1].value.ok, true)
+    t.diagnostic(JSON.stringify({ host: installationVersion(anchor), afterFault, afterRetry, outcome,
+      failure: rejected?.verificationCode ?? null, ownStarts: children.map(ownStarts), retryRestoredTail, providerCalls: 0 }))
+    // On unchanged production the original waiter is still pending after both
+    // genuine rollback and retry; this is a behavioral RED, not a missing seam.
+    assert.equal(outcome, 'rejected', 'disposed unstarted native instance must reject before the stage deadline')
+    assert.equal(rejected.verificationCode, 'unsettled-tree'); await observed
+  } finally {
+    scopeRelease.resolve()
+    let cleanupTimer
+    try {
+      await Promise.race([(async () => {
+        harness?.cancel(); await harness?.dispose(); await pending?.catch(() => {})
+        await Promise.all(observerWork)
+        for (const fiber of fibers) { await fiber.await(); assert.equal(fiber.uid, null) }
+      })(), new Promise((_, reject) => { cleanupTimer = setTimeout(() => reject(new Error('FIXTURE_CLEANUP_DEADLINE_12S')), 12000) })])
+      if (ctx) {
+        assert.equal(agents.list().length, 0)
+        assert.ok([root, ...children].every(agent => agentDisposals.includes(agent) && sessionDisposals.includes(agent.session)))
+        assert.ok(streams.every(record => record.ended)); assert.ok(harness.streamSnapshot().records.every(record => record.ended))
+        await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+      }
+    } finally { clearTimeout(cleanupTimer); await rm(workspace, { recursive: true, force: true }) }
+    await assert.rejects(access(workspace), { code: 'ENOENT' })
+    for (const [index, name] of listenerNames.entries()) assert.deepEqual(process.rawListeners(name), baseline[index], `exact ${name} callback references/order/multiplicity`)
+    t.diagnostic(JSON.stringify({ nativeUnstartedCleanup: true, scopesQuiescent: fibers.length,
+      agentDisposals: agentDisposals.length, sessionDisposals: sessionDisposals.length, streamsDrained: streams.length,
+      retryWriterOwnershipAndCheckedTail: retryRestoredTail, everyOldCloseSucceeded: 'not observable', providerCalls: 0 }))
+  }
+})
+
+for (const boundary of ['cancel', 'dispose', 'application-shutdown']) {
+  test(`native unstarted disposal excludes intentional ${boundary} before the first child turn`, options, async t => {
+    const { createNativeHarness, nativeSubagentMode } = await import('../verify-model.mjs')
+    await native('@deepseek-ai/dsh-subprocess-local')
+    const listenerNames = ['unhandledRejection', 'uncaughtException', 'SIGTERM', 'SIGINT', 'exit']
+    const baseline = listenerNames.map(name => process.rawListeners(name)), previousExit = process.exitCode
+    const workspace = await mkdtemp(join(tmpdir(), 'taskforce-native-unstarted-cancel-'))
+    const entered = nativeGate(), release = nativeGate()
+    const fibers = [], observers = [], streamEnds = [], abortListeners = []
+    let root, child, ctx, agents, sessions, fixtureRoot, shutdown, harness, stageWork, cleanupWork
+    let stageOutcome = 'pending', observedCode, appUnloading = false, aborts = 0, abortSawAppUnloading = false, childRemoved = false, sessionRemoved = false, rootRequests = 0
+    try {
+      harness = await createNativeHarness({ installAnchor: anchor, packageRoot: new URL('../..', import.meta.url).pathname,
+        workspace, provider: 'deepseek-official', model: 'deepseek-flash', onRequest() {},
+      }, { inspectNative: state => {
+        root = state.root; ctx = state.ctx; agents = ctx.agents; sessions = ctx.sessions
+        fixtureRoot = dirname(process.env.DSH_HOME); shutdown = state.shutdown; fibers.push(root.ctx.fiber)
+        const applicationFiber = ctx.fiber
+        ctx.on('internal/status', fiber => { if (fiber === applicationFiber && fiber.state === 5) appUnloading = true }, { global: true, prepend: true })
+        ctx.on('agent/created', ({ agent, signal }) => {
+          if (agent.session.header.parentSession !== root.id) return
+          child = agent; fibers.push(agent.ctx.fiber)
+          assert.equal(nativeSubagentMode(ctx, agent), 'continuable')
+          const aborted = () => { aborts++; abortSawAppUnloading = appUnloading }
+          signal.addEventListener('abort', aborted, { once: true })
+          abortListeners.push(() => signal.removeEventListener('abort', aborted))
+          entered.resolve()
+          return release.promise.then(() => { throw new Error('LOCAL_CANCELLED_CREATION') })
+        }, { global: true })
+        ctx.on('agent/disposed', ({ agent }) => {
+          if (agent !== child) return
+          observers.push((async () => {
+            assert.equal(agents.get(agent.id), undefined)
+            if (boundary === 'application-shutdown') assert.equal(appUnloading, true, 'real app root starts unload before child disposal')
+            childRemoved = true
+          })())
+        }, { global: true })
+        ctx.on('session/disposed', session => {
+          if (session !== child?.session) return
+          observers.push((async () => { assert.equal(childRemoved, true); assert.equal(sessions.get(session.id), undefined); sessionRemoved = true })())
+        }, { global: true })
+        const background = Object.hasOwn(root.ctx.tools.schemas(root).find(tool => tool.name === 'subagent').parameters.properties, 'run_in_background')
+          ? { run_in_background: true } : {}
+        ctx.on('llm/stream', request => (async function* () {
+          const record = { ended: false }; streamEnds.push(record)
+          try {
+            assert.equal(request.sessionId, root.id, 'cancelled child never starts a local stream')
+            const block = ++rootRequests === 1
+              ? { type: 'tool-call', id: 'cancelled-create', name: 'subagent', arguments: JSON.stringify({ description: 'local cancelled worker', prompt: 'Return 137.', ...background }) }
+              : { type: 'text', text: '137' }
+            yield { type: 'block-end', index: 0, block }
+            yield { type: 'usage', usage: { inputTokens: 2, outputTokens: 3 } }
+            yield { type: 'finish', reason: { kind: block.type === 'tool-call' ? 'tool-calls' : 'stop' } }
+          } finally { record.ended = true }
+        })(), { global: true })
+      } })
+      stageWork = harness.runStage({ name: 'cancellation-boundary', prompt: 'Start a local child.' })
+      const observed = stageWork.then(() => { stageOutcome = 'resolved' }, error => { stageOutcome = 'rejected'; observedCode = error.verificationCode })
+      await entered.promise
+      assert.equal(stageOutcome, 'pending')
+      if (boundary === 'cancel') harness.cancel()
+      if (boundary === 'dispose') cleanupWork = harness.dispose()
+      if (boundary === 'application-shutdown') cleanupWork = shutdown(0)
+      release.resolve()
+      if (cleanupWork) await cleanupWork
+      if (boundary === 'application-shutdown') {
+        assert.equal(appUnloading, true); assert.ok(aborts > 0)
+        assert.equal(abortSawAppUnloading, true, 'real application UNLOADING precedes the creation signal abort')
+      }
+      await nativeCondition(() => agents.get(child.id) === undefined && root.status === 'idle')
+      assert.equal(child.session.snapshotEvents().some(event => event.type === 'turn/start' && event.seq >= child.session.firstLiveSeq), false)
+      if (boundary === 'dispose') { await observed; assert.equal(stageOutcome, 'rejected'); assert.equal(observedCode, 'unsettled-tree') }
+      else {
+        await new Promise(resolve => setTimeout(resolve, 25))
+        assert.equal(stageOutcome, 'pending', 'intentional teardown cannot invent the early unstarted-disposal failure')
+      }
+      t.diagnostic(JSON.stringify({ boundary, stageOutcome, appUnloading, aborts, abortSawAppUnloading, childUnstarted: true,
+        actualChildAbsent: agents.get(child.id) === undefined, providerCalls: 0 }))
+    } finally {
+      release.resolve()
+      let timer
+      try {
+        await Promise.race([(async () => {
+          await cleanupWork
+          harness?.cancel(); await harness?.dispose(); await stageWork?.catch(() => {})
+          await Promise.all(observers)
+          for (const fiber of fibers) { await fiber.await(); assert.equal(fiber.uid, null) }
+        })(), new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('FIXTURE_CLEANUP_DEADLINE_12S')), 12000) })])
+        assert.equal(agents?.list().length, 0)
+        assert.ok(streamEnds.every(record => record.ended)); assert.ok(harness.streamSnapshot().records.every(record => record.ended))
+        await assert.rejects(access(fixtureRoot), { code: 'ENOENT' })
+      } finally { clearTimeout(timer); for (const remove of abortListeners) remove(); process.exitCode = previousExit; await rm(workspace, { recursive: true, force: true }) }
+      for (const [index, name] of listenerNames.entries()) assert.deepEqual(process.rawListeners(name), baseline[index])
+      t.diagnostic(JSON.stringify({ boundary, cleanup: true, childDisposedObserver: childRemoved, sessionDisposedObserver: sessionRemoved,
+        scopesQuiescent: fibers.length, localStreamsDrained: streamEnds.length, providerCalls: 0 }))
+    }
+  })
 }

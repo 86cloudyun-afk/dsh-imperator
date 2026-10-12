@@ -8,6 +8,14 @@ import { apply as applyStore, TaskforceStore } from '../../lib/store/index.js'
 import { tempStore, seedSubmitted } from './helpers.mjs'
 
 const run = 'scope-a'
+test('Task16 full stored run is distinct from its NUL prefix', t => {
+  const store = tempStore(t), full = 'root\0suffix'
+  const id = store.openTask({ title: 'exact run' }, full).task_id
+  const db = store.open(), before = db.prepare('SELECT total_changes() AS n').get().n
+  assert.throws(() => store.taskOf(id, 'root'), { code: 'E_CROSS_RUN' })
+  assert.equal(store.taskOf(id, full).task.run_id, full)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+})
 function foreignFact(store, taskId, kind = 'artifact', foreignRun = 'scope-b') {
   return store.open().prepare('INSERT INTO fact(task_id,kind,statement,evidence_path,confidence,created_by,run_id,created_at) VALUES(?,?,?,?,?,?,?,?)')
     .run(taskId, kind, 'FOREIGN_SECRET', 'FOREIGN_PATH', 'CONFIRMED', 'FOREIGN_ACTOR', foreignRun, '9999-01-01').lastInsertRowid

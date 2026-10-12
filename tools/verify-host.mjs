@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { TASKFORCE_DEFINITION } from '../lib/preset.js'
 import { foldSubagentFlow } from '../lib/plugins/working-context.mjs'
 import { foldGuardSignal } from '../lib/plugins/guard.mjs'
@@ -20,15 +20,15 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
   const fixture = await controlledProfile(anchor, ROOT)
   // Native shutdown may force process.exit on failed/stuck disposal, bypassing
   // finally. This synchronous exit hook still removes our disposable home.
-  const emergencyCleanup = () => fixture.dispose()
+  const emergencyCleanup = () => fixture.emergencyDispose()
   process.once('exit', emergencyCleanup)
   const checks = []
   let application
   const handles = []
+  const failures = []
   const pass = (name) => { checks.push(name); console.log(`HOST_PASS: ${name}`) }
   try {
-    const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
-    application = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+    application = await fixture.runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
       patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     // Trusted test hook for native cleanup failure injection; not a CLI flag.
     configureShutdown?.(application, fixture.root)
@@ -390,18 +390,28 @@ export async function verifyHost({ installAnchor, installDir, configureShutdown 
     await healthy()
     pass('native registration failure and explicit recovery')
     return { ok: true, dsh: installationVersion(anchor), node: process.version, checks }
-  } finally {
+  } catch (error) { failures.push(error) }
+  finally {
     try {
-      try { for (const handle of handles.reverse()) await handle.dispose() }
+      try {
+        for (const handle of handles.reverse()) {
+          try { await fixture.teardown(() => handle.dispose()) } catch (error) { failures.push(error) }
+        }
+      }
       // Native shutdown forces the supplied code on rejection/cleanup timeout.
       // Keep failure selected until every disposer and fixture cleanup returns.
-      finally { await application?.shutdown.shutdown(1) }
+      finally { try { await fixture.shutdown(1) } catch (error) { failures.push(error) } }
     } finally {
-      fixture.dispose()
-      process.removeListener('exit', emergencyCleanup)
-      assert.equal(existsSync(fixture.root), false, 'isolated home leaked')
-      process.exitCode = previousExitCode
+      try { fixture.dispose(); assert.equal(existsSync(fixture.root), false, 'isolated home leaked') }
+      catch (error) { failures.push(error) }
+      finally {
+        if (fixture.isDisposed()) process.off('exit', emergencyCleanup)
+        else fixture.whenDisposed.then(() => process.off('exit', emergencyCleanup))
+        process.exitCode = previousExitCode
+      }
     }
+    if (failures.length === 1) throw failures[0]
+    if (failures.length) throw new AggregateError(failures, 'native verification and cleanup failed')
   }
 }
 

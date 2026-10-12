@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { tempStore } from './helpers.mjs'
+import { TaskforceStore } from '../../lib/store/index.js'
 import { apply, foldSubagentFlow, readStoreState, renderWorkingContext } from '../../lib/plugins/working-context.mjs'
 
 const call = id => ({ type: 'tool/call', data: { name: 'subagent', callId: id } })
@@ -103,3 +104,21 @@ test('legacy store adapters include submitted/rejected tasks in active counts', 
   const store = { stats() { return { tasks: { open: 1, claimed: 2, submitted: 3, rejected: 4 } } } }
   assert.equal(readStoreState(store, 'a').activeTasks, 10)
 })
+
+for (const title of ['\0Preserve the migration boundary', 'Keep\0the migration boundary', 'Migration boundary\0', 'Tordinary', 'J"literal"', 'literal\\u0000', '中文🙂']) {
+  test(`Task19 accepted title remains in working context: ${JSON.stringify(title)}`, t => {
+    const store = tempStore(t), run = 'task19-working', id = store.openTask({ title }, run).task_id
+    const creationHandle = store.open()
+    function check(reader) {
+      const cell = reader.open().prepare('SELECT json_quote(title) AS title_json, typeof(title) AS title_type FROM task WHERE id=?').get(id)
+      assert.equal(cell.title_type, 'text'); assert.equal(JSON.parse(cell.title_json), title)
+      assert.deepEqual(reader.workingState(run), { activeTasks: 1, factCount: 0, task: { id, title } })
+      assert.deepEqual(readStoreState(reader, run), { activeTasks: 1, factCount: 0, task: { id, title } })
+      assert.deepEqual(reader.workingState('other-run'), { activeTasks: 0, factCount: 0 })
+    }
+    assert.equal(store.open(), creationHandle); check(store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try { assert.notEqual(reopened.open(), creationHandle); check(reopened) } finally { reopened.close() }
+  })
+}

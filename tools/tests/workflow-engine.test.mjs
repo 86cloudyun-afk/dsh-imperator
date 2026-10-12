@@ -5,6 +5,7 @@ import { writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { Worker } from 'node:worker_threads'
+import { DatabaseSync } from 'node:sqlite'
 import { TaskforceStore } from '../../lib/store/index.js'
 import { TaskforceGovernor } from '../../lib/governor/index.js'
 import { TaskforceRecovery } from '../../lib/store/recovery.js'
@@ -20,11 +21,12 @@ const module = await import('../../lib/workflow/index.js').catch(error => {
 const run = ' workflow-run ', lead = { sessionId: run, isRoot: true }
 const worker = { sessionId: ' worker ', isRoot: false }
 const reviewer = { sessionId: ' reviewer ', isRoot: false }
-function fixture(t) {
+function fixture(t, options = {}, identities = { run, lead, worker, reviewer }) {
+  const { run, lead, worker, reviewer } = identities
   assert.equal(typeof module.TaskforceWorkflow, 'function', 'workflow core must be implemented')
   let store
   t.after(() => store?.close())
-  store = tempStore(t); store.open()
+  store = tempStore(t, options); store.open()
   writeFileSync(join(store.root, 'source.js'), 'export const answer = 42\n')
   let flow = new module.TaskforceWorkflow(store)
   let sequence = 0, executions = 0
@@ -60,6 +62,169 @@ function fixture(t) {
   }
   return { get store() { return store }, get flow() { return flow }, actor, create, change, claim, open, verify, artifact, review, accept, key, reopen, executions: () => executions }
 }
+
+test('Task16 workflow carries complete run, owner and independent reviewer through real evidence and replay', async t => {
+  const full = 'root\0suffix', owner = { sessionId: 'writer\0suffix', isRoot: false }
+  const f = fixture(t, {}, { run: full, lead: { sessionId: full, isRoot: true }, worker: owner,
+    reviewer: { sessionId: 'writer\0independent', isRoot: false } })
+  const id = f.open(); await f.artifact(id); f.review(id)
+  assert.equal(f.store.taskOf(id, full).task.owner_session, owner.sessionId)
+  assert.throws(() => f.flow.state({ task_id: id }, 'root'), { code: 'E_CROSS_RUN' })
+  f.store.submitTask({ task_id: id }, full, owner)
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, full).row_version, request_key: f.key() }
+  const accepted = f.store.acceptTask(args, full, { sessionId: full, isRoot: true })
+  assert.equal(accepted.status, 'accepted'); assert.equal(accepted.execution_verified, true)
+  assert.deepEqual(f.store.acceptTask(args, full, { sessionId: full, isRoot: true }), accepted)
+  assert.equal(f.executions(), 1)
+})
+
+for (const route of ['artifact metadata', 'review metadata', 'latest review']) {
+  test(`SQLite TEXT workflow ${route} preserves complete persisted identities`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const identity = 'reviewer\0中文😀e\u0301'
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', findings: ['finding\0suffix'] }, { sessionId: identity, isRoot: false })
+    const producer = worker.sessionId + '\0suffix'
+    f.store.open().prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(producer, id)
+    f.reopen()
+    const state = f.flow.state({ task_id: id, include_context: true }, run)
+    if (route === 'artifact metadata') assert.equal(state.artifacts[0].producer_session, producer)
+    if (route === 'review metadata') assert.equal(state.reviews[0].reviewer_session, identity)
+    if (route === 'latest review') assert.equal(state.context.latest_review.reviewer_session, identity)
+    assert.deepEqual(state.context.latest_review.findings, ['finding\0suffix'])
+  })
+}
+
+test('SQLite TEXT acceptance rejects a producer whose ordinary owner is only a prefix', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  f.store.open().prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(worker.sessionId + '\0suffix', id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const before = f.store.open().prepare('SELECT total_changes() AS n').get().n
+  assert.throws(() => f.store.acceptTask({ task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version,
+    request_key: f.key() }, run, lead), { code: 'E_WORKFLOW_EVIDENCE' })
+  assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+  assert.equal(f.store.open().prepare('SELECT total_changes() AS n').get().n, before)
+})
+
+for (const exact of [false, true]) {
+  test(`SQLite TEXT acceptance uses ${exact ? 'exact' : 'distinct prefix'} reviewer writer history`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id)
+    const identity = 'auditor\0suffix'
+    f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
+      requirements_result: 'pass', quality_result: 'pass', findings: [] }, { sessionId: identity, isRoot: false })
+    f.store.open().prepare('INSERT INTO workflow_writer(task_id,run_id,evidence_generation,session_id) VALUES(?,?,?,?)').run(id, run, 0, exact ? identity : 'auditor')
+    if (exact) assert.throws(() => f.accept(id), { code: 'E_WORKFLOW_EVIDENCE' })
+    else assert.equal(f.accept(id).execution_verified, true)
+    assert.equal(f.store.taskOf(id, run).task.status, exact ? 'submitted' : 'accepted')
+  })
+}
+
+for (const route of ['artifacts', 'reviews', 'latest', 'accept artifact', 'accept review']) {
+  test(`SQLite TEXT workflow ${route} rejects corrupt evidence before output or acceptance`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    f.store.submitTask({ task_id: id }, run, worker)
+    const version = f.flow.state({ task_id: id }, run).row_version
+    const db = f.store.open(), prepare = db.prepare.bind(db), before = db.prepare('SELECT total_changes() AS n').get().n
+    let corruptReads = 0, writerLookups = 0, writerGets = 0
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      if (sql === 'SELECT 1 FROM workflow_writer WHERE task_id=? AND session_id=? LIMIT 1') {
+        writerLookups++
+        const get = statement.get.bind(statement)
+        statement.get = (...args) => { writerGets++; return get(...args) }
+      }
+      const match = route === 'artifacts' ? sql.startsWith('SELECT id AS revision_id,receipt_id,')
+        : route === 'reviews' ? sql.startsWith('SELECT id,revision_id,evidence_generation,reviewer_session,')
+          : route === 'latest' ? sql.startsWith('SELECT id,revision_id,plan_version,evidence_generation,reviewer_session,')
+            : route === 'accept artifact' ? sql.includes("THEN 'J'||json_quote(") && sql.includes('FROM workflow_artifact')
+              : sql.includes("THEN 'J'||json_quote(") && sql.includes('FROM workflow_review')
+      if (match) {
+        const method = ['artifacts', 'reviews'].includes(route) ? 'all' : 'get', read = statement[method].bind(statement)
+        const corrupt = row => {
+          corruptReads++
+          if (route.startsWith('accept')) row[route === 'accept artifact' ? 'producer_session' : 'reviewer_session'] = 'J"private sentinel"'
+          else row[route.includes('artifact') ? '__imperator_nul_producer_session' : '__imperator_nul_reviewer_session'] = '"private sentinel"'
+          return row
+        }
+        statement[method] = (...args) => { const result = read(...args); return method === 'all' ? result.map(corrupt) : corrupt(result) }
+      }
+      return statement
+    }
+    assert.throws(() => route.startsWith('accept')
+      ? f.store.acceptTask({ task_id: id, expected_version: version, request_key: f.key() }, run, lead)
+      : f.flow.state({ task_id: id, include_context: true }, run), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(corruptReads, 1); assert.equal(writerLookups, 0); assert.equal(writerGets, 0)
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    assert.equal(db.isTransaction, false)
+    assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+  })
+}
+
+for (const table of ['workflow_artifact', 'workflow_review']) {
+  test(`SQLite TEXT acceptance retains legacy ${table} columns and native integer errors`, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    const db = f.store.open(), field = table === 'workflow_artifact' ? 'producer_session' : 'reviewer_session'
+    db.exec(`ALTER TABLE ${table} ADD COLUMN __imperator_nul_${field} TEXT; ALTER TABLE ${table} ADD COLUMN "__proto__" TEXT;`
+      + ` ALTER TABLE ${table} ADD COLUMN constructor INTEGER; ALTER TABLE ${table} ADD COLUMN "2" TEXT;`
+      + ` ALTER TABLE ${table} ADD COLUMN extra_blob BLOB; ALTER TABLE ${table} ADD COLUMN extra_null; ALTER TABLE ${table} ADD COLUMN extra_integer INTEGER`)
+    db.prepare(`UPDATE ${table} SET __imperator_nul_${field}=?,"__proto__"=?,constructor=27,"2"=?,extra_blob=?,extra_integer=? WHERE task_id=?`)
+      .run('legacy companion', 'prototype data', 'two', new Uint8Array([0,255]), 9007199254740993n, id)
+    f.store.submitTask({ task_id: id }, run, worker)
+    const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+    const before = db.prepare('SELECT total_changes() AS n').get().n
+    assert.throws(() => f.store.acceptTask(args, run, lead), { code: 'ERR_OUT_OF_RANGE' })
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
+    db.prepare(`UPDATE ${table} SET extra_integer=42 WHERE task_id=?`).run(id)
+    assert.equal(f.store.acceptTask(args, run, lead).execution_verified, true)
+  })
+}
+
+test('SQLite TEXT acceptance factories prepare metadata without executing either original star', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  f.store.submitTask({ task_id: id }, run, worker)
+  const version = f.flow.state({ task_id: id }, run).row_version
+  const db = f.store.open(), prepare = db.prepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if ((sql.startsWith('SELECT * FROM') || sql.includes("THEN 'J'||json_quote(")) && / FROM workflow_(artifact|review) WHERE/.test(sql)) {
+      const record = { table: sql.includes('FROM workflow_artifact') ? 'artifact' : 'review',
+        original: sql.startsWith('SELECT *'), get: 0, all: 0, iterate: 0, run: 0 }
+      records.push(record)
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const execute = statement[method].bind(statement)
+        statement[method] = (...args) => { record[method]++; return execute(...args) }
+      }
+    }
+    return statement
+  }
+  assert.equal(f.store.acceptTask({ task_id: id, expected_version: version, request_key: f.key() }, run, lead).execution_verified, true)
+  assert.deepEqual(records, ['artifact', 'review'].flatMap(table => [
+    { table, original: true, get: 0, all: 0, iterate: 0, run: 0 },
+    { table, original: false, get: 1, all: 0, iterate: 0, run: 0 },
+  ]))
+  t.diagnostic('acceptance SQL lifecycle=' + JSON.stringify(records))
+})
+
+test('SQLite TEXT workflow history still caps metadata at the twenty newest complete rows', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  const db = f.store.open(), producer = 'producer\0suffix', reviewIdentity = 'reviewer\0suffix'
+  db.prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(producer, id)
+  db.prepare('UPDATE workflow_review SET reviewer_session=? WHERE task_id=?').run(reviewIdentity, id)
+  for (let i = 0; i < 20; i++) {
+    db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) SELECT task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at FROM workflow_artifact WHERE task_id=? ORDER BY id LIMIT 1').run(id)
+    db.prepare('INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at FROM workflow_review WHERE task_id=? ORDER BY id LIMIT 1').run(id)
+  }
+  const before = db.prepare('SELECT total_changes() AS n').get().n
+  const state = f.flow.state({ task_id: id, include_context: true }, run)
+  assert.equal(state.history_truncated, true)
+  assert.deepEqual(state.artifacts.map(row => row.revision_id), Array.from({ length: 20 }, (_, i) => 21 - i))
+  assert.deepEqual(state.reviews.map(row => row.id), Array.from({ length: 20 }, (_, i) => 21 - i))
+  assert.ok(state.artifacts.every(row => row.producer_session === producer))
+  assert.ok(state.reviews.every(row => row.reviewer_session === reviewIdentity))
+  assert.equal(state.context.latest_review.reviewer_session, reviewIdentity)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+})
 
 // Replacing the template with legacy policy or accepting model provenance breaks these.
 test('coding creation is atomic, defaults strict execution, and preserves ordinary legacy tasks', t => {
@@ -520,6 +685,159 @@ function deliveryRows(f, id) {
   return Object.fromEntries(['workflow', 'workflow_artifact', 'workflow_review', 'workflow_decision', 'execution_receipt']
     .map(table => [table, f.store.open().prepare('SELECT * FROM ' + table + ' WHERE task_id=? ORDER BY rowid').all(id)]))
 }
+function terminalRows(f, id) {
+  return { task: f.store.open().prepare('SELECT * FROM task WHERE id=?').get(id), ...deliveryRows(f, id),
+    ...Object.fromEntries(['fact', 'task_event', 'task_dependency', 'task_dependency_fence', 'workflow_writer']
+      .map(table => [table, f.store.open().prepare('SELECT * FROM ' + table + ' WHERE task_id=? ORDER BY rowid').all(id)])) }
+}
+
+// Removing the terminal guard must permit these first, correctly versioned
+// decisions after normal cancellation; neither test constructs terminal rows.
+test('cancelled plan refuses a first approval without writes before and after database reopen', t => {
+  const f = fixture(t), id = f.create().task_id
+  const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+  assert.equal(f.store.closeTask({ task_id: id, result: 'failed' }, run, lead).status, 'cancelled')
+  const before = terminalRows(f, id)
+  for (const reopen of [false, true]) {
+    if (reopen) f.reopen()
+    assert.equal(f.flow.state({ task_id: id }, run).task_status, 'cancelled')
+    assert.equal(f.flow.ready({}, run).tasks.some(row => row.task_id === id), false)
+    assert.throws(() => f.flow.approvePlan(args, run, f.actor), { code: 'E_TERMINAL' })
+    assert.deepEqual(terminalRows(f, id), before)
+  }
+})
+
+test('cancellation committed on another connection refuses the prepared first review without writes', async t => {
+  const f = fixture(t), id = f.open(), artifact = await f.artifact(id)
+  const peer = new TaskforceStore(f.store.root); t.after(() => peer.close())
+  const peerFlow = new module.TaskforceWorkflow(peer)
+  const args = { task_id: id, expected_version: peerFlow.state({ task_id: id }, run).row_version, request_key: f.key(),
+    revision_id: artifact.revision_id, requirements_result: 'pass', quality_result: 'pass', findings: [] }
+  assert.equal(f.store.closeTask({ task_id: id, result: 'failed' }, run, lead).status, 'cancelled')
+  const before = terminalRows(f, id)
+  assert.equal(peerFlow.state({ task_id: id }, run).row_version, args.expected_version)
+  assert.throws(() => peerFlow.recordReview(args, run, reviewer), { code: 'E_TERMINAL' })
+  assert.deepEqual(terminalRows({ store: peer }, id), before)
+  f.reopen()
+  assert.throws(() => f.flow.recordReview({ ...args, request_key: f.key() }, run, reviewer), { code: 'E_TERMINAL' })
+  assert.deepEqual(terminalRows(f, id), before)
+})
+
+for (const status of ['accepted', 'cancelled', 'done', 'partial', 'failed']) {
+  test(status + ' task refuses every new ordinary workflow mutation before version checks', async t => {
+    const f = fixture(t), id = f.create().task_id
+    if (status === 'accepted') {
+      f.change('approvePlan', id); f.claim(id); await f.artifact(id); f.review(id); f.accept(id)
+    } else if (status === 'cancelled') {
+      f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+    } else {
+      // Persisted compatibility fixture only: today's close(done/partial)
+      // submits, and close(failed) cancels; none creates these legacy statuses.
+      f.store.open().prepare('UPDATE task SET status=? WHERE id=?').run(status, id)
+    }
+    f.reopen()
+    const state = f.flow.state({ task_id: id }, run), before = terminalRows(f, id)
+    assert.equal(state.task_status, status)
+    for (const expected_version of [state.row_version, 0]) {
+      for (const [method, extra, actor] of [
+        ['setDependencies', { prerequisite_task_ids: [] }, f.actor],
+        ['approvePlan', {}, f.actor],
+        ['recordArtifact', {}, worker],
+        ['recordReview', { revision_id: state.revision_id, requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer],
+      ]) {
+        assert.throws(() => f.flow[method]({ task_id: id, expected_version, request_key: f.key(), ...extra }, run, actor),
+          { code: 'E_TERMINAL' }, method + ' on ' + status)
+        assert.deepEqual(terminalRows(f, id), before)
+      }
+    }
+  })
+}
+
+for (const status of ['cancelled', 'accepted']) {
+  test('original workflow requests replay read-only after ' + status + ' and database reopen', async t => {
+    const f = fixture(t), id = f.create().task_id, requests = []
+    const record = (method, extra, actor) => {
+      const args = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key(), ...extra }
+      const result = f.flow[method](args, run, actor)
+      requests.push({ method, args, actor, result })
+      return result
+    }
+    record('setDependencies', { prerequisite_task_ids: [] }, f.actor)
+    record('approvePlan', {}, f.actor); f.claim(id); await f.verify(id)
+    const artifact = record('recordArtifact', {}, worker)
+    record('recordReview', { revision_id: artifact.revision_id, requirements_result: 'pass', quality_result: 'pass', findings: [] }, reviewer)
+    let acceptArgs, accepted
+    if (status === 'cancelled') f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+    else {
+      f.store.submitTask({ task_id: id }, run, worker)
+      acceptArgs = { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() }
+      accepted = f.store.acceptTask(acceptArgs, run, lead)
+    }
+    f.reopen()
+    const before = terminalRows(f, id)
+    for (const { method, args, actor, result } of requests) {
+      assert.deepEqual(f.flow[method](args, run, actor), result)
+      assert.throws(() => f.flow[method]({ ...args, request_key: f.key() }, run, actor), { code: 'E_TERMINAL' })
+      assert.throws(() => f.flow[method]({ ...args, expected_version: args.expected_version + 1 }, run, actor), { code: 'E_WORKFLOW_REPLAY' })
+      assert.deepEqual(terminalRows(f, id), before)
+    }
+    const review = requests.at(-1)
+    assert.throws(() => f.flow.recordReview(review.args, run, { ...reviewer, sessionId: 'other reviewer' }), { code: 'E_WORKFLOW_REPLAY' })
+    if (accepted) assert.deepEqual(f.store.acceptTask(acceptArgs, run, lead), accepted)
+    assert.deepEqual(terminalRows(f, id), before)
+    const returned = f.change('returnForRework', id, { reason: 'explicit terminal reconsideration' })
+    assert.equal(returned.reopened, true)
+    assert.equal(returned.previous_status, status)
+    const reopened = terminalRows(f, id)
+    assert.equal(reopened.task.status, 'rejected')
+    assert.equal(reopened.task.evidence_generation, 1)
+    assert.equal(reopened.workflow[0].rework_count, 1)
+    for (const { method, args, actor, result } of requests) assert.deepEqual(f.flow[method](args, run, actor), result)
+    if (accepted) assert.deepEqual(f.store.acceptTask(acceptArgs, run, lead), accepted)
+    assert.deepEqual(terminalRows(f, id), reopened)
+  })
+}
+
+test('terminal tasks preserve root role, run and attached-record integrity checks before replay', t => {
+  const f = fixture(t), id = f.create().task_id
+  const args = { task_id: id, expected_version: 1, request_key: f.key() }
+  const approved = f.flow.approvePlan(args, run, f.actor)
+  f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+  const before = terminalRows(f, id)
+  assert.throws(() => f.flow.approvePlan(args, run, worker), { code: 'E_WORKFLOW_ROLE' })
+  assert.throws(() => f.flow.approvePlan(args, run, { sessionId: 'foreign root', isRoot: true }), { code: 'E_WORKFLOW_ROLE' })
+  assert.throws(() => f.flow.approvePlan(args, 'foreign run', { sessionId: 'foreign run', isRoot: true }), { code: 'E_CROSS_RUN' })
+  assert.deepEqual(f.flow.approvePlan(args, run, f.actor), approved)
+  assert.deepEqual(terminalRows(f, id), before)
+  f.store.open().prepare('UPDATE workflow_decision SET run_id=? WHERE task_id=? AND request_key=?').run('private foreign record', id, args.request_key)
+  const damaged = terminalRows(f, id)
+  for (const request_key of [args.request_key, f.key()]) {
+    assert.throws(() => f.flow.approvePlan({ ...args, request_key }, run, f.actor),
+      error => error.code === 'E_STORE_INTEGRITY' && !error.message.includes('private foreign record'))
+    assert.deepEqual(terminalRows(f, id), damaged)
+  }
+})
+
+test('explicit root return reopens a cancelled plan for fresh approval and verified acceptance', async t => {
+  const f = fixture(t), id = f.create({ max_reworks: 1 }).task_id
+  f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+  f.reopen()
+  const before = terminalRows(f, id)
+  assert.throws(() => f.change('returnForRework', id, { reason: 'worker cannot reopen' }, worker), { code: 'E_WORKFLOW_ROLE' })
+  assert.deepEqual(terminalRows(f, id), before)
+  assert.equal(f.change('returnForRework', id, { reason: 'root authorizes another attempt' }).reopened, true)
+  const returned = f.flow.state({ task_id: id }, run)
+  assert.equal(returned.stage, 'plan')
+  assert.equal(returned.evidence_generation, 1)
+  assert.equal(returned.rework_count, 1)
+  assert.throws(() => f.claim(id), { code: 'E_WORKFLOW_STAGE' })
+  f.change('approvePlan', id); f.claim(id); await f.artifact(id); f.review(id)
+  assert.equal(f.accept(id).execution_verified, true)
+  const accepted = terminalRows(f, id)
+  assert.throws(() => f.change('returnForRework', id, { reason: 'budget exhausted' }), { code: 'E_WORKFLOW_BUDGET' })
+  assert.deepEqual(terminalRows(f, id), accepted)
+})
+
 function outcomeReview(f, id, result) {
   return f.change('recordReview', id, { revision_id: f.flow.state({ task_id: id }, run).revision_id,
     requirements_result: result, quality_result: 'pass', findings: result === 'pass' ? [] : ['requires root decision'] }, reviewer)
@@ -934,18 +1252,35 @@ for (const damage of ['source', 'log']) for (const budget of [0, 1]) {
     const f = fixture(t), id = f.open({ max_reworks: budget }); await f.artifact(id); f.review(id)
     f.store.submitTask({ task_id: id }, run, worker)
     const before = deliveryRows(f, id), call = workflowToolCaller(f), db = f.store.open(), prepare = db.prepare
-    let receiptReads = 0
+    let receiptReads = 0, originalExecutions = 0, injections = 0
+    const generatedCalls = { get: 0, all: 0, iterate: 0, run: 0 }
     // Inject an actual file mutation precisely between the two real strict reads;
     // every statement still executes on the real SQLite connection.
     db.prepare = function(sql) {
-      if (sql === 'SELECT * FROM execution_receipt WHERE task_id = ? AND run_id IS ? ORDER BY id DESC LIMIT 1' && ++receiptReads === 2) damageEvidence(f, id, damage)
-      return prepare.call(this, sql)
+      const statement = prepare.call(this, sql)
+      if (sql.endsWith(' FROM execution_receipt WHERE task_id = ? AND run_id IS ? ORDER BY id DESC LIMIT 1')) {
+        const original = sql.startsWith('SELECT *')
+        for (const method of ['get', 'all', 'iterate', 'run']) {
+          const read = statement[method].bind(statement)
+          statement[method] = (...args) => {
+            if (original) originalExecutions++
+            else {
+              generatedCalls[method]++
+              if (method === 'get' && ++receiptReads === 2) { damageEvidence(f, id, damage); injections++ }
+            }
+            return read(...args)
+          }
+        }
+      }
+      return statement
     }
     let response
     try {
       response = await call('task_accept', { task_id: id, expected_version: f.flow.state({ task_id: id }, run).row_version, request_key: f.key() })
     } finally { db.prepare = prepare }
     assert.equal(receiptReads, 2, 'retain both real strict evidence checks')
+    assert.equal(originalExecutions, 0); assert.equal(injections, 1)
+    assert.deepEqual(generatedCalls, { get: 2, all: 0, iterate: 0, run: 0 })
     assert.equal(response.ok, false); assertWorkflowRecovery(response, 'E_WORKFLOW_EVIDENCE', budget)
     assert.deepEqual(deliveryRows(f, id), before)
     assert.equal(f.store.taskOf(id, run).task.status, 'submitted')
@@ -993,4 +1328,247 @@ test('sole current delivery accepts with zero budget and completed request repla
   assert.deepEqual(f.store.acceptTask(acceptArgs, run, lead), accepted)
   assert.deepEqual(deliveryRows(f, id), before)
   assert.equal(f.flow.state({ task_id: id }, run).rework_count, 0)
+})
+
+// Dropping include_context, parsing outside the authorized snapshot, coercing
+// its Boolean, or weakening any currentness fence must break these assertions.
+test('explicit workflow context restores the exact plan and failed findings after reopen without writes', async t => {
+  const f = fixture(t)
+  const plan = { objective: '保留完整计划 “quoted”\nnext', scope: ['source.js', '边界'], non_goals: ['publish'], deliverables: ['tested \\ source'] }
+  const findings = ['缺少边界测试\nsecond line', 'preserve "quotes" and \\ slashes']
+  const id = f.open({ plan }), artifact = await f.artifact(id)
+  const reviewed = f.change('recordReview', id, { revision_id: artifact.revision_id,
+    requirements_result: 'fail', quality_result: 'unverified', findings }, reviewer)
+  const compact = f.flow.state({ task_id: id }, run), rows = terminalRows(f, id), executions = f.executions()
+  f.reopen()
+  const db = f.store.open(), changes = db.prepare('SELECT total_changes() AS n').get().n
+  const restored = f.flow.state({ task_id: id, include_context: true }, run)
+  assert.deepEqual(restored.context.plan, plan)
+  const storedReview = db.prepare('SELECT id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,created_at FROM workflow_review WHERE id=?').get(reviewed.review_id)
+  assert.deepEqual(restored.context.latest_review, { ...storedReview, findings, is_current: true })
+  const { context, ...metadata } = restored
+  assert.deepEqual(metadata, compact)
+  assert.deepEqual(f.flow.state({ task_id: id }, run), compact)
+  assert.deepEqual(f.flow.state({ task_id: id, include_context: false }, run), compact)
+  assert.equal(Object.hasOwn(compact, 'context'), false)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  assert.deepEqual(terminalRows(f, id), rows)
+  assert.equal(f.executions(), executions)
+})
+
+test('explicit workflow context has a null latest review before the first review and remains readable when terminal', t => {
+  const f = fixture(t), id = f.create().task_id
+  const before = f.flow.state({ task_id: id, include_context: true }, run)
+  assert.equal(before.context.latest_review, null)
+  f.store.closeTask({ task_id: id, result: 'failed' }, run, lead)
+  const db = f.store.open(), changes = db.prepare('SELECT total_changes() AS n').get().n
+  const terminal = f.flow.state({ task_id: id, include_context: true }, run)
+  assert.equal(terminal.task_status, 'cancelled')
+  assert.deepEqual(terminal.context, before.context)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+})
+
+test('explicit workflow context preserves historical review after real rework and uses the newest review', async t => {
+  const f = fixture(t), id = f.open(), artifact = await f.artifact(id)
+  const first = f.change('recordReview', id, { revision_id: artifact.revision_id,
+    requirements_result: 'fail', quality_result: 'pass', findings: ['fix boundary'] }, reviewer)
+  assert.equal(f.flow.state({ task_id: id, include_context: true }, run).context.latest_review.is_current, true)
+  f.change('returnForRework', id, { reason: 'fix boundary' })
+  f.reopen()
+  let context = f.flow.state({ task_id: id, include_context: true }, run).context
+  assert.equal(context.latest_review.id, first.review_id)
+  assert.equal(context.latest_review.is_current, false)
+  assert.deepEqual(context.latest_review.findings, ['fix boundary'])
+  f.claim(id); await f.artifact(id)
+  assert.equal(f.flow.state({ task_id: id, include_context: true }, run).context.latest_review.is_current, false)
+  const second = f.review(id)
+  context = f.flow.state({ task_id: id, include_context: true }, run).context
+  assert.equal(context.latest_review.id, second.review_id)
+  assert.equal(context.latest_review.is_current, true)
+  assert.deepEqual(context.latest_review.findings, [])
+  f.accept(id)
+  assert.equal(f.flow.state({ task_id: id, include_context: true }, run).context.latest_review.is_current, true)
+})
+
+for (const fence of ['revision_id', 'plan_version', 'evidence_generation']) {
+  test('explicit workflow context currentness independently compares ' + fence, async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    const db = f.store.open(), table = fence === 'evidence_generation' ? 'task' : 'workflow'
+    const column = table === 'task' ? 'id' : 'task_id'
+    db.prepare('UPDATE ' + table + ' SET ' + fence + '=' + fence + '+1 WHERE ' + column + '=?').run(id)
+    const changes = db.prepare('SELECT total_changes() AS n').get().n
+    const state = f.flow.state({ task_id: id, include_context: true }, run)
+    assert.equal(state.context.latest_review.is_current, false)
+    assert.equal(state.context.latest_review[fence], state[fence] - 1)
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  })
+}
+
+test('workflow context flag is a strict optional Boolean and cannot forge direct API scope', t => {
+  const f = fixture(t), id = f.create().task_id, db = f.store.open()
+  const changes = db.prepare('SELECT total_changes() AS n').get().n
+  for (const include_context of [null, 0, 1, '', 'true', 'false', [], {}]) {
+    assert.throws(() => f.flow.state({ task_id: id, include_context }, run), { code: 'E_WORKFLOW_INPUT' })
+  }
+  assert.deepEqual(f.flow.state({ task_id: id, include_context: undefined }, run), f.flow.state({ task_id: id }, run))
+  assert.throws(() => f.flow.state({ task_id: id, include_context: true }, 'foreign'), { code: 'E_CROSS_RUN' })
+  assert.throws(() => f.flow.state({ task_id: id, include_context: true, run_id: run, actor: lead }, run), { code: 'E_WORKFLOW_INPUT' })
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+})
+
+for (const table of ['workflow', 'workflow_review', 'workflow_artifact']) {
+  test('explicit workflow context refuses mixed-run ' + table + ' without data disclosure', async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    const db = f.store.open()
+    db.prepare('UPDATE ' + table + ' SET run_id=? WHERE task_id=?').run('foreign private sentinel', id)
+    const changes = db.prepare('SELECT total_changes() AS n').get().n
+    assert.throws(() => f.flow.state({ task_id: id, include_context: true }, run), error => {
+      assert.equal(error.code, 'E_STORE_INTEGRITY')
+      assert.doesNotMatch(error.message, /foreign|private sentinel/)
+      return true
+    })
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  })
+}
+
+test('explicit workflow context keeps its authorization and payload in one SQLite snapshot', async t => {
+  const f = fixture(t, { journalMode: 'wal' }), id = f.open(); await f.artifact(id); f.review(id)
+  const db = f.store.open(), originalPlan = JSON.parse(db.prepare('SELECT plan FROM workflow WHERE task_id=?').get(id).plan)
+  const writer = new DatabaseSync(f.store.dbPath); t.after(() => writer.close())
+  const prepare = db.prepare.bind(db)
+  let fired = false
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if (sql.endsWith(' FROM workflow WHERE task_id=?') && sql.includes("THEN 'J'||json_quote(")) {
+      const get = statement.get.bind(statement)
+      statement.get = (...args) => {
+        const result = get(...args)
+        if (!fired) {
+          fired = true
+          writer.exec('BEGIN IMMEDIATE')
+          writer.prepare('UPDATE task SET run_id=? WHERE id=?').run('foreign', id)
+          writer.prepare('UPDATE workflow SET run_id=?,plan=? WHERE task_id=?').run('foreign', '{"secret":"FOREIGN_CONTEXT"}', id)
+          writer.prepare('UPDATE workflow_review SET run_id=?,findings=? WHERE task_id=?').run('foreign', '["FOREIGN_FINDINGS"]', id)
+          writer.exec('COMMIT')
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  t.after(() => { db.prepare = prepare })
+  const changes = db.prepare('SELECT total_changes() AS n').get().n
+  const state = f.flow.state({ task_id: id, include_context: true }, run)
+  assert.equal(fired, true, 'real second connection committed during the authorized read')
+  assert.deepEqual(state.context.plan, originalPlan)
+  assert.deepEqual(state.context.latest_review.findings, [])
+  assert.equal(state.context.latest_review.is_current, true)
+  assert.doesNotMatch(JSON.stringify(state), /FOREIGN_CONTEXT|FOREIGN_FINDINGS/)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  assert.equal(db.isTransaction, false)
+  assert.throws(() => f.flow.state({ task_id: id, include_context: true }, run), { code: 'E_CROSS_RUN' })
+})
+
+// Corrupt storage is intentionally seeded only for integrity tests; compact
+// reads must not suddenly parse context that was never requested.
+for (const part of ['plan', 'findings']) {
+  test('explicit workflow context validates stored ' + part + ' shape and its UTF-8 JSON budget generically', async t => {
+    const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+    const db = f.store.open(), compact = f.flow.state({ task_id: id }, run)
+    const goodPlan = { objective: 'private sentinel', scope: [], non_goals: [], deliverables: [] }
+    const invalid = part === 'plan' ? [
+      '{private sentinel', 'null', '[]', '"private sentinel"',
+      JSON.stringify({ ...goodPlan, extra: 'private sentinel' }),
+      JSON.stringify({ ...goodPlan, objective: '' }),
+      JSON.stringify({ ...goodPlan, objective: 'x'.repeat(4097) }),
+      JSON.stringify({ ...goodPlan, scope: 'private sentinel' }),
+      JSON.stringify({ ...goodPlan, scope: [1] }),
+      JSON.stringify({ ...goodPlan, scope: ['x'.repeat(513)] }),
+      JSON.stringify({ ...goodPlan, scope: Array(65).fill('x') }),
+      JSON.stringify({ ...goodPlan, non_goals: [null] }),
+      JSON.stringify({ ...goodPlan, deliverables: ['  '] }),
+      JSON.stringify({ objective: '界'.repeat(4096), scope: ['界'.repeat(512), '界'.repeat(512), '界'.repeat(512)], non_goals: [], deliverables: [] }),
+      JSON.stringify(goodPlan) + ' '.repeat(16384),
+    ] : [
+      '[private sentinel', 'null', '{}', '"private sentinel"', '[1]', '[null]', '[""]', '["  "]',
+      JSON.stringify(['x'.repeat(1025)]), JSON.stringify(Array(65).fill('x')),
+      JSON.stringify(Array(6).fill('界'.repeat(1024))), JSON.stringify(['private sentinel']) + ' '.repeat(16384),
+    ]
+    const table = part === 'plan' ? 'workflow' : 'workflow_review'
+    for (const encoded of invalid) {
+      db.prepare('UPDATE ' + table + ' SET ' + part + '=? WHERE task_id=?').run(encoded, id)
+      const changes = db.prepare('SELECT total_changes() AS n').get().n
+      assert.deepEqual(f.flow.state({ task_id: id }, run), compact)
+      assert.deepEqual(f.flow.state({ task_id: id, include_context: false }, run), compact)
+      assert.throws(() => f.flow.state({ task_id: id, include_context: true }, run), error => {
+        assert.equal(error.code, 'E_STORE_INTEGRITY')
+        assert.equal(error.message, 'workflow context storage is invalid')
+        return true
+      })
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+      assert.equal(db.isTransaction, false)
+    }
+  })
+}
+
+function fullContextPayload(escaped) {
+  const chunk = escaped ? '\u0000' : '界'
+  const factor = escaped ? 2 : 1
+  const plan = { objective: chunk.repeat(4096 / factor), scope: [chunk.repeat(512 / factor), chunk.repeat(512 / factor), 'x'.repeat(512)], non_goals: [], deliverables: [] }
+  plan.scope.push('x'.repeat(16384 - Buffer.byteLength(JSON.stringify(plan)) - 3))
+  const findings = Array(5).fill(chunk.repeat(1024 / factor))
+  findings.push('x'.repeat(16384 - Buffer.byteLength(JSON.stringify(findings)) - 3))
+  assert.equal(Buffer.byteLength(JSON.stringify(plan)), 16384)
+  assert.equal(Buffer.byteLength(JSON.stringify(findings)), 16384)
+  return { plan, findings }
+}
+
+for (const escaped of [false, true]) {
+  test('explicit workflow context prunes whole oldest metadata within the real tool byte budget: ' + (escaped ? 'JSON escapes' : 'Unicode'), async t => {
+    const f = fixture(t), { plan, findings } = fullContextPayload(escaped), id = f.open({ plan })
+    const artifact = await f.artifact(id)
+    f.change('recordReview', id, { revision_id: artifact.revision_id, requirements_result: 'fail', quality_result: 'fail', findings }, reviewer)
+    const db = f.store.open()
+    // Simulate bounded history from earlier writers. Every string is within
+    // existing writer String.length limits, even when its JSON expands 6x.
+    const producer = 'p' + '\u0000'.repeat(199), reviewerId = 'r' + '\u0000'.repeat(199)
+    db.prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(producer, id)
+    db.prepare('UPDATE workflow_review SET reviewer_session=? WHERE task_id=?').run(reviewerId, id)
+    for (let index = 1; index < 20; index++) {
+      const at = '2026-10-11T00:00:' + String(index).padStart(2, '0') + '.000Z'
+      db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) SELECT task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,? FROM workflow_artifact WHERE id=?').run(at, artifact.revision_id)
+      db.prepare('INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,? FROM workflow_review WHERE task_id=? ORDER BY id LIMIT 1').run(at, id)
+    }
+    const compact = f.flow.state({ task_id: id }, run)
+    assert.equal(compact.history_truncated, false)
+    const changes = db.prepare('SELECT total_changes() AS n').get().n
+    const state = f.flow.state({ task_id: id, include_context: true }, run)
+    const bytes = Buffer.byteLength(JSON.stringify({ ok: true, ...state }))
+    assert.ok(bytes <= 65536, 'actual success envelope must fit: ' + bytes)
+    assert.equal(state.history_truncated, true)
+    assert.deepEqual(state.context.plan, plan)
+    assert.deepEqual(state.context.latest_review.findings, findings)
+    assert.equal(state.context.latest_review.id, compact.reviews[0].id)
+    assert.ok(state.artifacts.length + state.reviews.length < 40)
+    assert.deepEqual(state.artifacts, compact.artifacts.slice(0, state.artifacts.length))
+    assert.deepEqual(state.reviews, compact.reviews.slice(0, state.reviews.length))
+    const removed = [...compact.artifacts.slice(state.artifacts.length), ...compact.reviews.slice(state.reviews.length)]
+    assert.ok(Buffer.byteLength(JSON.stringify({ ok: true, ...state, artifacts: [...state.artifacts, removed[0]] })) > 65536,
+      'pruning stops at the first whole-item boundary that fits')
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+    t.diagnostic('full context bytes=' + bytes + ', artifacts=' + state.artifacts.length + ', reviews=' + state.reviews.length)
+  })
+}
+
+test('explicit workflow context fails closed when essential metadata alone cannot fit the response', async t => {
+  const f = fixture(t), id = f.open(); await f.artifact(id); f.review(id)
+  const db = f.store.open()
+  db.prepare('UPDATE workflow_review SET reviewer_session=? WHERE task_id=?').run('private sentinel'.repeat(5000), id)
+  const changes = db.prepare('SELECT total_changes() AS n').get().n
+  assert.throws(() => f.flow.state({ task_id: id, include_context: true }, run), error => {
+    assert.equal(error.code, 'E_STORE_INTEGRITY')
+    assert.doesNotMatch(error.message, /private sentinel/)
+    return true
+  })
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
 })

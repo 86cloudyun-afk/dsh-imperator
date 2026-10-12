@@ -5,8 +5,279 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { TaskforceStore } from '../../lib/store/index.js'
-import { configureSqlite, normalizeSqliteError, normalizeSqliteOptions, withWriteTransaction } from '../../lib/store/sqlite.js'
+import { configureSqlite, normalizeSqliteError, normalizeSqliteOptions, withWriteTransaction,
+  sqliteTextCompanion, restoreSqliteText, prepareSqliteTextProjection } from '../../lib/store/sqlite.js'
 import { tempStore, seedSubmitted } from './helpers.mjs'
+
+test('SQLite TEXT primitives preserve native values, row shape, and integer conversion settings', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  db.exec('CREATE TABLE text_read(value, __companion TEXT, "__proto__" TEXT, constructor INTEGER, "12" TEXT, "2" TEXT, extra BLOB, empty, integer_value INTEGER, "", "odd""列😀")')
+  const samples = ['', 'plain', 'T', 'J', 'J"pretend"', 'Tordinary', '"json"', '\\u0000', '\0', 'left\0right', '中\0文😀e\u0301\r\n\u0001', null, 1.25, 42n, new Uint8Array([0,255])]
+  for (const value of samples) {
+    db.exec('DELETE FROM text_read')
+    db.prepare('INSERT INTO text_read VALUES(?,?,?,?,?,?,?,?,?,?,?)').run(value, 'legacy companion', 'prototype data', 27, 'twelve', 'two', new Uint8Array([0,255]), null, 42, 'empty name', 'quoted Unicode name')
+    const nativeStatement = db.prepare('SELECT * FROM text_read'), native = nativeStatement.get()
+    const projected = db.prepare('SELECT value, ' + sqliteTextCompanion('value', '__text') + ' FROM text_read')
+    const explicit = restoreSqliteText(projected.get(), 'value', '__text')
+    const expected = typeof value === 'bigint' ? Number(value) : value
+    assert.deepEqual(explicit.value, expected)
+    assert.deepEqual(Object.keys(explicit), ['value']); assert.equal(Object.getPrototypeOf(explicit), null)
+    const { statement: wildcard, restore } = prepareSqliteTextProjection(db, 'value', 'text_read', (projection = '*') => 'SELECT ' + projection + ' FROM text_read')
+    const encoded = wildcard.get(), row = restore(encoded)
+    assert.equal(row, encoded)
+    const descriptors = Object.getOwnPropertyDescriptors(native); descriptors.value.value = expected
+    assert.deepEqual(Object.getOwnPropertyDescriptors(row), descriptors)
+    assert.deepEqual(Object.keys(row), Object.keys(native)); assert.equal(Object.getPrototypeOf(row), null)
+    assert.deepEqual(wildcard.all().map(restore), [row])
+    db.prepare('UPDATE text_read SET integer_value=?').run(9007199254740993n)
+    assert.throws(() => wildcard.get(), { code: 'ERR_OUT_OF_RANGE' })
+    wildcard.setReadBigInts(true)
+    assert.equal(restore(wildcard.get()).integer_value, 9007199254740993n)
+    assert.equal(restore(wildcard.get()).constructor, 27n)
+    db.prepare('UPDATE text_read SET integer_value=?').run(42)
+    db.prepare('UPDATE text_read SET value=?').run(9007199254740993n)
+    const integers = prepareSqliteTextProjection(db, 'value', 'text_read', (projection = '*') => 'SELECT ' + projection + ' FROM text_read')
+    assert.throws(() => nativeStatement.get(), { code: 'ERR_OUT_OF_RANGE' })
+    assert.throws(() => integers.statement.get(), { code: 'ERR_OUT_OF_RANGE' })
+    integers.statement.setReadBigInts(true)
+    assert.equal(integers.restore(integers.statement.get()).value, 9007199254740993n)
+    db.exec('DELETE FROM text_read')
+    assert.equal(restore(wildcard.get()), undefined)
+    assert.deepEqual(wildcard.all().map(restore), [])
+    assert.equal(restoreSqliteText(projected.get(), 'value', '__text'), undefined)
+  }
+})
+
+test('Task16 target lists reject holes before factory or native calls and keep empty identifiers valid', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  db.exec('CREATE TABLE source(value, other, ""); INSERT INTO source VALUES(1,2,3)')
+  const inherited = new Array(1), proto = Object.create(Array.prototype)
+  proto[0] = 'value'; Object.setPrototypeOf(inherited, proto)
+  for (const fields of [new Array(1), ['value', ,], [, 'value'], inherited, ['value', undefined], [], ['value', 'value'], null, 1]) {
+    let factories = 0, prepares = 0, metadata = 0
+    const calls = { get: 0, all: 0, iterate: 0, run: 0 }
+    const tracked = { prepare(sql) {
+      prepares++; const statement = db.prepare(sql), columns = statement.columns.bind(statement)
+      statement.columns = () => { metadata++; return columns() }
+      for (const method of Object.keys(calls)) { const read = statement[method].bind(statement); statement[method] = (...args) => { calls[method]++; return read(...args) } }
+      return statement
+    } }
+    for (const suffix of ['', ' WHERE 0']) {
+      assert.throws(() => prepareSqliteTextProjection(tracked, fields, 'source', (projection = '*') => {
+        factories++; return 'SELECT ' + projection + ' FROM source' + suffix
+      }), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+      assert.equal(factories, 0); assert.equal(prepares, 0); assert.equal(metadata, 0)
+      assert.deepEqual(calls, { get: 0, all: 0, iterate: 0, run: 0 })
+    }
+  }
+  for (const fields of ['value', ['value'], ['value', 'other'], '', ['']]) {
+    const { statement, restore } = prepareSqliteTextProjection(db, fields, 'source', (projection = '*') => 'SELECT ' + projection + ' FROM source')
+    assert.deepEqual({ ...restore(statement.get()) }, { value: 1, other: 2, '': 3 })
+  }
+})
+
+test('Task16 multi-target projection keeps maximum native width and per-call empty result accounting', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  const names = ['value', 'other', '', '__proto__', '12', '2', 'odd"列', ...Array.from({ length: 1993 }, (_, i) => 'extra_' + i)]
+  const quote = name => '"' + name.replaceAll('"', '""') + '"'
+  db.exec('CREATE TABLE source(' + names.map(quote).join(',') + ')')
+  db.prepare('INSERT INTO source(value,other,"","__proto__","12","2","odd""列") VALUES(?,?,?,?,?,?,?)')
+    .run('left\0right', 'Jordinary', 'empty', 'prototype', 'twelve', 'two', 'quoted')
+  const original = db.prepare('SELECT * FROM source'), native = original.get()
+  assert.equal(original.columns().length, 2000); assert.equal(Object.keys(native).length, 2000)
+  for (const [method, suffix] of [['get', ''], ['all', ''], ['iterate', ''], ['get', ' WHERE 0'], ['all', ' WHERE 0']]) {
+    const observations = []
+    const tracked = { prepare(sql) {
+      const statement = db.prepare(sql), calls = { get: 0, all: 0, iterate: 0, run: 0 }; observations.push(calls)
+      for (const name of Object.keys(calls)) { const read = statement[name].bind(statement); statement[name] = (...args) => { calls[name]++; return read(...args) } }
+      return statement
+    } }
+    const { statement, restore } = prepareSqliteTextProjection(tracked, ['value', 'other'], 'source', (projection = '*') => 'SELECT ' + projection + ' FROM source' + suffix)
+    assert.equal(statement.columns().length, 2000)
+    const result = statement[method](), rows = method === 'get' ? [result] : [...result]
+    if (suffix) assert.deepEqual(rows.map(restore), method === 'get' ? [undefined] : [])
+    else for (const encoded of rows) {
+      assert.equal(restore(encoded), encoded); assert.equal(encoded.value, 'left\0right'); assert.equal(encoded.other, 'Jordinary')
+      const descriptors = Object.getOwnPropertyDescriptors(native); descriptors.value.value = 'left\0right'
+      assert.deepEqual(Object.getOwnPropertyDescriptors(encoded), descriptors)
+      assert.deepEqual(Object.keys(encoded), Object.keys(native)); assert.equal(Object.getPrototypeOf(encoded), null)
+    }
+    assert.deepEqual(observations, [{ get: 0, all: 0, iterate: 0, run: 0 }, { get: 0, all: 0, iterate: 0, run: 0, [method]: 1 }])
+  }
+})
+
+test('Task16 multi-target faults reject each transported field with exact native call and injection counts', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  db.exec('CREATE TABLE source(value, other); INSERT INTO source VALUES(1,2)')
+  for (const field of ['value', 'other']) for (const fault of ['metadata', 'missing', 'tag', 'descriptor']) {
+    const calls = [{ get: 0, all: 0, iterate: 0, run: 0 }, { get: 0, all: 0, iterate: 0, run: 0 }]
+    let prepares = 0, injections = 0
+    const tracked = { prepare(sql) {
+      const index = prepares++, statement = db.prepare(sql), columns = statement.columns.bind(statement)
+      statement.columns = () => { const result = columns(); if (index === 1 && fault === 'metadata') { result.find(c => c.name === field).name = 'wrong'; injections++ } return result }
+      for (const method of Object.keys(calls[index])) {
+        const read = statement[method].bind(statement)
+        statement[method] = (...args) => {
+          calls[index][method]++; const row = read(...args)
+          if (index === 1 && method === 'get') {
+            injections++
+            if (fault === 'missing') delete row[field]
+            if (fault === 'tag') row[field] = 'J"no NUL"'
+            if (fault === 'descriptor') Object.defineProperty(row, field, { writable: false })
+          }
+          return row
+        }
+      }
+      return statement
+    } }
+    assert.throws(() => {
+      const { statement, restore } = prepareSqliteTextProjection(tracked, ['value', 'other'], 'source', (projection = '*') => 'SELECT ' + projection + ' FROM source')
+      restore(statement.get())
+    }, { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
+    assert.deepEqual(calls, [{ get: 0, all: 0, iterate: 0, run: 0 }, { get: fault === 'metadata' ? 0 : 1, all: 0, iterate: 0, run: 0 }])
+  }
+})
+
+test('SQLite TEXT projection rejects malformed metadata, transports and native object descriptors', () => {
+  const metadata = [{ name: 'value' }, { name: 'other' }]
+  const prepare = (...args) => {
+    const first = args.length > 0 ? args[0] : metadata, second = args.length > 1 ? args[1] : metadata
+    let prepares = 0
+    return prepareSqliteTextProjection({ prepare() { const columns = prepares++ === 0 ? first : second; return { columns: () => columns } } },
+      'value', 'static_alias', projection => projection ?? 'original')
+  }
+  const invalid = work => assert.throws(work, { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+  for (const columns of [undefined, null, [], new Array(2), [null], [{ name: 1 }], [{ name: 'other' }],
+    [{ name: 'value' }, { name: 'value' }], [...metadata, { name: 'other' }]]) invalid(() => prepare(columns))
+  for (const columns of [undefined, null, [], [{ name: 'value' }], metadata.toReversed(), [...metadata, { name: 'extra' }],
+    [{ name: 'value' }, { name: 'changed' }]]) invalid(() => prepare(metadata, columns))
+  const { restore } = prepare(), row = value => Object.assign(Object.create(null), { value, other: 42 })
+  for (const value of ['', 'unmarked private sentinel', 'Xprivate sentinel', 'Tprivate\0sentinel', 'Jbad JSON',
+    'Jnull', 'J7', 'Jtrue', 'J[]', 'J{}', 'J"no NUL"', undefined, true, {}, [], new Uint16Array([1])]) invalid(() => restore(row(value)))
+  for (const value of [null, [], 7, 'Tvalue', {}, { value: 'Tvalue', other: 42 },
+    Object.assign(Object.create(null), { other: 42 }), Object.assign(row('Tvalue'), { extra: 1 }),
+    Object.assign(row('Tvalue'), { [Symbol('extra')]: 1 })]) invalid(() => restore(value))
+  for (const flag of ['writable', 'enumerable', 'configurable']) {
+    const value = row('Tvalue'); Object.defineProperty(value, 'value', { [flag]: false }); invalid(() => restore(value))
+  }
+  let getters = 0
+  for (const field of ['value', 'other']) {
+    const value = row('Tvalue'); Object.defineProperty(value, field, { get() { getters++; return 'private sentinel' } }); invalid(() => restore(value))
+  }
+  assert.equal(getters, 0)
+  const parse = JSON.parse
+  try {
+    JSON.parse = () => assert.fail('ordinary TEXT must not be parsed')
+    for (const text of ['', 'T', 'J', 'J"pretend"', '"JSON\\u0000literal"']) {
+      assert.equal(restore(row('T' + text)).value, text)
+      assert.equal(restoreSqliteText({ value: text, companion: null }, 'value', 'companion').value, text)
+    }
+  } finally { JSON.parse = parse }
+  assert.equal(restore(row('J"prefix\\u0000suffix"')).value, 'prefix\0suffix')
+  const native = Object.assign(new Error('native failure'), { code: 'ERR_SQLITE_ERROR' })
+  for (const db of [{ prepare() { throw native } }, { prepare() { return { columns() { throw native } } } }]) {
+    assert.throws(() => prepareSqliteTextProjection(db, 'value', 'f', () => 'query'), error => error === native)
+  }
+})
+
+test('SQLite TEXT projection executes only its replacement and refreshes columns after DDL', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  db.exec("CREATE TABLE source(value); INSERT INTO source VALUES('ordinary')")
+  const observations = []
+  const tracked = { prepare(sql) {
+    const statement = db.prepare(sql), record = { sql, get: 0, all: 0, iterate: 0, run: 0 }
+    observations.push(record)
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...args) => { record[method]++; return read(...args) }
+    }
+    statement.setReturnArrays = () => assert.fail('native object rows are required')
+    statement.setReadBigInts = () => assert.fail('helper must preserve integer mode')
+    return statement
+  } }
+  const query = (projection = '*') => 'SELECT ' + projection + ' FROM source AS caller_alias'
+  for (const added of [false, true]) {
+    if (added) db.exec('ALTER TABLE source ADD COLUMN "new""列"; UPDATE source SET "new""列"=42')
+    const { statement, restore } = prepareSqliteTextProjection(tracked, 'value', 'caller_alias', query)
+    const row = statement.get(); assert.equal(restore(row), row); assert.equal(row.value, 'ordinary')
+    if (added) assert.equal(row['new"列'], 42)
+    assert.deepEqual(Object.keys(row), added ? ['value', 'new"列'] : ['value'])
+  }
+  assert.equal(observations.length, 4)
+  assert.deepEqual(observations.map(({ sql, ...calls }) => calls), [
+    { get: 0, all: 0, iterate: 0, run: 0 }, { get: 1, all: 0, iterate: 0, run: 0 },
+    { get: 0, all: 0, iterate: 0, run: 0 }, { get: 1, all: 0, iterate: 0, run: 0 },
+  ])
+})
+
+for (const companion of [undefined, 7, false, {}, 'bad JSON', 'null', '[]', '"plain"']) {
+  test(`SQLite TEXT invalid object evidence fails closed through detail: ${JSON.stringify(companion)}`, t => {
+    const store = tempStore(t), id = store.openTask('text', 'run').task_id
+    store.recordFact({ task_id: id, statement: 'private\0sentinel' }, 'run')
+    const db = store.open(), prepare = db.prepare.bind(db)
+    let injections = 0
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      if (sql.startsWith('SELECT id, task_id, kind, statement,')) {
+        const all = statement.all.bind(statement)
+        statement.all = (...args) => all(...args).map(row => {
+          injections++
+          if (companion === undefined) delete row.__imperator_nul_statement
+          else row.__imperator_nul_statement = companion
+          return row
+        })
+      }
+      return statement
+    }
+    assert.throws(() => store.board({ task_id: id }, 'run'), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
+    assert.equal(db.isTransaction, false)
+  })
+}
+
+for (const fault of ['missing column', 'extra column', 'array row', 'wrong name', 'wrong order', 'wrong count', 'missing target', 'duplicate target', 'duplicate name']) {
+  test(`SQLite TEXT wildcard layout fails closed through facts page: ${fault}`, t => {
+    const store = tempStore(t), id = store.openTask('text', 'run').task_id
+    store.recordFact({ task_id: id, statement: 'private\0sentinel' }, 'run')
+    const db = store.open(), prepare = db.prepare.bind(db)
+    let injections = 0
+    const calls = { original: { get: 0, all: 0, iterate: 0, run: 0 }, generated: { get: 0, all: 0, iterate: 0, run: 0 } }
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      const original = sql.startsWith('SELECT f.*'), replacement = sql.includes("THEN 'J'||json_quote(")
+      if ((original || replacement) && sql.includes('ORDER BY f.id DESC LIMIT')) {
+        for (const method of ['get', 'all', 'iterate', 'run']) {
+          const read = statement[method].bind(statement)
+          statement[method] = (...args) => { calls[original ? 'original' : 'generated'][method]++; return read(...args) }
+        }
+        const all = statement.all.bind(statement), columns = statement.columns.bind(statement)
+        statement.columns = () => {
+          const metadata = columns()
+          if (replacement && fault === 'wrong name') { metadata.at(-1).name = 'wrong'; injections++ }
+          if (replacement && fault === 'wrong order') { [metadata[0], metadata[1]] = [metadata[1], metadata[0]]; injections++ }
+          if (replacement && fault === 'wrong count') { metadata.pop(); injections++ }
+          if (original && fault === 'missing target') { metadata.find(c => c.name === 'statement').name = 'missing'; injections++ }
+          if (original && fault === 'duplicate target') { metadata[0].name = 'statement'; injections++ }
+          if (original && fault === 'duplicate name') { metadata[0].name = metadata[1].name; injections++ }
+          return metadata
+        }
+        statement.all = (...args) => all(...args).map(row => {
+          if (replacement && ['missing column', 'extra column', 'array row'].includes(fault)) injections++
+          if (replacement && fault === 'missing column') delete row.statement
+          if (replacement && fault === 'extra column') row.extra = null
+          return replacement && fault === 'array row' ? Object.values(row) : row
+        })
+      }
+      return statement
+    }
+    assert.throws(() => store.boardPage({ view: 'facts', task_id: id }, 'run'), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
+    assert.deepEqual(calls, { original: { get: 0, all: 0, iterate: 0, run: 0 },
+      generated: { get: 0, all: ['missing column', 'extra column', 'array row'].includes(fault) ? 1 : 0, iterate: 0, run: 0 } })
+    assert.equal(db.isTransaction, false)
+  })
+}
 
 test('validates SQLite options and preserves or explicitly selects WAL', (t) => {
   assert.deepEqual(normalizeSqliteOptions(), { busyTimeoutMs: 1000, journalMode: 'preserve' })
@@ -217,4 +488,118 @@ test('shared fixture creates a submitted task with a plausible artifact', (t) =>
   const fact = store.open().prepare("SELECT confidence, kind, evidence_path FROM fact WHERE task_id=? AND kind='artifact'").get(id)
   assert.deepEqual({ ...fact }, { confidence: 'PLAUSIBLE', kind: 'artifact', evidence_path: 'artifact.txt' })
   assert.equal(store.open().prepare('SELECT status FROM task WHERE id=?').get(id).status, 'submitted')
+})
+
+// Task19 E1 supplements the existing generic primitive tests with its exact union.
+test('Task19 E1 seven-field projection keeps native width and rejects each later coordinate before consumption', t => {
+  const db = new DatabaseSync(':memory:'); t.after(() => db.close())
+  const fields = ['run_id', 'owner_session', 'actor_session', 'command', 'call_id', 'root_call_id', 'parent_call_id']
+  const unknown = ['', '__proto__', 'constructor', '__imperator_nul_call_id', '12', '2', 'quoted"列😀', 'extra_blob', 'extra_number']
+  const names = ['id', 'task_id', ...fields.slice(0, 4), ...unknown,
+    ...Array.from({ length: 1982 }, (_, index) => 'extra_' + index), ...fields.slice(4)]
+  const quote = name => '"' + name.replaceAll('"', '""') + '"'
+  db.exec('CREATE TABLE execution_receipt(' + names.map(name => quote(name) + (fields.includes(name) ? ' TEXT' : '')).join(',') + ')')
+  const scope = 'scope\0full', taskId = 7
+  const older = [scope, '\0owner', 'actor\0tail', 'command\0', '\0call', 'root\0suffix', 'parent\0']
+  const newest = [scope, 'Tordinary', 'J"literal"', 'literal\\u0000', 'call\0new', '{"root":true}', null]
+  const insertNames = ['id', 'task_id', ...fields, ...unknown]
+  const insert = db.prepare('INSERT INTO execution_receipt(' + insertNames.map(quote).join(',') + ') VALUES('
+    + insertNames.map(() => '?').join(',') + ')')
+  const extras = ['empty name', 'prototype data', 17, 'original companion-like data', 'twelve', 'two', 'quoted value', new Uint8Array([0, 255]), 1.25]
+  insert.run(1, taskId, ...older, ...extras)
+  insert.run(2, taskId, ...newest, ...extras)
+  insert.run(99, taskId + 1, ...newest, ...extras)
+  insert.run(100, taskId, 'scope', ...newest.slice(1), ...extras)
+  const suffix = ' FROM execution_receipt WHERE task_id = ? AND run_id IS ? ORDER BY id DESC LIMIT 10'
+  const query = (projection = '*') => 'SELECT ' + projection + suffix
+  const original = db.prepare(query()), native = original.all(taskId, scope)
+  assert.equal(original.columns().length, 2000)
+  assert.deepEqual(native.map(row => row.id), [2, 1], 'native selector, binds and descending order remain the baseline')
+  const expected = new Map([[2, newest], [1, older]])
+  const changes = db.prepare('SELECT total_changes() AS n').get().n
+  for (const fault of [null, 'call_id', 'root_call_id', 'parent_call_id']) {
+    const observed = [], bound = []
+    let injections = 0, consumed = 0
+    const tracked = { prepare(sql) {
+      const index = observed.length, statement = db.prepare(sql)
+      const record = { sql, columns: 0, get: 0, all: 0, iterate: 0, run: 0, names: null }
+      observed.push(record)
+      const columns = statement.columns.bind(statement)
+      statement.columns = () => { record.columns++; const result = columns(); record.names = result.map(column => column.name); return result }
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const read = statement[method].bind(statement)
+        statement[method] = (...args) => {
+          record[method]++; bound.push({ index, method, args })
+          const result = read(...args)
+          if (index === 1 && method === 'all') {
+            assert.deepEqual(result.map(row => row.id), [2, 1])
+            for (const row of result) fields.forEach((field, fieldIndex) => {
+              const value = expected.get(row.id)[fieldIndex]
+              assert.equal(row[field], value === null ? null : value.includes('\0') ? 'J' + JSON.stringify(value) : 'T' + value)
+            })
+            if (fault !== null) { result[0][fault] = 'J"private coordinate without NUL"'; injections++ }
+          }
+          return result
+        }
+      }
+      return statement
+    } }
+    const { statement, restore } = prepareSqliteTextProjection(tracked, fields, 'execution_receipt', query)
+    const consume = () => {
+      const encoded = statement.all(taskId, scope)
+      const rows = encoded.map(row => {
+        const blob = row.extra_blob, keys = Reflect.ownKeys(row)
+        assert.equal(restore(row), row)
+        assert.equal(row.extra_blob, blob)
+        assert.deepEqual(Reflect.ownKeys(row), keys)
+        return row
+      })
+      consumed++
+      return rows
+    }
+    if (fault === null) {
+      const rows = consume()
+      assert.deepEqual(rows.map(row => row.id), [2, 1])
+      rows.forEach((row, index) => {
+        assert.equal(Object.getPrototypeOf(row), null)
+        assert.deepEqual(Reflect.ownKeys(row), Reflect.ownKeys(native[index]))
+        const descriptors = Object.getOwnPropertyDescriptors(native[index])
+        fields.forEach((field, fieldIndex) => { descriptors[field].value = expected.get(row.id)[fieldIndex] })
+        assert.deepEqual(Object.getOwnPropertyDescriptors(row), descriptors)
+        assert.equal(Object.keys(row).length, 2000)
+      })
+    } else {
+      let returned = false
+      assert.throws(() => { consume(); returned = true }, { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+      assert.equal(returned, false)
+    }
+    assert.equal(injections, fault === null ? 0 : 1)
+    assert.equal(consumed, fault === null ? 1 : 0)
+    assert.equal(observed.length, 2)
+    assert.equal(observed[0].sql, query())
+    assert.ok(observed[1].sql.endsWith(suffix))
+    assert.deepEqual(observed.map(row => row.names), [names, names])
+    assert.deepEqual(observed.map(({ sql, names, ...calls }) => calls), [
+      { columns: 1, get: 0, all: 0, iterate: 0, run: 0 },
+      { columns: 1, get: 0, all: 1, iterate: 0, run: 0 },
+    ])
+    assert.deepEqual(bound, [{ index: 1, method: 'all', args: [taskId, scope] }])
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  }
+  const tooWide = 'SELECT *, NULL AS width_overflow' + suffix
+  let nativeError
+  try { db.prepare(tooWide) } catch (error) { nativeError = error }
+  assert.equal(nativeError?.code, 'ERR_SQLITE_ERROR')
+  const attempts = []
+  let forwarded
+  const rejecting = { prepare(sql) {
+    attempts.push(sql)
+    try { return db.prepare(sql) } catch (error) { forwarded = error; throw error }
+  } }
+  assert.throws(() => prepareSqliteTextProjection(rejecting, fields, 'execution_receipt',
+    (projection = '*, NULL AS width_overflow') => 'SELECT ' + projection + suffix), error =>
+    error === forwarded && error.code === nativeError.code && error.errcode === nativeError.errcode
+      && error.errstr === nativeError.errstr && error.message === nativeError.message)
+  assert.deepEqual(attempts, [tooWide], 'native original-width rejection precedes metadata and replacement preparation')
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
 })

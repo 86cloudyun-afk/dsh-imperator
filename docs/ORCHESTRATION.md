@@ -99,7 +99,7 @@ ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”
 
 ## 0.3 不可变历史增量投影
 
-`createEventCursor().read(events)` 返回 `{ reset, events }`；后者是需要重放的全量历史或新增尾部。只有深冻结的 JSON 事件图可以缓存，验证过的不可变对象用 WeakSet 记忆。普通可变数组可以承载不可变事件，但数组引用相同、长度相同、末尾 seq/callId 相同均不构成追加证明：每次逐项比较整个旧前缀的事件引用；中段替换、重排、缩短或非深冻结输入都全量重放。存在 seq 时要求连续；无 seq 的兼容 JSON 历史仍按完整引用前缀判断。访问器、稀疏数组、循环或非 JSON 对象不能进入快速路径。
+`createEventCursor().read(events)` 返回 `{ reset, events }`；后者是需要重放的全量历史或新增尾部。只有深冻结的 JSON 事件图可以缓存，验证过的不可变对象用 WeakSet 记忆。对不同或未认证的容器，仍沿用完整前缀验证与原有 reset / 提前退出规则。只有紧邻的上次成功读取已认证的深冻结稠密数组，本次通过迭代安全检查后，才可用单个可选 WeakRef 复用其相等证明，省去旧前缀引用比较；提示丢失或操作失败时回到原扫描。普通可变数组可以承载不可变事件，但数组引用相同、长度相同、末尾 seq/callId 相同均不构成追加证明；中段替换、重排、缩短或非深冻结输入都全量重放。存在 seq 时要求连续；无 seq 的兼容 JSON 历史仍按完整引用前缀判断。访问器、稀疏数组、循环或非 JSON 对象不能进入快速路径。增量结果的尾部数组每次重新创建，reducer append / snapshot 与原错误、处理计数顺序保持不变。
 
 `createGuardProjection(options).read(events)` 与 `createFlowProjection(delegationTools, settlement).read(events)` 复用纯函数 `foldGuardSignals` / `foldSubagentFlow` 的 append/snapshot reducer，并保持返回形状。`processedEvents` 是累计传入 reducer 的事件数（包含 reset 重放），不是总操作数。冻结 40000 条事件初读处理 40000 条，原历史重读不增加，追加一条后为 40001；结果与全量 fold 相同。阈值或工具集合变化会使该 projection 重新回放；settlement 是创建时固定的值，变更时创建新 projection。
 
@@ -107,7 +107,7 @@ ECHO 仍以调用发起顺序为准；PR #6 原先“旧成功清空新失败”
 
 工具扫描保留 turn/step cursor，以及 native/PTC 命名空间、原始结果坐标、重复与乱序结果、通知 ID 和 ECHO 确认位置。后到的真实 PTC dispatch 可以回溯标记 run_code wrapper。snapshot 不提交未关闭的当前推理步；因此重复读取不会累计虚假的 STALL。仍使用 STALL observe、`stepDownRequests: 0`，store 与工具权限边界不变。
 
-成本边界：每次仍有 O(n) 前缀引用比较及引用数组复制；首次或新增对象的深冻结认证与 JSON 图大小相关。guard snapshot 仍扫描失败调用尾部，最坏 O(调用数)；todo 和可见 context 去重仍读取相应历史，surface compaction 会重新判断可见性。缓存保留事件引用与调用/通知元数据，空间随历史增长。这里只减少可信不可变历史的重复 reducer 处理，不承诺完整 pre-step 为 O(新增事件)，也不把处理计数当作真实模型延迟或成本测量。
+成本边界：不同或未认证输入最坏仍有 O(n) 前缀引用比较；同一个已认证冻结容器的紧邻重复读取只可省去该次比较。已有引用前缀继续保留，新增尾部引用追加其中，reset 时重建；首次或新增对象的深冻结认证与 JSON 图大小相关。guard snapshot 仍扫描失败调用尾部，最坏 O(调用数)；todo 和可见 context 去重仍读取相应历史，surface compaction 会重新判断可见性。缓存保留事件引用与调用/通知元数据，空间随历史增长；可选弱提示不强持有调用者的外层数组，也不承诺 GC 时机。这里只减少可信不可变历史的重复 reducer 处理和特定同容器的前缀比较，不承诺完整 pre-step 为 O(新增事件)，也不把处理计数当作真实模型延迟或成本测量。
 
 ## 0.3 低风险短流程与固定模型回归
 
@@ -130,7 +130,7 @@ repair/reuse 的提示与实际任务 policy 均固定为 `legacy`，便于与�
 
 grader 在工作区外运行固定断言，不运行模型自行改写的测试来决定最终通过；删除测试、打印成功或提前 exit(0) 都不能替代 grader 完成。strict 固定命令为 `node --test money.test.mjs`，清单为 `money.mjs` 和 `money.test.mjs`。任务豁免不计通过。模型请求错误、工具错误、非正常 turn/end、缺 usage、不完整验收、超额、超时或清理失败均不能标记 `ok: true`。
 
-runner 走官方 `controlledProfile`、registry mount 和 native followup，记录所有真实子代激活并等待各层宿主结算通知及主会话再次空闲。上限默认且最大 80 个全树请求（允许调低），每阶段默认 180000 ms；重试和自动标题模型调用关闭。失败时取消所有跟踪 agent，dispose 主句柄与应用，每步清理最多等待 10 秒，最终清除临时 profile/home/workspace 并还原环境和退出码。
+runner 走官方 `controlledProfile`、registry mount 和 native followup，记录所有真实子代激活，等待全部跟踪 Agent 的原始 `whenIdle` 与主会话再次空闲，并保留两次稳定性检查。通知义务按公开当前 own-session 模式判定：continuable 每次本阶段激活须收到相应父子对的真实结算通知；明确 one-shot 不等待 SDK 不发送的通知，前台结果及实际销毁仍由原生工具完成；当前新增激活的身份未知时阻止结算。repair 首次任务明确后两阶段必须通过 `task_child_send` 复用同一可续作执行者。上限默认且最大 80 个全树请求（允许调低），每阶段默认 180000 ms；重试和自动标题模型调用关闭。失败时取消所有跟踪 agent，dispose 主句柄与应用，每步清理最多等待 10 秒，最终清除临时 profile/home/workspace 并还原环境和退出码。
 
 报告只持久化白名单元数据，不保存模型推理、对话、原始工具返回、证据内容或 credentials。任务/会话历史及 native 日志位于运行期间的临时 home，清理后移除。报告含固定阶段名称、数值指标、独立判据结果、固定失败码和版本/摘要；模型原文、异常消息及任意事实陈述不能进入报告。源码指纹覆盖排序后的 `package.json`、`cordis.patch.yml`、`lib/` 与 `tools/` 路径和文件字节；文档、报告和 git 元数据不计入。缓存 tokens 按宿主语义单列，`inputTokens` 是未缓存输入，缺省 cache 字段计 0。报告是单次受控样例，不能独自证明普遍性能提升。
 

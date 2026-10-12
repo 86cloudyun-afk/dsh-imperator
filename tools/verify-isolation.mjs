@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict'
 import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath, pathToFileURL } from 'node:url'
+import { fileURLToPath } from 'node:url'
 import { controlledProfile, nativeModule, resolveInstallAnchor } from './host-runtime.mjs'
 import { option } from './verify-preset.mjs'
 
@@ -11,10 +11,11 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 export async function verifyIsolation({ installAnchor, installDir } = {}) {
   const anchor = resolveInstallAnchor({ installAnchor, installDir })
   const fixture = await controlledProfile(anchor, ROOT)
-  const emergency = () => fixture.dispose()
+  const emergency = () => fixture.emergencyDispose()
   process.once('exit', emergency)
   const previousExitCode = process.exitCode
   const handles = new Set(), prepared = new WeakSet(), checks = []
+  const failures = []
   let app, registry, agents, serial = 0
   const check = async (name, fn) => { await fn(); checks.push(name); console.log(`ISOLATION_PASS: ${name}`) }
   try {
@@ -22,8 +23,7 @@ export async function verifyIsolation({ installAnchor, installDir } = {}) {
       nativeModule(anchor, '@deepseek-ai/dsh-system-prompt'), nativeModule(anchor, '@deepseek-ai/dsh-agent'),
       nativeModule(anchor, '@deepseek-ai/dsh-llm'),
     ])
-    const { runProfile } = await import(pathToFileURL(join(dirname(anchor), 'lib/profile-boot.js')).href)
-    app = await runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
+    app = await fixture.runProfile({ environment: fixture.boot.loadLayeredEnv('dsh'), profile: 'web',
       patchFiles: [fixture.overlay], args: ['--host', '127.0.0.1', '--port', '0', '--no-open'] })
     registry = app.ctx.get('agentPresets'); agents = app.ctx.get('agents')
     const create = async preset => {
@@ -166,14 +166,25 @@ export async function verifyIsolation({ installAnchor, installDir } = {}) {
       await registry.select(old.agent, 'standard'); await write(old, true)
       await snapshot(standard, 'standard'); await write(standard, true)
     })
-  } finally {
-    try { try { for (const handle of [...handles].reverse()) await handle.dispose() }
-      finally { await app?.shutdown.shutdown(1) }
+  } catch (error) { failures.push(error) }
+  finally {
+    try {
+      try {
+        for (const handle of [...handles].reverse()) {
+          try { await fixture.teardown(() => handle.dispose()) } catch (error) { failures.push(error) }
+        }
+      } finally { try { await fixture.shutdown(1) } catch (error) { failures.push(error) } }
     } finally {
-      fixture.dispose(); process.removeListener('exit', emergency)
-      assert.equal(existsSync(fixture.root), false)
-      process.exitCode = previousExitCode
+      try { fixture.dispose(); assert.equal(existsSync(fixture.root), false) }
+      catch (error) { failures.push(error) }
+      finally {
+        if (fixture.isDisposed()) process.off('exit', emergency)
+        else fixture.whenDisposed.then(() => process.off('exit', emergency))
+        process.exitCode = previousExitCode
+      }
     }
+    if (failures.length === 1) throw failures[0]
+    if (failures.length) throw new AggregateError(failures, 'native isolation and cleanup failed')
   }
   checks.push('agent, host and disposable home cleanup')
   console.log(`ISOLATION_VERIFIED: ${checks.length} checks; no model requests`)

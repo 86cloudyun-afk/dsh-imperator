@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { DatabaseSync } from 'node:sqlite'
 import { tempStore } from './helpers.mjs'
+import { TaskforceStore } from '../../lib/store/index.js'
 import { withWriteTransaction } from '../../lib/store/sqlite.js'
 import { apply as applyTools } from '../../lib/tools/index.js'
 
@@ -30,6 +31,131 @@ function tools(store, id = 'run-a') {
   applyTools({ logger: { warn() {} }, get: name => name === 'taskforceStore' ? store : undefined,
     tools: { register: d => defs.push(d) } })
   return args => defs.find(d => d.name === 'task_board').execute(args, { agent: { options: {}, session: { header: { id } } } })
+}
+
+test('SQLite TEXT width-neutral facts and latest remain readable at the native column limit', async t => {
+  const store = tempStore(t), id = store.openTask('maximum width', 'run-a').task_id, db = store.open()
+  const capacity = Number(db.prepare('PRAGMA compile_options').all().map(row => row.compile_options)
+    .find(option => option.startsWith('MAX_COLUMN=')).split('=')[1])
+  const existing = db.prepare('PRAGMA table_info(fact)').all().length
+  for (let index = existing; index < capacity; index++) db.exec(`ALTER TABLE fact ADD COLUMN extension_${index}`)
+  assert.equal(db.prepare('SELECT * FROM fact').columns().length, capacity)
+  for (const statement of ['ordinary', 'left\0中文😀right']) {
+    store.recordFact({ task_id: id, statement }, 'run-a')
+    assert.equal(db.prepare('SELECT hex(CAST(statement AS BLOB)) AS bytes FROM fact WHERE task_id=? ORDER BY id DESC LIMIT 1').get(id).bytes,
+      Buffer.from(statement).toString('hex').toUpperCase())
+    for (const view of ['facts', 'latest']) await t.test(`${view}: ${JSON.stringify(statement)}`, () => {
+      const page = store.boardPage(view === 'facts' ? { view: 'facts', task_id: id } : {}, 'run-a')
+      const row = view === 'facts' ? page.facts[0] : page.tasks[0].facts[0]
+      assert.equal(row.statement, statement)
+      if (view === 'facts') {
+        assert.equal(row[`extension_${capacity - 1}`], null)
+        assert.ok(Object.keys(row).length >= capacity)
+      }
+    })
+  }
+})
+
+test('SQLite TEXT board factories add metadata prepares without additional data execution', t => {
+  const store = tempStore(t), id = store.openTask('counts', 'run-a').task_id
+  store.recordFact({ task_id: id, statement: 'prefix\0suffix' }, 'run-a')
+  const db = store.open(), prepare = db.prepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if ((sql.startsWith('SELECT f.*') || sql.includes("THEN 'J'||json_quote(")) && / FROM (fact|handoff) f JOIN task/.test(sql)) {
+      const record = { original: sql.startsWith('SELECT f.*'), handoff: sql.includes(' FROM handoff '), get: 0, all: 0, iterate: 0, run: 0 }
+      records.push(record)
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const execute = statement[method].bind(statement)
+        statement[method] = (...args) => { record[method]++; return execute(...args) }
+      }
+    }
+    return statement
+  }
+  for (const route of ['facts', 'handoffs', 'latest', 'empty']) {
+    records.length = 0
+    if (route === 'empty') store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+    store.boardPage(['facts', 'handoffs'].includes(route) ? { view: route, task_id: id } : {}, 'run-a')
+    const metadata = { original: true, handoff: false, get: 0, all: 0, iterate: 0, run: 0 }
+    const execution = { original: false, handoff: false, get: 0, all: 1, iterate: 0, run: 0 }
+    assert.deepEqual(records, route === 'empty' ? [] : route === 'handoffs'
+      ? [{ ...metadata, handoff: true }, { ...execution, handoff: true }] : [metadata, execution])
+    t.diagnostic(route + ' SQL lifecycle=' + JSON.stringify(records))
+  }
+})
+
+for (const route of ['facts', 'detail', 'latest', 'late full', 'late display']) {
+  test(`SQLite TEXT page ${route} restores text before pagination and clipping`, t => {
+    const store = tempStore(t), run = 'run-a'
+    const samples = ['plain', 'T', 'J', 'J"pretend"', 'Tordinary', '"json"', '\\u0000', '\0', '\0start', 'middle\0suffix', 'end\0', 'a\0\0b',
+      '中\0文😀e\u0301\r\n\u0001', ...[159, 160, 161].map(n => '中\0' + '文'.repeat(n - 2))]
+    const id = store.openTask('text', run).task_id
+    if (route.startsWith('late ')) store.closeTask({ task_id: id, result: 'failed' }, run)
+    for (const statement of samples) {
+      store.recordFact({ task_id: id, statement, kind: route.startsWith('late ') ? 'blocker' : 'fact' }, run)
+      const display = statement.length > 160 ? statement.slice(0, 160) + '…' : statement
+      if (route === 'facts') assert.equal(store.boardPage({ view: 'facts', task_id: id, limit: 1 }, run).facts[0].statement, statement)
+      if (route === 'detail') assert.equal(store.boardPage({ task_id: id }, run).facts[0].statement, statement)
+      if (route === 'latest') assert.equal(store.boardPage({}, run).tasks[0].facts[0].statement, display)
+      if (route === 'late full') assert.equal(store.boardPage({ view: 'late_blockers', task_id: id, limit: 1 }, run).late_blockers[0].statement, statement)
+      if (route === 'late display') assert.equal(store.boardPage({}, run).late_blockers[0].statement, display)
+    }
+    if (route === 'facts') assert.deepEqual(collect(store, { view: 'facts', task_id: id, limit: 3 }, 'facts').map(r => r.statement), samples.toReversed())
+    store.handle.close(); store.handle = null; store.open()
+    if (route === 'facts') assert.equal(store.boardPage({ view: 'facts', task_id: id }, run).facts[0].statement, samples.at(-1))
+  })
+}
+
+test('SQLite TEXT fact history preserves real companion names and unusual legacy column types', t => {
+  const store = tempStore(t), id = store.openTask('legacy columns', 'run-a').task_id
+  store.recordFact({ task_id: id, statement: 'prefix\0suffix' }, 'run-a')
+  const db = store.open()
+  db.exec('ALTER TABLE fact ADD COLUMN __imperator_nul_statement TEXT; ALTER TABLE fact ADD COLUMN "__proto__" TEXT;'
+    + ' ALTER TABLE fact ADD COLUMN constructor INTEGER; ALTER TABLE fact ADD COLUMN "12" TEXT; ALTER TABLE fact ADD COLUMN "2" TEXT;'
+    + ' ALTER TABLE fact ADD COLUMN extra_blob BLOB; ALTER TABLE fact ADD COLUMN extra_null; ALTER TABLE fact ADD COLUMN extra_integer INTEGER')
+  db.exec('ALTER TABLE fact ADD COLUMN "" TEXT; ALTER TABLE fact ADD COLUMN "quoted""列😀" TEXT')
+  db.prepare('UPDATE fact SET ""=?,"quoted""列😀"=? WHERE task_id=?').run('empty name', 'quoted name', id)
+  db.prepare('UPDATE fact SET __imperator_nul_statement=?,"__proto__"=?,constructor=27,"12"=?,"2"=?,extra_blob=?,extra_integer=42 WHERE task_id=?')
+    .run('legacy companion', 'prototype data', 'twelve', 'two', new Uint8Array([0,255]), id)
+  const row = store.boardPage({ view: 'facts', task_id: id }, 'run-a').facts[0]
+  assert.equal(row.statement, 'prefix\0suffix')
+  assert.equal(row.__imperator_nul_statement, 'legacy companion')
+  assert.equal(row.__proto__, 'prototype data'); assert.equal(row.constructor, 27)
+  assert.equal(row['12'], 'twelve'); assert.equal(row['2'], 'two')
+  assert.deepEqual(row.extra_blob, new Uint8Array([0,255])); assert.equal(row.extra_null, null)
+  assert.equal(row.extra_integer, 42)
+  assert.equal(row[''], 'empty name'); assert.equal(row['quoted"列😀'], 'quoted name')
+  assert.equal(Object.getPrototypeOf(row), Object.prototype, 'public history keeps its existing spread shape')
+  assert.deepEqual(Object.getOwnPropertyDescriptor(row, '__proto__'), { value: 'prototype data', writable: true, enumerable: true, configurable: true })
+  assert.equal(store.boardPage({}, 'run-a').tasks[0].facts[0].statement, 'prefix\0suffix')
+  db.prepare('UPDATE fact SET extra_integer=? WHERE task_id=?').run(9007199254740993n, id)
+  for (const args of [{ view: 'facts', task_id: id }, {}]) assert.throws(() => store.boardPage(args, 'run-a'), { code: 'ERR_OUT_OF_RANGE' })
+})
+
+for (const route of ['late', 'latest']) {
+  test(`SQLite TEXT page ${route} rejects corrupt evidence before clipping`, t => {
+    const store = tempStore(t), id = store.openTask('text', 'run-a').task_id
+    if (route === 'late') store.closeTask({ task_id: id, result: 'failed' }, 'run-a')
+    store.recordFact({ task_id: id, kind: 'blocker', statement: 'private\0sentinel' }, 'run-a')
+    const db = store.open(), prepare = db.prepare.bind(db)
+    let injections = 0
+    db.prepare = sql => {
+      const statement = prepare(sql)
+      if (route === 'late' ? sql.startsWith('SELECT b.id AS fact_id,') : sql.includes("THEN 'J'||json_quote(") && sql.includes('FROM fact f')) {
+        const all = statement.all.bind(statement)
+        statement.all = (...args) => all(...args).map(row => {
+          injections++
+          if (route === 'latest') row.statement = 'J"private sentinel"'
+          else row.__imperator_nul_statement = '"private sentinel"'
+          return row
+        })
+      }
+      return statement
+    }
+    assert.throws(() => store.boardPage({}, 'run-a'), { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' })
+    assert.equal(injections, 1)
+    assert.equal(db.isTransaction, false)
+  })
 }
 
 test('1000 pending tasks have bounded defaults, full totals and complete descending keyset traversal', t => {
@@ -585,3 +711,251 @@ test('control integrity uses task-key searches on a large journal for paged and 
     assert.doesNotMatch(plan.join('\n'), /\bSCAN o\b/)
   }
 })
+
+const task19HandoffFields = ['from_child', 'to_child', 'note']
+const task19HandoffCases = []
+for (const field of task19HandoffFields) for (const position of ['leading', 'middle', 'trailing']) {
+  const values = { from_child: 'old', to_child: 'new', note: 'handoff' }
+  values[field] = position === 'leading' ? '\0' + field : position === 'middle' ? field + '\0suffix' : field + '\0'
+  task19HandoffCases.push(values)
+}
+for (const position of ['leading', 'middle', 'trailing']) task19HandoffCases.push(Object.fromEntries(task19HandoffFields.map(field =>
+  [field, position === 'leading' ? '\0' + field : position === 'middle' ? field + '\0suffix' : field + '\0'])))
+for (const value of ['Tordinary', 'J"literal"', '{"text":true}', 'literal\\u0000', '中文🙂']) {
+  task19HandoffCases.push(Object.fromEntries(task19HandoffFields.map(field => [field, value])))
+}
+// Full-run variants are post-Task16 closure; each batch fits H1's unchanged limit10.
+for (const run of ['task19-handoffs', 'task19-handoffs\0full']) for (const offset of [0, 10]) {
+  test(`Task19 handoff content survives both history readers and pagination: ${JSON.stringify(run)} batch ${offset / 10}`, t => {
+    const store = tempStore(t), id = store.openTask('handoffs', run).task_id
+    const expected = task19HandoffCases.slice(offset, offset + 10).map(values => ({
+      ...values, id: store.recordHandoff({ task_id: id, ...values }, run).handoff_id,
+    })).reverse()
+    assert.ok(expected.length > 3 && expected.length <= 10)
+    const creationHandle = store.open()
+    function check(reader) {
+      const oracle = new DatabaseSync(store.dbPath, { readOnly: true })
+      try {
+        const rows = oracle.prepare('SELECT id, json_quote(from_child) AS from_child_json, typeof(from_child) AS from_child_type,'
+          + ' json_quote(to_child) AS to_child_json, typeof(to_child) AS to_child_type, json_quote(note) AS note_json, typeof(note) AS note_type,'
+          + ' json_quote(run_id) AS run_id_json, typeof(run_id) AS run_id_type FROM handoff WHERE task_id=? ORDER BY id DESC').all(id)
+        assert.deepEqual(rows.map(row => row.id), expected.map(row => row.id))
+        rows.forEach((row, index) => {
+          for (const field of [...task19HandoffFields, 'run_id']) {
+            assert.equal(row[field + '_type'], 'text')
+            assert.equal(JSON.parse(row[field + '_json']), field === 'run_id' ? run : expected[index][field])
+          }
+        })
+        assert.equal(oracle.prepare('SELECT total_changes() AS n').get().n, 0)
+      } finally { oracle.close() }
+      const db = reader.open(), before = db.prepare('SELECT total_changes() AS n').get().n
+      const legacy = reader.board({ task_id: id }, run).handoffs
+      const detail = reader.boardPage({ task_id: id }, run)
+      const history = collect(reader, { view: 'handoffs', task_id: id, limit: 3 }, 'handoffs', run)
+      assert.equal(detail.handoffs_pagination.has_more, false)
+      for (const rows of [legacy, detail.handoffs, history]) {
+        assert.deepEqual(rows.map(row => row.id), expected.map(row => row.id))
+        assert.equal(new Set(rows.map(row => row.id)).size, expected.length)
+        rows.forEach((row, index) => {
+          assert.equal(row.task_id, id)
+          for (const field of task19HandoffFields) assert.equal(row[field], expected[index][field])
+        })
+      }
+      for (const row of legacy) assert.equal(Object.hasOwn(row, 'run_id'), false, 'H1 retains its existing projection')
+      for (const row of [...detail.handoffs, ...history]) assert.equal(row.run_id, run)
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    }
+    assert.equal(store.open(), creationHandle); check(store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try { assert.notEqual(reopened.open(), creationHandle); check(reopened) } finally { reopened.close() }
+  })
+}
+
+for (const [index, sample] of ['\0field', 'field\0suffix', 'field\0', 'Tordinary', 'J"literal"', '{"text":true}', 'literal\\u0000', '中文🙂', 'structured\0actor'].entries()) {
+  test(`Task19 fact attribution remains exact in every public projection: ${JSON.stringify(sample)}`, t => {
+    const store = tempStore(t), run = index === 7 ? 'task19-facts\0full' : 'task19-facts'
+    const structured = index === 8
+    const by = sample.replace('field', 'display'), actorSession = structured ? by : sample.replace('field', 'audit')
+    const actor = structured ? { sessionId: by, isRoot: false } : by
+    const statement = 'statement\0kept', evidencePath = [null, 'result.txt', '报告/结果.txt'][index % 3]
+    const evidenceLine = evidencePath === null ? null : 7
+    const id = store.openTask('active attribution', run).task_id
+    const lateId = store.openTask('late attribution', run).task_id
+    store.closeTask({ task_id: lateId, result: 'failed' }, run)
+    const record = taskId => store.recordFact({ task_id: taskId, kind: 'blocker', statement,
+      evidence_path: evidencePath, evidence_line: evidenceLine }, run, actor, structured ? undefined : actorSession)
+    const fact = record(id), lateFact = record(lateId)
+    assert.equal(fact.late, false); assert.equal(lateFact.late, true)
+    const creationHandle = store.open()
+    function check(reader) {
+      const oracle = new DatabaseSync(store.dbPath, { readOnly: true })
+      try {
+        const rows = oracle.prepare('SELECT id, json_quote(created_by) AS by_json, typeof(created_by) AS by_type,'
+          + ' json_quote(actor_session) AS actor_json, typeof(actor_session) AS actor_type,'
+          + ' json_quote(statement) AS statement_json, typeof(statement) AS statement_type,'
+          + ' json_quote(evidence_path) AS evidence_json, typeof(evidence_path) AS evidence_type, json_quote(run_id) AS run_json'
+          + ' FROM fact WHERE id IN (?,?) ORDER BY id').all(fact.fact_id, lateFact.fact_id)
+        assert.deepEqual(rows.map(row => row.id), [fact.fact_id, lateFact.fact_id])
+        for (const row of rows) {
+          assert.equal(row.by_type, 'text'); assert.equal(JSON.parse(row.by_json), by)
+          assert.equal(row.actor_type, 'text'); assert.equal(JSON.parse(row.actor_json), actorSession)
+          assert.equal(row.statement_type, 'text'); assert.equal(JSON.parse(row.statement_json), statement)
+          assert.equal(row.evidence_type, evidencePath === null ? 'null' : 'text')
+          assert.equal(JSON.parse(row.evidence_json), evidencePath); assert.equal(JSON.parse(row.run_json), run)
+        }
+        assert.equal(oracle.prepare('SELECT total_changes() AS n').get().n, 0)
+      } finally { oracle.close() }
+      const db = reader.open(), before = db.prepare('SELECT total_changes() AS n').get().n
+      const detail = reader.board({ task_id: id }, run).facts[0]
+      const ranked = reader.board({}, run).tasks.find(row => row.id === id).facts[0]
+      const raw = reader.boardPage({ view: 'facts', task_id: id }, run).facts[0]
+      const latest = reader.boardPage({}, run).tasks.find(row => row.id === id).facts[0]
+      for (const row of [detail, ranked, raw, latest]) {
+        assert.equal(row.id, fact.fact_id); assert.equal(row.by, by); assert.equal(row.actor_session, actorSession)
+        assert.equal(row.statement, statement); assert.equal(row.truncated, undefined)
+        assert.equal(row.evidence, evidencePath === null ? null : `${evidencePath}:${evidenceLine}`)
+      }
+      assert.equal(raw.created_by, by); assert.equal(raw.evidence_path, evidencePath); assert.equal(raw.run_id, run)
+      const legacyLate = reader.board({}, run).late_blockers.find(row => row.task_id === lateId).blockers[0]
+      const fullLate = reader.boardPage({ view: 'late_blockers', task_id: lateId }, run).late_blockers[0]
+      const displayLate = reader.boardPage({ view: 'summary' }, run).late_blockers[0]
+      for (const row of [legacyLate, fullLate, displayLate]) {
+        assert.equal(row.fact_id, lateFact.fact_id); assert.equal(row.by, by)
+        assert.equal(row.actor_session, actorSession); assert.equal(row.statement, statement)
+      }
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+    }
+    assert.equal(store.open(), creationHandle); check(store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try { assert.notEqual(reopened.open(), creationHandle); check(reopened) } finally { reopened.close() }
+  })
+}
+
+for (const delta of [-1, 0, 1]) {
+  test(`Task19 restored board values obey existing clip boundaries: ${delta}`, t => {
+    const store = tempStore(t), run = 'task19-boundaries'
+    const text = length => 'x\0' + '"'.repeat(length - 2)
+    const values = { title: text(80 + delta), owner: text(64 + delta), owner_session: text(256 + delta),
+      statement: text(160 + delta), by: text(64 + delta), actor_session: text(256 + delta) }
+    const id = store.openTask({ title: values.title, note: values.statement }, run).task_id
+    store.claimTask({ task_id: id, child_id: values.owner }, run, 'lead', values.owner_session)
+    const fact = store.recordFact({ task_id: id, statement: values.statement }, run, values.by, values.actor_session)
+    const creationHandle = store.open()
+    function check(reader) {
+      const page = reader.boardPage({}, run), row = page.tasks[0], visibleFact = row.facts[0]
+      const clipped = delta > 0
+      assert.equal(row.title, clipped ? values.title.slice(0, 80) + '…' : values.title)
+      assert.equal(row.owner, clipped ? values.owner.slice(0, 64) + '…' : values.owner)
+      assert.equal(row.owner_session, clipped ? null : values.owner_session)
+      assert.equal(visibleFact.statement, clipped ? values.statement.slice(0, 160) + '…' : values.statement)
+      assert.equal(visibleFact.by, clipped ? values.by.slice(0, 64) + '…' : values.by)
+      assert.equal(visibleFact.actor_session, clipped ? null : values.actor_session)
+      assert.deepEqual(row.truncated_fields, clipped ? ['title', 'owner', 'owner_session'] : undefined)
+      assert.deepEqual(visibleFact.truncated_fields, clipped ? ['statement', 'by', 'actor_session'] : undefined)
+      assert.equal(page.truncated, clipped); assert.equal(page.pagination.has_more, false)
+      assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 60000)
+      const detail = reader.board({ task_id: id }, run)
+      for (const field of ['title', 'owner', 'owner_session']) assert.equal(detail.task[field], values[field])
+      assert.equal(detail.task.note, values.statement)
+      const history = reader.boardPage({ view: 'facts', task_id: id }, run).facts[0]
+      assert.equal(history.id, fact.fact_id)
+      for (const field of ['statement', 'by', 'actor_session']) assert.equal(history[field], values[field])
+    }
+    assert.equal(store.open(), creationHandle); check(store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try { assert.notEqual(reopened.open(), creationHandle); check(reopened) } finally { reopened.close() }
+  })
+}
+
+// Count the real public reader pair; oracle/setup reads occur outside this hook.
+function task19BoardLifecycle(t, db, originalSql, match, args, rowCount, work, mutate) {
+  const originalPrepare = db.prepare, prepare = originalPrepare.bind(db), records = []
+  db.prepare = sql => {
+    const statement = prepare(sql)
+    if (!match(sql)) return statement
+    const record = { kind: sql === originalSql ? 'original' : 'generated', columns: 0,
+      get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] }
+    records.push(record)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...values) => { record.columns++; return columns(...values) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...values) => {
+        record[method]++; record.bindings.push(values)
+        const result = read(...values)
+        if (method === 'all') {
+          assert.equal(Array.isArray(result), true); record.rows.push(result.length)
+          if (record.kind === 'generated' && mutate) mutate(result)
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  let result
+  try { result = work() } finally { db.prepare = originalPrepare }
+  t.diagnostic('public SQL lifecycle ' + JSON.stringify({ originalSql, records }))
+  assert.deepEqual(records, rowCount === null ? [] : [
+    { kind: 'original', columns: 1, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [] },
+    { kind: 'generated', columns: 1, get: 0, all: 1, iterate: 0, run: 0, bindings: [args], rows: [rowCount] },
+  ])
+  return result
+}
+
+for (const [view, scope] of [['facts', 'lifecycle\0run'], ['handoffs', 'lifecycle\0run'], ['latest', 'lifecycle\0run'], ['handoffs', null]]) {
+  test(`Task19 ${view} public lifecycle counts empty and multi-field rows without extra reads: ${JSON.stringify(scope)}`, t => {
+    const store = tempStore(t), db = store.open()
+    const statement = 'statement\0full', by = 'display\0full', actor = 'actor\0full'
+    const ids = [], expected = []
+    if (view !== 'latest') ids.push(store.openTask('history', scope).task_id)
+    const check = count => {
+      const history = view !== 'latest'
+      const suffix = history
+        ? ' FROM ' + (view === 'facts' ? 'fact' : 'handoff')
+          + ' f JOIN task t ON t.id=f.task_id AND f.run_id IS t.run_id WHERE t.run_id IS ? AND t.id=? ORDER BY f.id DESC LIMIT ?'
+        : ' FROM fact f JOIN task t ON t.id=f.task_id AND f.run_id IS t.run_id WHERE t.run_id IS ? AND t.id IN ('
+          + [...ids].reverse().map(() => '?').join(',') + ') AND f.id=(SELECT MAX(b.id) FROM fact b WHERE b.task_id=t.id AND b.run_id IS t.run_id)'
+      const match = sql => sql.startsWith('SELECT ') && (history ? sql.endsWith(suffix)
+        : sql.includes(' FROM fact f JOIN task t ON t.id=f.task_id AND f.run_id IS t.run_id WHERE t.run_id IS ? AND t.id IN (')
+          && sql.endsWith(' AND f.id=(SELECT MAX(b.id) FROM fact b WHERE b.task_id=t.id AND b.run_id IS t.run_id)'))
+      const before = db.prepare('SELECT total_changes() AS n').get().n
+      const page = task19BoardLifecycle(t, db, 'SELECT f.*' + suffix, match,
+        history ? [scope, ids[0], 4] : [scope, ...[...ids].reverse()], count,
+        () => store.boardPage(history ? { view, task_id: ids[0], limit: 3 } : { limit: 3 }, scope))
+      const rows = history ? page[view] : page.tasks.flatMap(task => task.facts)
+      assert.equal(rows.length, expected.length)
+      assert.deepEqual(rows.map(row => row.id), [...expected].reverse().map(row => row.id))
+      rows.forEach((row, index) => {
+        const wanted = expected.at(-1 - index)
+        if (view === 'handoffs') {
+          for (const field of ['from_child', 'to_child', 'note', 'run_id']) assert.equal(row[field], wanted[field])
+        } else {
+          assert.equal(row.statement, statement); assert.equal(row.by, by); assert.equal(row.actor_session, actor)
+          assert.equal(row.evidence, null)
+          if (view === 'facts') {
+            assert.equal(row.created_by, by); assert.equal(row.evidence_path, null); assert.equal(row.run_id, scope)
+          }
+        }
+      })
+      assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+      assert.equal(db.isTransaction, false)
+    }
+    check(view === 'latest' ? null : 0) // A4 alone skips preparation when no task is selected.
+    if (view === 'latest') { ids.push(store.openTask('latest one', scope).task_id); check(0) }
+    for (let index = 0; index < 2; index++) {
+      if (view === 'latest' && index === 1) ids.push(store.openTask('latest two', scope).task_id)
+      if (view === 'handoffs') {
+        const values = { from_child: 'from\0full', to_child: 'to\0full', note: 'note\0full', run_id: scope }
+        const created = store.recordHandoff({ task_id: ids[0], ...values }, scope)
+        expected.push({ ...values, id: created.handoff_id })
+      } else {
+        const created = store.recordFact({ task_id: view === 'latest' ? ids.at(-1) : ids[0], statement }, scope, by, actor)
+        expected.push({ id: created.fact_id })
+      }
+      check(index + 1)
+    }
+  })
+}

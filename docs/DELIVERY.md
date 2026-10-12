@@ -1,18 +1,24 @@
-# Imperator 0.3.2 交付、验收与回滚
+# Imperator 0.4.2 交付、验收与回滚
 
 ## 交付目标
 
-本版修复 ID-only 代理调用 task_open 的异常、未归属任务接管时执行回执与豁免记录漏迁移，以及子代理服务错误的误分类。blocker 部分索引优化候选、完整成员校验和计数，实际同进程测量见 [0.3.2 研究记录](superpowers/research/2026-10-09-imperator-0.3.2-recovery.md)。执行审计归属异常会阻止验收，接管保持真实 owner/generation/命令/快照/结果不变。保留有界分页与完整成员变化校验、冻结事件增量投影、durable governor core 和固定四阶段 opt-in 模型回归。包版本为 0.3.2，Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2 / 0.2.1-alpha.2（预发布版），不能把版本范围声明当作所有未来版本均已测试。
+本版修复终态任务被迟到工作流操作推进、已提交控制回执被无用查询阻塞、fork 继承事件误计本会话活动，以及 H01 / 每步工作上下文的真实委派身份遗漏。新增显式计划与审核意见读取、可信宿主撤回未准入队列意图和本次原生执行 promotion 的短期 job 定位。已验收的 legacy 任务提示明确本次验收已完成，把补齐证据指针的建议放到后续任务提交前。隔离验证器仅清理自己的 SDK 启动回调，并保留实际清理未结算及多重错误的失败状态；模型报告增加取消前的有界结算观察。原生结算按当前本会话的 one-shot / continuable 身份区分通知义务，未知身份阻止通过，全树运行/销毁及可续作通知仍必须完成；首次模型任务明确后续两阶段复用要求。生产 SDK 保持原样。
 
-F1修正候选 `c237ab8` 的108个归档文件与提交逐字节相同，实际解压包已通过双Node全量原生验证及显式四阶段模型验收（58条native stream请求、215946ms，运行/usage/route错误计数全0）。包SHA为 `c4556657616dcd1d016bad5ceb9e4e30a89811ff9de41697430fb7914d815c16`；完整身份与证据见 [0.3验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。历史55条普通agent样本与六次失败278条保留，旧辅助调用覆盖缺失、历史发生情况及usage未知，不能推断历史全部provider用量完整。最终文档归档将不同于模型候选包，仍须controller核对产品等价、双Node、唯一最终范围复核、更新CI与exact HEAD merge；本记录不宣称这些步骤完成。固定样例不证明生产部署或普遍性能/费用改善。
+包版本为 0.4.2，固定包名、preset、显示名和数据库位置不变。本轮没有新增运行时依赖或 DDL，原生全树 adapter 仍关闭；队列撤回要求同库调度写入者协调升级到同一版本。Node 范围为 `^22.23.2 || ^24.19.0`，声明 DSH >=0.2.0-rc.2；固定原生验收目标为官方 0.2.0-rc.2 / 0.2.1-alpha.2（预发布版），版本范围不代表所有未来版本均已测试。逐项 RED/GREEN、审核和精确最终验收状态见 [本轮记录](superpowers/research/2026-10-11-imperator-iteration-ledger.md)。
+
+截至 2026-10-11 09:02 UTC，十二项任务分别通过独立 SPEC→QUALITY。第三个冻结包已通过 source、单 CPU、同一解包的两 pins 全量 native：rc.2 原生 104/104，alpha 101/104，三个 rc.2 专属前台分支因 alpha 实际 schema 不支持而明确跳过。新产品/提示样本的唯一实际模型仍 FAILED：49 请求，repair 到达 180 秒限时，取消前有一个 Agent 运行、一个原始 idle 等待，任务 claimed 而未提交；后两阶段未执行。整轮与额外 PR 审核、最终 CI/合并/main 验证仍未完成。源码修正不证明此前模型选择了前台模式，第三包也不能解释为相同误等。
+
+历史 0.3.2 修复 ID-only 代理调用、未归属任务接管与子代理错误分类，blocker 索引测量见 [0.3.2 研究记录](superpowers/research/2026-10-09-imperator-0.3.2-recovery.md)。以下旧候选数据属于其历史验收，不作为本版通过证据。
+
+F1修正候选 `c237ab8` 的108个归档文件与提交逐字节相同，实际解压包已通过双Node全量原生验证及显式四阶段模型验收（58条native stream请求、215946ms，运行/usage/route错误计数全0）。包SHA为 `c4556657616dcd1d016bad5ceb9e4e30a89811ff9de41697430fb7914d815c16`；完整身份与证据见 [0.3验收记录](superpowers/research/2026-10-08-imperator-0.3-acceptance.md)。历史55条普通agent样本与六次失败278条保留，旧辅助调用覆盖缺失、历史发生情况及usage未知，不能推断历史全部provider用量完整。该历史记录当时将最终文档归档、产品等价、双 Node、范围复核、CI 与 exact HEAD merge 留给 controller；本版状态单独记录于本轮证据，不以旧样本代替。固定样例不证明生产部署或普遍性能/费用改善。
 
 ## 包含内容与核验
 
-`local-dsh-taskforce-0.3.2.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
+`local-dsh-taskforce-0.4.2.tgz` 包含 lib、cordis.patch.yml、tools、docs 和 package.json/README。运行时没有新增第三方依赖，没有安装/prepare 生命周期脚本。CI 制品记录精确提交和 Git tree、Node/npm/DSH 版本、npm 包完整性摘要、归档 SHA-256 和完整测试日志。先核验交付包旁的 SHA256SUMS，解压后执行：
 
 ```sh
 mkdir taskforce-candidate
-tar -xzf local-dsh-taskforce-0.3.2.tgz -C taskforce-candidate
+tar -xzf local-dsh-taskforce-0.4.2.tgz -C taskforce-candidate
 cd taskforce-candidate/package
 npm test
 npm run test:all -- --install-anchor /absolute/path/to/@deepseek-ai/dsh/package.json
@@ -22,7 +28,7 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 
 验证会创建独立临时 DSH_HOME，绑定回环地址临时端口，关闭浏览器和访问 URL 输出，并完成清理；不向模型投入消息，不读取已有实例的任务数据。只读元数据及测试结果在日志中出现，不输出模型密钥或访问令牌。
 
-## 0.3 数据迁移与运行边界
+## 历史数据迁移与当前运行边界
 
 固定包名 `@local/dsh-taskforce`、preset `taskforce`、显示名 `任务部队` 与数据库 `$DSH_HOME/taskforce/taskforce.db` 不变。开库在事务中补 `task.owner_session`、执行 policy/清单/命令/cwd/generation 与 `fact.actor_session`，创建 `execution_receipt` / `execution_waiver`；历史行不猜填真实身份或成功回执。旧未绑定路径保留具名警告；历史已 trim 的身份不能自动还原。管理员应核对原始会话记录，不能把昵称当可信身份。
 
@@ -41,7 +47,7 @@ anchor 必须指向实际安装的官方 DSH package.json，不是 profile。省
 在确认目标 profile 后，以其管理员身份安装经校验的本地包，例如 web profile：
 
 ```sh
-dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.3.2.tgz
+dsh plugin --profile web add /absolute/path/local-dsh-taskforce-0.4.2.tgz
 dsh --profile web --dump-config
 ```
 
@@ -63,7 +69,7 @@ CLI 机制参考：[官方 DSH 包说明](https://www.npmjs.com/package/@deepsee
 
 0.2.1 补充修复 issue #7：退出 TaskForce 后撤销本插件作用域限制，并阻止等待中的 TaskForce 钩子向已切换的会话注入消息。标准模式隔离是本版交付门槛；历史 0.2.0 包不包含此修复。见 `PRESET_ISOLATION.md`。
 
-## Opt-in 固定模型回归（0.3）
+## Opt-in 固定模型回归
 
 离线 `npm test` 包含 `tools/tests/model-regression.test.mjs` 的 mock 超时、错误、usage、验收、复用与独立 grader 行为测试，不联网调用模型。真实模型验收另行显式执行，要求精确的官方 `@deepseek-ai/dsh@0.2.0-rc.2` 或 `@deepseek-ai/dsh@0.2.1-alpha.2` 安装锚点：
 
@@ -77,9 +83,11 @@ node tools/verify-model.mjs --model-calls \
 
 可选 `--package-sha256 <64位小写SHA256>` 绑定实际交付 tarball 的摘要；调用者应先独立计算该摘要。报告 `report.json` 绑定包版本、完整 git commit（源码树可取时）、产品源码 SHA256、可选包摘要、宿主/Node 版本与 provider/model。每阶段给出请求、输入/输出/缓存 tokens、时长、新建/复用/返工、事实和验收数量、固定独立断言数量；失败阶段仍保留已知计数。只有四阶段独立判据、真实任务闭环、完整 usage 与清理全部通过，`ok` 才为 true，CLI 才退出 0。
 
+每阶段 `progress` 给出最近一次获准请求的阶段内时间 `lastRequestElapsedMs`（无请求时为 null），以及 `settlement`：固定阶段位置和八项计数，无法读取时为 null。计数来自实际 tracked Agents 的状态、原始 `whenIdle` 等待和本阶段各父子对的结算通知；单独的 idle 或 accepted 不表示运行树已结束。阶段达到限时才记录独立的 `timeoutProgress`，在取消前复制；后续取消、清理和普通 progress 更新不改写它。仅保存固定枚举和数字，不保存会话身份或原始内容。原生 `whenIdle` 等待与两次 tick 保留；通知义务按当前 own-session 模式判定，未知的本阶段新增 activation 阻止结算；独立 grader 与有限额度保持。
+
 原生验证器固定每个获准请求输出容量为8192 tokens，同时配置 provider 默认值与 root agent；官方子会话继承此配置，不降低 reasoning effort。在全局公开 `llm/stream` waterfall 消费边界，以 SDK `isAgentLoopRequest` 的精确对象标记、真实 agent/request 的 agent/turn/step/signal 和受控 root 子树核对归属，只对匹配的一次实际流消费计请求。SDK prepared call 已解析的 provider/model/maxTokens 必须匹配固定路由与8192，错误路由或65536等容量在派发前拒绝。报告 `outputCapacity.source=native-stream-boundary`；自定义离线 harness 为 `custom-harness-unverified`。报告 `auxiliaryPolicy=reject-before-dispatch`：本固定回归不支持辅助 LLM 调用，包括自动 compaction；尝试即拒绝并锁存失败，不能捕获异常后继续获准。生产 preset compaction 保持 auto=true 及其原配置，未被禁用或更改。历史 `native-configuration` 仅证明普通 agent 配置，不能证明辅助请求容量；8192与历史4096不能作同额度性能比较。
 
-本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
+本工具在独立进程使用官方临时 profile，沿用环境提供的 provider 配置和凭据；凭据不进入报告。每进程仅允许一个存活 fixture、每 fixture 一次实际原生启动；启动结算时按原始回调引用及重复次数捕获四种原生 fatal/signal 监听器，全部已启动的应用与 handle 清理实际结算后才释放所属回调并恢复环境、删除 home。超时 race 不代表底层清理完成；此时仍保留回调及独占环境，并保持失败判定，强制退出仅同步删除临时 home。异常监听器基数按固定诊断失败，不扩大删除范围；原有及稍后加入的无关回调保留。这是隔离验证器的资源管理，不修复或证明生产 SDK 的监听器生命周期。仅持久化白名单指标，不保存 reasoning、credentials、模型对话、原始工具输出或任意错误消息。报告不包含可复用数据库或证据日志，因为隔离的 home/workspace 在结束时清除。严格验收结果在清除前由当前源码和真实宿主日志再次检查，固定 grader 由 verifier 控制并在模型工作区外执行。详细阶段判据、软预算与限制见 `docs/ORCHESTRATION.md`。
 
 没有显式 opt-in、非法请求/timeout 参数、超时、超过全局请求上限、provider/tool 错误、usage 缺失、未收口任务、错误执行者复用、无有效 strict 回执或独立断言失败均退出非零。不得用单条模型总结、模型改写后的测试退出码、静态提示词字数或 mock 成功代替真实模型验收。
 
@@ -91,4 +99,4 @@ node tools/verify-model.mjs --model-calls \
 
 总报告及阶段 `runtimeDiagnostics` 保留 step-error、native-tool-error、ptc-tool-error、noncompleted-turn、missing-message、missing-usage、invalid-usage、duplicate-message、route-mismatch、no-requests，并增加 auxiliary-call、stream-attribution、capacity-mismatch、stream-error、stream-admission-error、compaction-error、pending-stream。每个实际消费流按 SDK 最新 cumulative usage 帧计一次，要求完整合法 usage、一次成功终结及迭代耗尽；异常、取消、提前退出、max-tokens或缺终结均失败。流 usage 为原生总量来源，持久 assistant/message 继续独立核验；失败阶段保留已观察 usage 与任务指标，取消/清理等待流结束后再收集最终已知usage。native compaction/end.error 进入运行闸，即使 pre-step 捕获异常并继续也不能 PASS。持久错误和边界拒绝阻止后续派发，拒绝调用不计请求；并发尚在途流不提前作为持久错误，阶段结束必须完整。全局cap80、每阶段180000ms、stream idle30000ms、清理及原生/PTC scope 不变。每类保留计数，最多20条固定枚举/数字索引详情，不保存原始会话ID、路径、错误、工具内容、模型输出或凭据。bash非零退出仍是普通工具结果，真实isError/错误事件才触发工具错误闸。
 
-新四阶段样本按native stream计量58请求215946ms，usage input58054/output41812/cacheRead1526144/cacheWrite0。历史旧计量样本55请求229651ms及六次失败278请求1470626ms保留；旧七次合计333条观察请求1700277ms，辅助发生情况和usage未知。八次混合观察范围合计391请求1916223ms、input422242/output289464/cacheRead9956352/cacheWrite0；此加总不是历史完整provider总量证明。新repair/reuse两阶段41请求156713ms，对历史v0.2.1的58请求144214ms，请求较少而时长更长，输出额度8192/4096、grader及工作量不同，不是同额度受控比较。完整stage/usage、失败与范围说明见验收记录；最终文档包与审核/CI/merge仍待controller完成。
+历史 0.3 四阶段样本按native stream计量58请求215946ms，usage input58054/output41812/cacheRead1526144/cacheWrite0。历史旧计量样本55请求229651ms及六次失败278请求1470626ms保留；旧七次合计333条观察请求1700277ms，辅助发生情况和usage未知。八次混合观察范围合计391请求1916223ms、input422242/output289464/cacheRead9956352/cacheWrite0；此加总不是历史完整provider总量证明。新repair/reuse两阶段41请求156713ms，对历史v0.2.1的58请求144214ms，请求较少而时长更长，输出额度8192/4096、grader及工作量不同，不是同额度受控比较。完整stage/usage、失败与范围说明见验收记录；该段为历史观察；0.4.2 的最终包、审核、CI 与合并状态以本轮记录为准。

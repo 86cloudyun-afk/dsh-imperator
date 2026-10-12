@@ -32,6 +32,29 @@ const snapshot = (store, id) => ({ task: store.taskOf(id, 'run-a').task,
   handoffs: store.handle.prepare('SELECT * FROM handoff WHERE task_id = ? ORDER BY id').all(id) })
 const task = store => store.openTask({ title: 'session ownership' }, 'run-a').task_id
 
+test('Task16 complete owner and display label survive repeated claim and submit', t => {
+  for (const sessionId of ['safe', 'worker\0suffix']) {
+    const store = tempStore(t), id = task(store), actor = { sessionId, isRoot: false }
+    const args = { task_id: id, child_id: 'display\0suffix' }
+    store.claimTask(args, 'run-a', actor, sessionId)
+    const before = snapshot(store, id)
+    assert.throws(() => store.submitTask({ task_id: id }, 'run-a', { sessionId: 'worker', isRoot: false }), { code: 'E_TASK_CONFLICT' })
+    assert.deepEqual(snapshot(store, id), before)
+    assert.equal(store.claimTask(args, 'run-a', actor, sessionId).owner, args.child_id)
+    assert.equal(store.taskOf(id, 'run-a').task.owner_session, sessionId)
+    assert.equal(store.submitTask({ task_id: id }, 'run-a', actor).status, 'submitted')
+    assert.equal(store.submitTask({ task_id: id }, 'run-a', actor).already, true)
+  }
+})
+
+test('Task16 unbound complete label does not authorize its prefix', t => {
+  const store = tempStore(t), id = task(store)
+  store.claimTask({ task_id: id, child_id: 'display\0suffix' }, 'run-a')
+  const before = snapshot(store, id)
+  assert.throws(() => store.closeTask({ task_id: id, result: 'failed' }, 'run-a', 'display'), { code: 'E_TASK_CONFLICT' })
+  assert.deepEqual(snapshot(store, id), before)
+})
+
 for (const action of ['task_submit', 'task_close']) {
   test(`real owner with a display label can ${action}; sibling cannot claim or act using the same label`, async t => {
     const store = tempStore(t), call = caller(store), id = task(store)

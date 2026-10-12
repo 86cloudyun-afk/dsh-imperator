@@ -29,6 +29,70 @@ function input(id, extra = {}) {
 function admit(scheduler, key = 'admit') { return scheduler.admitNext({ request_key: key }, run, lead) }
 function ref(row, extra = {}) { return { request_id: row.request_id, generation: row.generation, ...extra } }
 
+test('Task16 scheduler withdrawal checks complete owner before replay and preserves decisions on refusal', t => {
+  const { store, scheduler: s } = setup(t), full = 'worker\0suffix', id = task(store, full)
+  const args = input(id), queued = s.enqueue(args, run, lead)
+  const withdraw = sessionId => s.withdraw({ request_id: queued.request_id, request_key: 'withdraw' }, run, { role: 'worker', sessionId })
+  const snapshot = () => ({ rows: ['scheduler_request', 'scheduler_decision'].map(table => store.open().prepare('SELECT * FROM ' + table).all()),
+    exact: store.open().prepare('SELECT json_quote(run_id) AS run, json_quote(owner_session) AS owner FROM scheduler_request').all() })
+  let before = snapshot()
+  assert.throws(() => withdraw('worker'), code('E_SCHEDULER_CONFLICT')); assert.deepEqual(snapshot(), before)
+  assert.equal(s.state({}, run, { role: 'worker', sessionId: 'worker' }).requests.length, 0)
+  assert.equal(s.enqueue(args, run, { role: 'worker', sessionId: full }).request_id, queued.request_id)
+  assert.equal(withdraw(full).status, 'withdrawn')
+  before = snapshot()
+  assert.throws(() => withdraw('worker'), code('E_SCHEDULER_CONFLICT')); assert.deepEqual(snapshot(), before)
+})
+
+test('Task16 full run survives withdrawal response, persisted decision and exact replay', t => {
+  const { store, scheduler: s } = setup(t), full = 'root\0suffix', owner = 'worker\0suffix'
+  const id = task(store, owner, full), queued = s.enqueue(input(id), full, { role: 'lead', sessionId: full })
+  const args = { request_id: queued.request_id, request_key: 'withdraw\0suffix' }, actor = { role: 'worker', sessionId: owner }
+  const result = s.withdraw(args, full, actor)
+  assert.equal(result.request.run_id, full)
+  const saved = store.open().prepare('SELECT result FROM scheduler_decision WHERE run_id=? AND request_key=?').get(full, args.request_key).result
+  assert.equal(JSON.parse(saved).result.request.run_id, full)
+  const changes = store.open().prepare('SELECT total_changes() AS n').get().n
+  const replay = s.withdraw(args, full, actor)
+  assert.equal(replay.replay, true); assert.equal(replay.request.run_id, full)
+  assert.equal(store.open().prepare('SELECT total_changes() AS n').get().n, changes)
+})
+
+test('Task16 full run flows through FIFO admission, queued and admitted state and transition', t => {
+  const { store, scheduler: s } = setup(t), full = 'root\0suffix', owner = 'worker\0suffix'
+  const id = task(store, owner, full), authority = { role: 'lead', sessionId: full }
+  s.enqueue(input(id), full, authority)
+  assert.equal(s.state({}, full, authority).requests[0].run_id, full)
+  const admitted = s.admitNext({ request_key: 'admit' }, full, authority)
+  assert.equal(admitted.status, 'admitted'); assert.equal(admitted.request.run_id, full)
+  assert.equal(s.state({}, full, authority).requests[0].run_id, full)
+  assert.equal(s.bind(ref(admitted.request, { session_id: owner }), full, { role: 'worker', sessionId: owner }).run_id, full)
+})
+
+for (const side of ['current', 'captured']) test('Task16 scheduler independently rejects different full ' + side + ' owner', t => {
+  const { store, scheduler: s } = setup(t), a = 'worker\0first', b = 'worker\0second'
+  const captured = side === 'current' ? b : a, current = side === 'current' ? a : b
+  const id = task(store, captured), args = input(id)
+  s.enqueue(args, run, lead)
+  store.submitTask({ task_id: id }, run, { sessionId: captured, isRoot: false })
+  store.rejectTask({ task_id: id, reason: 'reassign' }, run, { sessionId: run, isRoot: true })
+  store.claimTask({ task_id: id, child_id: 'replacement' }, run, { sessionId: run, isRoot: true }, current)
+  const before = s.state({}, run, lead), decisions = store.open().prepare('SELECT * FROM scheduler_decision').all()
+  assert.throws(() => s.enqueue(args, run, { role: 'worker', sessionId: b }), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(s.state({}, run, lead), before)
+  assert.deepEqual(store.open().prepare('SELECT * FROM scheduler_decision').all(), decisions)
+})
+
+test('Task16 scheduler SQL request keys keep NUL keys distinct', t => {
+  const { store, scheduler: s } = setup(t), id = task(store)
+  const first = s.enqueue(input(id, { request_key: 'queue\0suffix' }), run, lead)
+  const second = s.enqueue(input(id, { request_key: 'queue' }), run, lead)
+  assert.notEqual(first.request_id, second.request_id)
+  const before = s.state({}, run, lead)
+  assert.throws(() => s.enqueue(input(id, { request_key: 'queue\0suffix', mode: 'write' }), run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(s.state({}, run, lead), before)
+})
+
 test('queue replay, atomic admission, and dispatch-decision replay never consume the next request', t => {
   const { store, scheduler: s, governor: g } = setup(t)
   const a = s.enqueue(input(task(store)), run, worker)
@@ -193,6 +257,130 @@ test('prepared identity uses the exact live ancestor chain and never creates or 
   child.session.header.parentSession = 'missing'
   assert.throws(() => host.prepareNativeIdentity(ctx, { version: '0.2.0-rc.2', parentAgent: child, session_id: 'x' }), code('E_SCHEDULER_CAPABILITY'))
 })
+
+function identityAgent(id, header = {}, options) {
+  return { id, session: { header: { id, ...header } }, ...(options === undefined ? {} : { options }) }
+}
+function identityFixture(version, nodes) {
+  const live = new Map(nodes.map(agent => [agent.id, agent])), lookups = []
+  const agents = { get(id) { lookups.push(id); return live.get(id) },
+    create() { assert.fail('identity preparation must not create an agent') } }
+  return { live, lookups, prepare(parentAgent, session_id = ' reserved ') {
+    return host.prepareNativeIdentity({ get: name => name === 'agents' ? agents : undefined },
+      { version, parentAgent, session_id })
+  } }
+}
+function preparedIdentity(fixture, parent, root, depth) {
+  const value = fixture.prepare(parent)
+  assert.deepEqual(value, { session_id: ' reserved ', parent_session_id: parent.id,
+    root_run_id: root.id, delegation_depth: depth, native_enabled: false })
+  assert.ok(Object.isFrozen(value))
+}
+
+for (const version of ['0.2.0-rc.2', '0.2.1-alpha.2']) {
+  test(`H01 ${version}: an ordinary fork starts its own run without reading seed ancestry`, () => {
+    const source = identityAgent('source', { origin: 'subagent', delegationDepth: 2, parentSession: 'offline' })
+    const fork = identityAgent('fork', { parentSession: source.id, isSeeded: true })
+    const fixture = identityFixture(version, [source, fork])
+    preparedIdentity(fixture, fork, fork, 1)
+    assert.ok(!fixture.lookups.includes(source.id))
+  })
+  test(`H01 ${version}: a fork and its real child work with the seed source offline`, () => {
+    const fork = identityAgent('fork', { parentSession: 'offline-seed', isSeeded: true })
+    const child = identityAgent('child', { parentSession: fork.id, origin: 'subagent', delegationDepth: 1 })
+    const fixture = identityFixture(version, [fork, child])
+    preparedIdentity(fixture, fork, fork, 1)
+    preparedIdentity(fixture, child, fork, 2)
+    assert.ok(!fixture.lookups.includes('offline-seed'))
+  })
+  test(`H01 ${version}: ordinary roots stop before even reading a seed parent field`, () => {
+    const root = identityAgent('root', { delegationDepth: 0 }, { subagentDepth: 0 })
+    Object.defineProperty(root.session.header, 'parentSession', { get() { assert.fail('seed ancestry must not be read') } })
+    preparedIdentity(identityFixture(version, [root]), root, root, 1)
+  })
+  for (const [label, headerDepth, runtimeDepth, expected] of [
+    ['ordinary root', undefined, undefined, 1],
+    ['runtime-only child', undefined, 1, 2],
+    ['runtime-only depth two', undefined, 2, null],
+    ['durable depth survives runtime zero', 1, 0, 2],
+    ['runtime deepens durable zero', 0, 1, 2],
+    ['durable two survives runtime one', 2, 1, null],
+    ['runtime two deepens durable one', 1, 2, null],
+  ]) {
+    test(`H01 ${version}: ${label}`, () => {
+      const root = identityAgent('root')
+      const current = label === 'ordinary root' ? root : identityAgent('child',
+        { parentSession: root.id, delegationDepth: headerDepth }, { subagentDepth: runtimeDepth })
+      const fixture = identityFixture(version, [root, current])
+      if (expected === null) assert.throws(() => fixture.prepare(current), code('E_SCHEDULER_CAPABILITY'))
+      else preparedIdentity(fixture, current, root, expected)
+    })
+  }
+  test(`H01 ${version}: origin-only live delegation edges count toward the depth limit`, () => {
+    const root = identityAgent('root', { parentSession: 'offline-seed' })
+    const child = identityAgent('child', { parentSession: root.id, origin: 'subagent' })
+    const grandchild = identityAgent('grandchild', { parentSession: child.id, origin: 'subagent' })
+    const fixture = identityFixture(version, [root, child, grandchild])
+    preparedIdentity(fixture, child, root, 2)
+    assert.throws(() => fixture.prepare(grandchild), code('E_SCHEDULER_CAPABILITY'))
+  })
+  test(`H01 ${version}: a fork grandchild cannot prepare depth three`, () => {
+    const fork = identityAgent('fork', { parentSession: 'offline-seed' })
+    const child = identityAgent('child', { parentSession: fork.id, origin: 'subagent', delegationDepth: 1 })
+    const grandchild = identityAgent('grandchild', { parentSession: child.id, origin: 'subagent', delegationDepth: 2 })
+    assert.throws(() => identityFixture(version, [fork, child, grandchild]).prepare(grandchild), code('E_SCHEDULER_CAPABILITY'))
+  })
+  for (const [label, value] of [['negative', -1], ['negative zero', -0], ['fraction', 1.5], ['NaN', NaN],
+    ['infinity', Infinity], ['unsafe integer', Number.MAX_SAFE_INTEGER + 1], ['null', null], ['string', '1'], ['boolean', true]]) {
+    for (const source of ['durable', 'runtime']) {
+      test(`H01 ${version}: rejects ${source} ${label} depth`, () => {
+        const root = identityAgent('root')
+        const current = identityAgent('child', { parentSession: root.id, delegationDepth: source === 'durable' ? value : 1 },
+          { subagentDepth: source === 'runtime' ? value : 1 })
+        assert.throws(() => identityFixture(version, [root, current]).prepare(current), code('E_SCHEDULER_CAPABILITY'))
+      })
+    }
+  }
+  test(`H01 ${version}: validates runtime depths on live ancestors too`, () => {
+    const root = identityAgent('root', {}, { subagentDepth: -1 })
+    const child = identityAgent('child', { parentSession: root.id, origin: 'subagent', delegationDepth: 1 })
+    assert.throws(() => identityFixture(version, [root, child]).prepare(child), code('E_SCHEDULER_CAPABILITY'))
+  })
+  for (const parentSession of [undefined, null, '', 'offline']) {
+    for (const classification of ['origin', 'durable', 'runtime']) {
+      test(`H01 ${version}: ${classification} delegation refuses missing parent ${String(parentSession)}`, () => {
+        const child = identityAgent('child', { parentSession,
+          ...(classification === 'origin' ? { origin: 'subagent' } : {}),
+          ...(classification === 'durable' ? { delegationDepth: 1 } : {}) },
+        classification === 'runtime' ? { subagentDepth: 1 } : undefined)
+        assert.throws(() => identityFixture(version, [child]).prepare(child), code('E_SCHEDULER_CAPABILITY'))
+      })
+    }
+  }
+  test(`H01 ${version}: reconstructed objects and fresh proxies cannot replace exact live agents`, () => {
+    const root = identityAgent('root')
+    const fixture = identityFixture(version, [root])
+    assert.throws(() => fixture.prepare({ ...root }), code('E_SCHEDULER_CAPABILITY'))
+    assert.throws(() => fixture.prepare(new Proxy(root, {})), code('E_SCHEDULER_CAPABILITY'))
+    root.session.header.id = 'other'
+    assert.throws(() => fixture.prepare(root), code('E_SCHEDULER_CAPABILITY'))
+  })
+  test(`H01 ${version}: occupied reserved IDs and cyclic delegated ancestry refuse`, () => {
+    const root = identityAgent('root')
+    const child = identityAgent('child', { parentSession: root.id, origin: 'subagent' })
+    const fixture = identityFixture(version, [root, child])
+    assert.throws(() => fixture.prepare(root, child.id), code('E_SCHEDULER_CAPABILITY'))
+    root.session.header.origin = 'subagent'
+    root.session.header.parentSession = child.id
+    assert.throws(() => fixture.prepare(child), { code: 'E_SCHEDULER_CAPABILITY', message: 'broken live ancestor identity' })
+  })
+  test(`H01 ${version}: ancestry traversal remains bounded at 64 live nodes`, () => {
+    const nodes = Array.from({ length: 65 }, (_, i) => identityAgent('node-' + i,
+      i === 64 ? {} : { parentSession: 'node-' + (i + 1), origin: 'subagent' }))
+    assert.throws(() => identityFixture(version, nodes).prepare(nodes[0]),
+      { code: 'E_SCHEDULER_CAPABILITY', message: 'ancestor chain exceeds bound' })
+  })
+}
 
 test('binding a lead-queued unbound task captures its actual worker for scoped state and replay', t => {
   const { store, scheduler: s } = setup(t)
@@ -389,6 +577,349 @@ function durableSchedulingRows(store) {
     .map(table => ({ table, rows: store.open().prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all() })))
 }
 
+function withdraw(scheduler, row, requestKey = 'withdraw', authority = worker, scope = run) {
+  assert.equal(typeof scheduler.withdraw, 'function', 'host-only withdraw API missing')
+  return scheduler.withdraw({ request_id: row.request_id, request_key: requestKey }, scope, authority)
+}
+function rowBytes(store, tables) {
+  return JSON.stringify(tables.map(table => [table, store.open().prepare('SELECT * FROM ' + table + ' ORDER BY rowid').all()]))
+}
+function taskGovernorBytes(store) {
+  return rowBytes(store, ['task', 'governor_run', 'governor_reservation', 'governor_retry_charge', 'governor_hold', 'governor_audit'])
+}
+function changes(store) { return store.open().prepare('SELECT total_changes() AS n').get().n }
+function queueRow(store, row) { return { ...store.open().prepare('SELECT * FROM scheduler_request WHERE request_id = ?').get(row.request_id) } }
+
+test('withdraw removes only a queued intent and preserves ordinary FIFO, exact payload, and bounded state', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const a = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+  const b = s.enqueue(input(task(store)), run, worker)
+  const c = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const before = taskGovernorBytes(store), original = queueRow(store, b)
+  const result = withdraw(s, b)
+  assert.deepEqual(result, { status: 'withdrawn', request: { ...b, state: 'withdrawn' }, replay: false })
+  assert.deepEqual(queueRow(store, b), { ...original, state: 'withdrawn' })
+  assert.equal(taskGovernorBytes(store), before)
+  assert.deepEqual(s.enqueue(input(b.task_id), run, worker), result.request)
+  const page = s.state({ limit: 2 }, run, worker)
+  assert.deepEqual(page.requests.map(row => row.state), ['queued', 'withdrawn'])
+  assert.equal(page.has_more, true)
+  assert.deepEqual(s.state({ after: page.next_after, limit: 2 }, run, worker).requests, [c])
+  assert.equal(admit(s, 'first').request.request_id, a.request_id)
+  assert.equal(admit(s, 'second').request.request_id, c.request_id)
+  assert.equal(admit(s, 'empty').status, 'empty')
+})
+
+for (const kind of ['new', 'retry']) {
+  test('withdraw unblocks FIFO after default cumulative ' + kind + ' budget is exhausted without changing task or governor rows', t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    const id = task(store), limits = g.snapshot(run).limits
+    let generation = 0
+    const count = kind === 'new' ? limits.max_created : limits.max_retries
+    for (let i = 0; i < count; i++) {
+      const reservation = g.reserve({ operation_key: 'consume-' + i, task_id: id, generation,
+        kind, mode: 'read', resources: [] }, run, lead)
+      generation = reservation.generation
+      g.settle({ reservation_id: reservation.reservation_id, generation, proof: { kind: 'never_started' } }, run, lead)
+    }
+    const head = s.enqueue(input(id, { generation, kind }), run, worker)
+    const tail = s.enqueue(input(task(store)), run, worker)
+    assert.equal(g.snapshot(run).active_total, 0)
+    for (const decision of ['blocked-once', 'blocked-again']) {
+      const blocked = admit(s, decision)
+      assert.equal(blocked.status, 'blocked')
+      assert.equal(blocked.code, 'E_BUDGET_EXHAUSTED')
+      assert.equal(blocked.request.request_id, head.request_id)
+    }
+    const before = taskGovernorBytes(store), original = queueRow(store, head)
+    assert.equal(withdraw(s, head).status, 'withdrawn')
+    assert.equal(taskGovernorBytes(store), before)
+    assert.deepEqual(queueRow(store, head), { ...original, state: 'withdrawn' })
+    assert.equal(admit(s, 'blocked-once').status, 'blocked', 'historical admission decision stays historical')
+    assert.equal(admit(s, 'after-withdraw').request.request_id, tail.request_id)
+    const snapshot = g.snapshot(run)
+    assert.deepEqual(snapshot.limits, limits)
+    assert.equal(kind === 'new' ? snapshot.created_total : snapshot.retries[id], count)
+  })
+}
+
+test('withdraw explicitly clears temporary resource FIFO blockage without releasing the other run hold', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const external = task(store, worker.sessionId, 'other')
+  g.reserve({ operation_key: 'external', task_id: external, generation: 0, kind: 'new', mode: 'write', resources: ['repo'] }, 'other', lead)
+  const head = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+  const tail = s.enqueue(input(task(store)), run, worker)
+  for (const decision of ['blocked-a', 'blocked-b']) {
+    const blocked = admit(s, decision)
+    assert.equal(blocked.code, 'E_RESOURCE_BUSY')
+    assert.equal(blocked.request.request_id, head.request_id)
+    assert.equal(s.state({}, run, worker).requests[1].state, 'queued')
+  }
+  const before = taskGovernorBytes(store)
+  withdraw(s, head)
+  assert.equal(taskGovernorBytes(store), before)
+  assert.equal(admit(s, 'after-withdraw').request.request_id, tail.request_id)
+  assert.equal(g.snapshot('other').holds.length, 1)
+})
+
+test('withdraw validates exact bounded keys, input shape, trusted authority and root run without writes', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const row = s.enqueue(input(task(store)), run, worker)
+  assert.equal(typeof s.withdraw, 'function', 'host-only withdraw API missing')
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), initialChanges = changes(store)
+  const valid = { request_id: row.request_id, request_key: ' withdraw ' }
+  for (const value of [undefined, null, 1, '', ' ', 'x'.repeat(513), '界'.repeat(171)]) {
+    for (const field of ['request_id', 'request_key']) {
+      assert.throws(() => s.withdraw({ ...valid, [field]: value }, run, worker), code('E_SCHEDULER_CONFLICT'))
+    }
+  }
+  for (const invalid of [null, [], {}, { ...valid, generation: 0 }, { ...valid, run_id: run }]) {
+    assert.throws(() => s.withdraw(invalid, run, worker), code('E_SCHEDULER_CONFLICT'))
+  }
+  for (const authority of [undefined, {}, { role: 'root', sessionId: lead.sessionId },
+    { ...worker, sessionId: '' }, { ...worker, sessionId: 's'.repeat(513) }, { ...worker, sessionId: 'child' }]) {
+    assert.throws(() => s.withdraw(valid, run, authority), code('E_SCHEDULER_CONFLICT'))
+  }
+  for (const scope of ['', 'run', 'other', 'r'.repeat(513)]) {
+    assert.throws(() => s.withdraw(valid, scope, lead), code('E_SCHEDULER_CONFLICT'))
+  }
+  assert.throws(() => s.withdraw({ ...valid, request_id: 'missing' }, run, lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  assert.equal(s.withdraw(valid, run, worker).replay, false)
+  assert.equal(s.withdraw(valid, run, worker).replay, true)
+  assert.throws(() => s.withdraw({ ...valid, request_key: 'withdraw' }, run, worker), code('E_SCHEDULER_CONFLICT'))
+})
+
+test('withdraw requires current and captured owners before first mutation and before replay; same-run lead can recover', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const root = { sessionId: lead.sessionId, isRoot: true }, original = { sessionId: worker.sessionId, isRoot: false }
+  const replacement = { role: 'worker', sessionId: 'replacement' }
+  const rows = []
+  for (let i = 0; i < 2; i++) {
+    const id = task(store)
+    store.submitTask({ task_id: id }, run, original)
+    store.rejectTask({ task_id: id, reason: 'reassignment' }, run, root)
+    rows.push(s.enqueue(input(id), run, worker))
+  }
+  const historical = withdraw(s, rows[0], 'historical')
+  for (const row of rows) store.claimTask({ task_id: row.task_id, child_id: 'replacement' }, run, root, replacement.sessionId)
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store), initialChanges = changes(store)
+  for (const authority of [worker, replacement]) {
+    assert.throws(() => withdraw(s, rows[0], 'historical', authority), code('E_SCHEDULER_CONFLICT'))
+    assert.throws(() => withdraw(s, rows[1], 'new', authority), code('E_SCHEDULER_CONFLICT'))
+  }
+  assert.throws(() => withdraw(s, rows[0], 'historical', lead, 'other'), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  assert.deepEqual(withdraw(s, rows[0], 'historical', lead), { ...historical, replay: true })
+  assert.equal(changes(store), initialChanges)
+  assert.equal(withdraw(s, rows[1], 'lead-recovery', lead).status, 'withdrawn')
+  assert.equal(taskGovernorBytes(store), taskBefore)
+})
+
+test('withdraw rejects worker claim of a lead-queued null captured owner without capturing it; lead can withdraw', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const id = store.openTask({ title: 'unbound intent' }, run).task_id
+  const row = s.enqueue(input(id), run, lead)
+  store.claimTask({ task_id: id, child_id: 'label' }, run, { sessionId: worker.sessionId, isRoot: false }, worker.sessionId)
+  g.snapshot(run)
+  const before = taskGovernorBytes(store), queue = queueRow(store, row), initialChanges = changes(store)
+  assert.equal(queue.owner_session, null)
+  assert.throws(() => withdraw(s, row), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.deepEqual(queueRow(store, row), queue)
+  const first = withdraw(s, row, 'lead-only', lead)
+  assert.throws(() => withdraw(s, row, 'lead-only'), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(taskGovernorBytes(store), before)
+  assert.equal(queueRow(store, row).owner_session, null)
+  assert.deepEqual(withdraw(s, row, 'lead-only', lead), { ...first, replay: true })
+})
+
+test('withdraw decision binds action and target, rejects fresh keys on withdrawn intents, and replays read-only after reopen', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const row = s.enqueue(input(task(store)), run, worker), other = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const first = withdraw(s, row, ' exact-withdraw ')
+  const record = store.open().prepare('SELECT * FROM scheduler_decision WHERE request_key = ?').get(' exact-withdraw ')
+  assert.deepEqual(JSON.parse(record.result), { action: 'withdraw', request_id: row.request_id,
+    result: { status: 'withdrawn', request: first.request } })
+  assert.equal(record.actor_session, worker.sessionId)
+  const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store), initialChanges = changes(store)
+  assert.throws(() => withdraw(s, row, 'new-key'), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => withdraw(s, other, ' exact-withdraw '), code('E_SCHEDULER_CONFLICT'))
+  assert.throws(() => admit(s, ' exact-withdraw '), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(withdraw(s, row, ' exact-withdraw '), { ...first, replay: true })
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  t.after(() => reopened.close())
+  const restored = new module.TaskforceScheduler(reopened)
+  const reopenedChanges = changes(reopened)
+  assert.deepEqual(withdraw(restored, row, ' exact-withdraw '), { ...first, replay: true })
+  assert.deepEqual(withdraw(restored, row, ' exact-withdraw ', lead), { ...first, replay: true })
+  assert.equal(changes(reopened), reopenedChanges)
+  assert.equal(durableSchedulingRows(reopened), before)
+  assert.equal(taskGovernorBytes(reopened), taskBefore)
+  assert.deepEqual(restored.enqueue(input(row.task_id), run, worker), first.request)
+})
+
+test('withdraw refuses an existing untagged admission key while historical admission replay stays compatible', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const old = admit(s, 'empty-admission')
+  assert.equal(old.status, 'empty')
+  const row = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), initialChanges = changes(store)
+  assert.throws(() => withdraw(s, row, 'empty-admission'), code('E_SCHEDULER_CONFLICT'))
+  assert.deepEqual(admit(s, 'empty-admission'), { ...old, replay: true })
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+  assert.equal(withdraw(s, row, 'fresh-key').status, 'withdrawn')
+})
+
+for (const state of ['reserved', 'running', 'unknown', 'settled', 'refused']) {
+  test('withdraw refuses ' + state + ' requests without changing reservations, holds, tasks or decisions', t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    const row = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+    if (state === 'refused') {
+      const direct = g.reserve({ operation_key: 'advance', task_id: row.task_id, generation: 0, kind: 'reuse', mode: 'read', resources: [] }, run, lead)
+      g.settle({ reservation_id: direct.reservation_id, generation: direct.generation, proof: { kind: 'never_started' } }, run, lead)
+      assert.equal(admit(s).status, 'refused')
+    } else {
+      const admitted = admit(s).request
+      assert.equal(queueRow(store, row).state, 'admitted')
+      if (['running', 'unknown'].includes(state)) s.bind(ref(admitted, { session_id: worker.sessionId }), run, worker)
+      if (state === 'unknown') s.markUnknown(ref(admitted, { reason: 'DELIVERY_UNKNOWN' }), run, worker)
+      if (state === 'settled') s.settle(ref(admitted, { proof: { kind: 'never_started' } }), run, lead)
+    }
+    assert.equal(s.state({}, run, lead).requests[0].state, state)
+    g.snapshot(run)
+    const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store), initialChanges = changes(store)
+    for (const authority of [lead, worker]) assert.throws(() => withdraw(s, row, 'invalid', authority), code('E_SCHEDULER_CONFLICT'))
+    assert.equal(changes(store), initialChanges)
+    assert.equal(durableSchedulingRows(store), before)
+    assert.equal(taskGovernorBytes(store), taskBefore)
+  })
+}
+
+test('withdraw refuses even a queued row if a reservation is already attached', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const row = s.enqueue(input(task(store), { mode: 'write', resources: ['repo'] }), run, worker)
+  admit(s)
+  store.open().prepare("UPDATE scheduler_request SET state = 'queued' WHERE request_id = ?").run(row.request_id)
+  g.snapshot(run)
+  const before = durableSchedulingRows(store), initialChanges = changes(store)
+  assert.throws(() => withdraw(s, row, 'invalid', lead), code('E_SCHEDULER_CONFLICT'))
+  assert.equal(changes(store), initialChanges)
+  assert.equal(durableSchedulingRows(store), before)
+})
+
+for (const fault of ['cas', 'decision-insert', 'outer-rollback']) {
+  test('withdraw rolls back queue and decision on ' + fault + ' failure', t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    const row = s.enqueue(input(task(store)), run, worker)
+    g.snapshot(run)
+    const before = durableSchedulingRows(store), taskBefore = taskGovernorBytes(store)
+    if (fault === 'cas') store.open().exec("CREATE TRIGGER reject_withdraw BEFORE UPDATE OF state ON scheduler_request WHEN NEW.state = 'withdrawn' BEGIN SELECT RAISE(IGNORE); END")
+    if (fault === 'decision-insert') store.open().exec("CREATE TRIGGER reject_withdraw BEFORE INSERT ON scheduler_decision BEGIN SELECT RAISE(ABORT, 'injected withdraw decision failure'); END")
+    if (fault === 'outer-rollback') {
+      assert.throws(() => withWriteTransaction(store.open(), () => {
+        assert.equal(withdraw(s, row).status, 'withdrawn')
+        throw new Error('outer withdraw rollback')
+      }), /outer withdraw rollback/)
+    } else assert.throws(() => withdraw(s, row), fault === 'cas' ? code('E_SCHEDULER_CONFLICT') : /injected withdraw decision failure/)
+    assert.equal(durableSchedulingRows(store), before)
+    assert.equal(taskGovernorBytes(store), taskBefore)
+    if (fault !== 'outer-rollback') store.open().exec('DROP TRIGGER reject_withdraw')
+    assert.equal(withdraw(s, row).replay, false)
+  })
+}
+
+async function schedulerRace(t, store, commands) {
+  const children = commands.map(({ action, key, target = '' }) => fork(new URL('./fixtures/scheduler-worker.mjs', import.meta.url),
+    [store.root, run, key, action, target], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] }))
+  t.after(() => { for (const child of children) if (child.exitCode === null) child.kill() })
+  const ready = (await Promise.all(children.map(child => once(child, 'message')))).map(([message]) => message)
+  assert.ok(ready.every(message => message.ready))
+  assert.equal(new Set(ready.map(message => message.pid)).size, 2, 'two independent child processes opened SQLite connections')
+  const replies = children.map(child => once(child, 'message')), exits = children.map(child => once(child, 'exit'))
+  for (const child of children) child.send('go')
+  const results = (await Promise.all(replies)).map(([reply]) => reply)
+  for (const [exitCode, signal] of await Promise.all(exits)) { assert.equal(exitCode, 0); assert.equal(signal, null) }
+  return results
+}
+
+for (const sameKey of [false, true]) {
+  test('withdraw and admit race on two process connections with ' + (sameKey ? 'one shared key' : 'distinct keys') + ' has only serial outcomes', { timeout: 12000 }, async t => {
+    const { store, scheduler: s, governor: g } = setup(t)
+    assert.equal(typeof s.withdraw, 'function', 'host-only withdraw API missing')
+    const head = s.enqueue(input(task(store), { kind: 'new', mode: 'write', resources: ['repo'] }), run, worker)
+    const tail = s.enqueue(input(task(store)), run, worker)
+    g.snapshot(run)
+    const taskBefore = rowBytes(store, ['task'])
+    const [withdrawal, admission] = await schedulerRace(t, store, [
+      { action: 'withdraw', key: 'race-withdraw', target: head.request_id },
+      { action: 'admit', key: sameKey ? 'race-withdraw' : 'race-admit' },
+    ])
+    const rows = s.state({}, run, lead).requests, snapshot = g.snapshot(run)
+    if (withdrawal.result) {
+      assert.equal(withdrawal.result.status, 'withdrawn')
+      assert.equal(rows[0].state, 'withdrawn')
+      assert.equal(rows[0].reservation_id, null)
+      if (sameKey) {
+        assert.equal(admission.error, 'E_SCHEDULER_CONFLICT')
+        assert.equal(rows[1].state, 'queued')
+        assert.equal(snapshot.active_total, 0)
+      } else {
+        assert.equal(admission.error, undefined)
+        assert.equal(admission.result.request.request_id, tail.request_id)
+        assert.equal(snapshot.active_total, 1)
+      }
+      assert.equal(snapshot.created_total, 0)
+      assert.equal(snapshot.holds.length, 0)
+    } else {
+      assert.equal(withdrawal.error, 'E_SCHEDULER_CONFLICT')
+      assert.equal(admission.error, undefined)
+      assert.equal(admission.result.request.request_id, head.request_id)
+      assert.equal(rows[0].state, 'reserved')
+      assert.equal(rows[1].state, 'queued')
+      assert.equal(snapshot.active_total, 1)
+      assert.equal(snapshot.created_total, 1)
+      assert.equal(snapshot.holds.length, 1)
+    }
+    assert.equal(snapshot.reservations.length, snapshot.active_total)
+    assert.equal(snapshot.retry_charges.length, snapshot.active_total)
+    assert.equal(rowBytes(store, ['task']), taskBefore)
+    assert.equal(store.open().prepare('SELECT COUNT(*) AS n FROM scheduler_decision').get().n,
+      withdrawal.result && !sameKey ? 2 : 1)
+  })
+}
+
+test('withdraw same-key race on two process connections commits once with a zero-write replay', { timeout: 12000 }, async t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  assert.equal(typeof s.withdraw, 'function', 'host-only withdraw API missing')
+  const row = s.enqueue(input(task(store)), run, worker)
+  g.snapshot(run)
+  const before = taskGovernorBytes(store)
+  const command = { action: 'withdraw', key: 'shared-withdraw', target: row.request_id }
+  const replies = await schedulerRace(t, store, [command, command])
+  assert.ok(replies.every(reply => reply.error === undefined))
+  const first = replies.find(reply => !reply.result.replay), replay = replies.find(reply => reply.result.replay)
+  assert.ok(first)
+  assert.ok(replay)
+  assert.deepEqual(replay.result, { ...first.result, replay: true })
+  assert.equal(replay.changes, 0)
+  assert.equal(first.changes, 2)
+  assert.equal(taskGovernorBytes(store), before)
+  assert.equal(store.open().prepare('SELECT COUNT(*) AS n FROM scheduler_decision').get().n, 1)
+  assert.equal(s.state({}, run, lead).requests[0].state, 'withdrawn')
+})
+
 test('scheduler historical settled replay preserves the newer admission through reopening', t => {
   const { store, scheduler: s, governor: g } = setup(t)
   const id = task(store)
@@ -422,3 +953,322 @@ test('scheduler historical settled replay preserves the newer admission through 
   assert.equal(JSON.stringify(restored.state({}, run, lead)), queue)
   assert.equal(durableSchedulingRows(reopened), rows)
 })
+
+// Task19 P6: fresh post16 closure; inherited Node24 Q1 fixtures remain separate.
+for (const [position, fullRun, owner] of [
+  ['leading', '\u0000run', '\u0000worker'],
+  ['middle', 'run\u0000tail', 'worker\u0000tail'],
+  ['trailing', 'run\u0000', 'worker\u0000'],
+  ['literal-T', 'Trun', 'Tworker'],
+  ['literal-J', 'J"run"', 'J"worker"'],
+  ['literal-JSON', '{"run":true}', '{"worker":true}'],
+  ['literal-backslash', 'run\\u0000tail', 'worker\\u0000tail'],
+  ['Unicode', '运行🔑', '工作人员🔑'],
+]) for (const scopeKind of ['safe-run', 'full-run']) {
+  test('Task19 scheduler view preserves session and new request run: ' + position + '/' + scopeKind, t => {
+    const { store, scheduler: s } = setup(t)
+    const scope = scopeKind === 'safe-run' ? run : fullRun
+    const actor = { role: 'worker', sessionId: owner }
+    const args = input(task(store, owner, scope))
+    const queued = s.enqueue(args, scope, actor)
+    const checkQueueStorage = source => {
+      const stored = source.open().prepare('SELECT json_quote(run_id) AS run, typeof(run_id) AS run_type, json_quote(owner_session) AS owner, typeof(owner_session) AS owner_type FROM scheduler_request WHERE request_id = ?').get(queued.request_id)
+      assert.deepEqual([JSON.parse(stored.run), stored.run_type, JSON.parse(stored.owner), stored.owner_type],
+        [scope, 'text', owner, 'text'])
+    }
+    checkQueueStorage(store)
+    assert.equal(queued.run_id, scope)
+    assert.equal(queued.session_id, null)
+    assert.equal(queued.reservation_id, null)
+    assert.equal(queued.generation, 0)
+    assert.equal(queued.state, 'queued')
+    assert.deepEqual(s.enqueue(args, scope, actor), queued)
+    const admitted = s.admitNext({ request_key: 'admit' }, scope, lead)
+    assert.equal(admitted.status, 'admitted')
+    assert.equal(admitted.request.run_id, scope)
+    assert.equal(admitted.request.session_id, null)
+    assert.equal(admitted.request.generation, 1)
+    const bound = s.bind(ref(admitted.request, { session_id: owner }), scope, actor)
+    const checkSessionStorage = source => {
+      const stored = source.open().prepare('SELECT json_quote(session_id) AS session, typeof(session_id) AS session_type FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?').get(bound.reservation_id, scope, queued.task_id)
+      assert.deepEqual([JSON.parse(stored.session), stored.session_type], [owner, 'text'])
+    }
+    checkSessionStorage(store)
+    assert.equal(bound.run_id, scope)
+    assert.equal(bound.session_id, owner)
+    assert.equal(bound.state, 'running')
+    const check = (scheduler, source) => {
+      checkQueueStorage(source)
+      checkSessionStorage(source)
+      assert.deepEqual(scheduler.enqueue(args, scope, actor), bound)
+      for (const authority of [lead, actor]) {
+        const page = scheduler.state({}, scope, authority)
+        assert.equal(page.run_id, scope)
+        assert.deepEqual(page.requests, [bound])
+        assert.equal(page.has_more, false)
+        assert.equal(page.next_after, null)
+        assert.ok(Buffer.byteLength(JSON.stringify(page)) <= 65536)
+      }
+      const prefix = owner.split('\u0000')[0]
+      const other = prefix && prefix !== owner ? prefix : 'different-worker'
+      assert.deepEqual(scheduler.state({}, scope, { role: 'worker', sessionId: other }).requests, [])
+      assert.deepEqual(scheduler.admitNext({ request_key: 'admit' }, scope, lead), { ...admitted, replay: true })
+    }
+    check(s, store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try {
+      const restored = new module.TaskforceScheduler(reopened)
+      check(restored, reopened)
+      const before = reopened.open().prepare('SELECT total_changes() AS n').get().n
+      check(restored, reopened)
+      assert.equal(reopened.open().prepare('SELECT total_changes() AS n').get().n, before)
+      const unknown = restored.markUnknown(ref(bound, { reason: 'delivery unknown' }), scope, actor)
+      assert.equal(unknown.run_id, scope)
+      assert.equal(unknown.session_id, owner)
+      assert.equal(unknown.state, 'unknown')
+      assert.deepEqual(restored.state({}, scope, actor).requests, [unknown])
+      assert.deepEqual(restored.enqueue(args, scope, actor), unknown)
+    } finally { reopened.close() }
+  })
+}
+
+test('Task19 restored long NUL governor session drives the original scheduler byte refusal', t => {
+  const { store, scheduler: s, governor: g } = setup(t)
+  const owner = 's\u0000' + 'x'.repeat(70000)
+  const args = input(task(store, owner))
+  const queued = s.enqueue(args, run, lead)
+  const admitted = admit(s).request
+  assert.equal(admitted.request_id, queued.request_id)
+  // The public governor accepts this identity; scheduler.bind retains its own 512-byte bound.
+  g.bind({ reservation_id: admitted.reservation_id, generation: admitted.generation, session_id: owner }, run, lead)
+  const check = (scheduler, source) => {
+    const stored = source.open().prepare('SELECT json_quote(session_id) AS session, typeof(session_id) AS session_type FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?').get(admitted.reservation_id, run, queued.task_id)
+    assert.deepEqual([JSON.parse(stored.session), stored.session_type], [owner, 'text'])
+    assert.throws(() => scheduler.state({}, run, lead), error =>
+      error.code === 'E_SCHEDULER_CONFLICT' && error.message === 'scheduler state item exceeds response byte limit')
+  }
+  check(s, store)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  try {
+    const restored = new module.TaskforceScheduler(reopened)
+    check(restored, reopened)
+    const before = reopened.open().prepare('SELECT total_changes() AS n').get().n
+    check(restored, reopened)
+    assert.equal(reopened.open().prepare('SELECT total_changes() AS n').get().n, before)
+  } finally { reopened.close() }
+})
+
+// Q3 stays Task16-owned: assert its durable closure without another product decoder.
+test('Task19 delegated withdrawal closure preserves full run after reopen without duplicate writes', t => {
+  const { store, scheduler: s } = setup(t), scope = 'task19-withdraw\0full', owner = 'worker\0full'
+  const actor = { role: 'worker', sessionId: owner }
+  const queued = s.enqueue(input(task(store, owner, scope)), scope, lead)
+  const args = { request_id: queued.request_id, request_key: 'task19-withdraw' }
+  const first = s.withdraw(args, scope, actor)
+  assert.equal(first.status, 'withdrawn'); assert.equal(first.request.run_id, scope)
+  assert.equal(first.request.request_id, queued.request_id)
+  function check(db) {
+    const rows = db.prepare('SELECT json_quote(result) AS result_json, typeof(result) AS result_type'
+      + ' FROM scheduler_decision WHERE run_id=? AND request_key=?').all(scope, args.request_key)
+    assert.equal(rows.length, 1); assert.equal(rows[0].result_type, 'text')
+    const wrapper = JSON.parse(JSON.parse(rows[0].result_json))
+    assert.equal(wrapper.action, 'withdraw'); assert.equal(wrapper.result.request.run_id, scope)
+    assert.equal(wrapper.result.request.request_id, queued.request_id)
+  }
+  check(store.open())
+  const before = store.open().prepare('SELECT total_changes() AS n').get().n
+  assert.deepEqual(s.withdraw(args, scope, actor), { ...first, replay: true })
+  assert.equal(store.open().prepare('SELECT total_changes() AS n').get().n, before)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  try {
+    const restored = new module.TaskforceScheduler(reopened)
+    restored.state({}, scope, lead)
+    const db = reopened.open(), before = db.prepare('SELECT total_changes() AS n').get().n
+    assert.deepEqual(restored.withdraw(args, scope, actor), { ...first, replay: true })
+    check(db)
+    assert.equal(db.prepare('SELECT total_changes() AS n').get().n, before)
+  } finally { reopened.close() }
+})
+
+// Task19 public reader instrumentation: fixed caller suffixes, no helper import.
+const task19ReaderSites = {
+  G1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ?', ['owner_session', 'session_id', 'run_id']],
+  G2: ['*', ' FROM governor_reservation WHERE run_id = ? AND operation_key = ?', ['owner_session', 'run_id', 'session_id']],
+  G3: ['*', ' FROM governor_reservation WHERE reservation_id = ?', ['run_id']],
+  G4: ['*', ' FROM governor_reservation WHERE run_id = ? ORDER BY rowid', ['run_id', 'session_id']],
+  G5: ['h.*', ' FROM governor_hold h JOIN governor_reservation r USING(reservation_id) WHERE r.run_id = ? ORDER BY h.reservation_id, h.resource_key', ['resource_key']],
+  G6: ['*', ' FROM governor_audit WHERE run_id = ? ORDER BY id', ['run_id', 'session_id']],
+  Q1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?', ['session_id']],
+  Q2: ['*', ' FROM scheduler_request WHERE request_id = ?', ['run_id']],
+}
+function task19Transport(values) {
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => [key,
+    typeof value === 'string' ? (value.includes('\0') ? 'J' + JSON.stringify(value) : 'T' + value) : value]))
+}
+function task19Observe(t, store, action, onRow) {
+  const db = store.open(), originalPrepare = db.prepare
+  const trace = { events: [], allPrepares: [], unrelatedPrepares: [], value: undefined }
+  db.prepare = sql => {
+    trace.allPrepares.push(sql)
+    const statement = originalPrepare.call(db, sql)
+    const match = Object.entries(task19ReaderSites).find(([, [, suffix]]) => sql.startsWith('SELECT ') && sql.endsWith(suffix))
+    if (!match) { trace.unrelatedPrepares.push(sql); return statement }
+    const [site, [projection, suffix, fields]] = match
+    const kind = sql === 'SELECT ' + projection + suffix ? 'original' : 'generated'
+    const event = { site, kind, sql, prepare: 1, columns: 0, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [], transport: [] }
+    trace.events.push(event)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...args) => { event.columns++; return columns(...args) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...args) => {
+        event[method]++; event.bindings.push({ method, args: [...args] })
+        const result = read(...args)
+        if (kind === 'generated' && (method === 'get' || method === 'all')) {
+          const rows = method === 'all' ? result : result === undefined ? [] : [result]
+          event.rows.push(rows.length)
+          for (const row of rows) {
+            assert.equal(Object.getPrototypeOf(row), null)
+            event.transport.push(Object.fromEntries(fields.map(field => [field, row[field]])))
+          }
+          onRow?.({ site, method, args, rows, db })
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  try { trace.value = action() } finally {
+    db.prepare = originalPrepare
+    t.diagnostic('Task19 public reader lifecycle ' + JSON.stringify({
+      prepares: trace.allPrepares.length, unrelatedPrepares: trace.unrelatedPrepares.length,
+      events: trace.events.map(event => ({ site: event.site, kind: event.kind,
+        ...(event.kind === 'original' ? { sql: event.sql } : { sqlBytes: Buffer.byteLength(event.sql) }),
+        prepare: event.prepare, columns: event.columns, get: event.get, all: event.all,
+        iterate: event.iterate, run: event.run, bindings: event.bindings, rows: event.rows })),
+    }))
+  }
+  return trace
+}
+function task19AssertTrace(trace, expected) {
+  assert.equal(trace.events.length, expected.length * 2, 'every invocation has exactly one original/generated pair')
+  assert.equal(trace.allPrepares.length, trace.events.length + trace.unrelatedPrepares.length)
+  expected.forEach(([site, method, args, rows, values], index) => {
+    for (const [offset, kind] of [[0, 'original'], [1, 'generated']]) {
+      const event = trace.events[index * 2 + offset]
+      assert.equal(event.site, site); assert.equal(event.kind, kind)
+      assert.deepEqual(Object.fromEntries(['prepare', 'columns', 'get', 'all', 'iterate', 'run'].map(key => [key, event[key]])),
+        { prepare: 1, columns: 1, get: Number(kind === 'generated' && method === 'get'),
+          all: Number(kind === 'generated' && method === 'all'), iterate: 0, run: 0 })
+      assert.deepEqual(event.bindings, kind === 'original' ? [] : [{ method, args }])
+      assert.deepEqual(event.rows, kind === 'original' ? [] : [rows])
+      if (kind === 'generated' && values) assert.deepEqual(event.transport, values.map(task19Transport))
+    }
+  })
+}
+function task19LosslessRows(store) {
+  const db = store.open(), quote = value => '"' + value.replaceAll('"', '""') + '"'
+  return db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(({ name }) => {
+    const columns = db.prepare('PRAGMA table_info(' + quote(name) + ')').all().map(row => row.name)
+    const pairs = columns.flatMap(column => ["'" + column.replaceAll("'", "''") + "'", quote(column)]).join(',')
+    return [name, db.prepare('SELECT json_object(' + pairs + ') AS row_json FROM ' + quote(name) + ' ORDER BY rowid').all()
+      .map(row => JSON.parse(row.row_json))]
+  })
+}
+
+test('Task19 Q1/Q2 public lifecycle counts every nested invocation including empty state and native NULL session', t => {
+  const { store, scheduler: s, governor: g } = setup(t), scope = 'queue-count\0run', owner = 'queue-count\0worker'
+  const actor = { role: 'worker', sessionId: owner }
+  s.state({}, scope, lead); g.snapshot(scope)
+  let trace = task19Observe(t, store, () => s.state({}, scope, lead))
+  task19AssertTrace(trace, []); assert.deepEqual(trace.value.requests, [])
+  const firstArgs = input(task(store, owner, scope), { request_key: 'queue-count-first' })
+  trace = task19Observe(t, store, () => s.enqueue(firstArgs, scope, actor))
+  const queued = trace.value
+  task19AssertTrace(trace, [['Q2', 'get', [queued.request_id], 1, [{ run_id: scope }]]])
+  assert.equal(queued.run_id, scope); assert.equal(queued.session_id, null)
+  trace = task19Observe(t, store, () => s.state({}, scope, lead))
+  task19AssertTrace(trace, []); assert.deepEqual(trace.value.requests, [queued])
+  trace = task19Observe(t, store, () => s.admitNext({ request_key: 'queue-count-admit-first' }, scope, lead))
+  const first = trace.value.request
+  assert.equal(trace.value.status, 'admitted'); assert.equal(first.session_id, null)
+  task19AssertTrace(trace, [['G2', 'get', [scope, 'scheduler:' + queued.request_id], 0, []],
+    ['G3', 'get', [first.reservation_id], 1, [{ run_id: scope }]],
+    ['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: null }]]])
+  trace = task19Observe(t, store, () => s.bind(ref(first, { session_id: owner }), scope, actor))
+  const bound = trace.value
+  task19AssertTrace(trace, [['G1', 'get', [first.reservation_id, scope], 1, [{ owner_session: owner, session_id: null, run_id: scope }]],
+    ['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]]])
+  assert.equal(bound.session_id, owner)
+  trace = task19Observe(t, store, () => s.state({}, scope, actor))
+  task19AssertTrace(trace, [['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]]])
+  assert.deepEqual(trace.value.requests, [bound])
+  trace = task19Observe(t, store, () => s.enqueue(firstArgs, scope, actor))
+  task19AssertTrace(trace, [['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]]])
+  assert.deepEqual(trace.value, bound)
+  const secondArgs = input(task(store, owner, scope), { request_key: 'queue-count-second' })
+  trace = task19Observe(t, store, () => s.enqueue(secondArgs, scope, actor))
+  const queuedSecond = trace.value
+  task19AssertTrace(trace, [['Q2', 'get', [queuedSecond.request_id], 1, [{ run_id: scope }]]])
+  trace = task19Observe(t, store, () => s.admitNext({ request_key: 'queue-count-admit-second' }, scope, lead))
+  const second = trace.value.request
+  task19AssertTrace(trace, [['G2', 'get', [scope, 'scheduler:' + queuedSecond.request_id], 0, []],
+    ['G3', 'get', [second.reservation_id], 1, [{ run_id: scope }]],
+    ['Q1', 'get', [second.reservation_id, scope, second.task_id], 1, [{ session_id: null }]]])
+  trace = task19Observe(t, store, () => s.state({}, scope, actor))
+  task19AssertTrace(trace, [['Q1', 'get', [first.reservation_id, scope, first.task_id], 1, [{ session_id: owner }]],
+    ['Q1', 'get', [second.reservation_id, scope, second.task_id], 1, [{ session_id: null }]]])
+  assert.deepEqual(trace.value.requests, [bound, second]); assert.equal(trace.value.has_more, false)
+})
+
+for (const action of ['state', 'bind', 'markUnknown', 'enqueue']) {
+  test('Task19 scheduler ' + action + ' generated row fault leaves no result and preserves complete accepted state', t => {
+    const { store, scheduler: s, governor: g } = setup(t), scope = 'queue-fault\0run', owner = 'queue-fault\0worker'
+    const actor = { role: 'worker', sessionId: owner }
+    s.state({}, scope, lead); g.snapshot(scope)
+    const args = input(task(store, owner, scope), { request_key: 'queue-fault-existing', resources: ['queue\0hold'] })
+    const queued = s.enqueue(args, scope, actor)
+    const admitted = s.admitNext({ request_key: 'queue-fault-admit' }, scope, lead).request
+    if (action !== 'bind') s.bind(ref(admitted, { session_id: owner }), scope, actor)
+    const newArgs = input(task(store, owner, scope), { request_key: 'queue-fault-new' })
+    const before = task19LosslessRows(store), db = store.open()
+    const beforeChanges = db.prepare('SELECT total_changes() AS n').get().n
+    const site = action === 'enqueue' ? 'Q2' : 'Q1'
+    const invoke = () => action === 'state' ? s.state({}, scope, actor)
+      : action === 'bind' ? s.bind(ref(admitted, { session_id: owner }), scope, actor)
+      : action === 'markUnknown' ? s.markUnknown(ref(admitted, { reason: 'delivery unknown' }), scope, actor)
+      : s.enqueue(newArgs, scope, actor)
+    const unreturned = Symbol('no partial public result'); let result = unreturned, injections = 0, insertedId
+    const trace = task19Observe(t, store, () => assert.throws(() => { result = invoke() },
+      { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' }), event => {
+      if (event.site !== site) return
+      assert.equal(event.rows.length, 1); assert.equal(event.db.isTransaction, true)
+      const row = event.rows[0]
+      if (site === 'Q2') {
+        assert.equal(row.run_id, task19Transport({ run_id: scope }).run_id)
+        assert.equal(row.task_id, newArgs.task_id); assert.equal(row.state, 'queued'); assert.equal(row.reservation_id, null)
+        insertedId = row.request_id; row.run_id = 'J"invalid transport without NUL"'
+      } else {
+        assert.equal(row.reservation_id, admitted.reservation_id); assert.equal(row.task_id, admitted.task_id)
+        assert.equal(row.session_id, task19Transport({ session_id: owner }).session_id)
+        assert.equal(row.state, action === 'markUnknown' ? 'unknown' : 'running')
+        row.session_id = 'J"invalid transport without NUL"'
+      }
+      injections++
+    })
+    assert.equal(result, unreturned); assert.equal(injections, 1); assert.equal(db.isTransaction, false)
+    const q1 = ['Q1', 'get', [admitted.reservation_id, scope, admitted.task_id], 1]
+    task19AssertTrace(trace, action === 'enqueue' ? [['Q2', 'get', [insertedId], 1]] : action === 'state' ? [q1]
+      : [['G1', 'get', [admitted.reservation_id, scope], 1, [{ owner_session: owner, session_id: action === 'bind' ? null : owner, run_id: scope }]], q1])
+    // Covers task/events, governor reservation/audit/holds/retry charges, queue/decisions and sequences losslessly.
+    assert.deepEqual(task19LosslessRows(store), before)
+    if (action === 'state') assert.equal(db.prepare('SELECT total_changes() AS n').get().n, beforeChanges)
+    if (action === 'enqueue') assert.equal(db.prepare('SELECT COUNT(*) AS n FROM scheduler_request WHERE request_id = ?').get(insertedId).n, 0)
+    const restored = s.state({}, scope, actor).requests.find(row => row.request_id === queued.request_id)
+    assert.equal(restored.state, action === 'bind' ? 'reserved' : 'running')
+    assert.equal(restored.session_id, action === 'bind' ? null : owner)
+  })
+}

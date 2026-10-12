@@ -1,0 +1,9 @@
+# 已验收任务的证据警告设计
+
+独立整轮审查确认原main已有误导指引：legacy任务可凭有效fact/artifact、无evidence_path通过；acceptTask在transition accepted之后仍建议“补一条带路径/行号的证据”。公开recordFact在accepted终态拒绝新的fact/artifact E_TERMINAL。警告指导用户执行当前状态不允许的动作，与既有终态冻结合同不一致。没有证据证明该分支触发或造成d389实际模型超时。
+
+只改 lib/store/index.js 的这个成功warning，并在 tools/tests/store-evidence.test.mjs 增加真实SQLite回归。保留无pointer可accept的legacy策略、返回status/evidence_basis、现有terminalguard、waiver/strict/blocker/rework与事务。成功warning明确“本次验收已完成”“可核查性弱”，将建议指向后续任务在提交/验收前记录evidence_path及可用行号；不要求当前终态任务补证、轮询、自动重开或新增模型工具。
+
+先test-only RED：真实legacy任务、owner/有效PLAUSIBLE fact无pointer→submit→rootaccept statusaccepted、basis.with_pointer0；warning须表达已完成和后续任务/提交前、不能当前任务建议补；尝试新增path fact/artifact仍E_TERMINAL，状态/facts/代数不变。覆盖带pointer正常legacy及显式waiver/strict的既有对照。仅行为文字断言RED，不以缺helper/import失败。再最小字符串GREEN，focused测试+sole npmtest，原source字节证明、owned两文件显式commit。Fresh独立task SPEC先PASS再QUALITY。
+
+这是独立窄任务11，由task10之后单一实现者顺序执行。Root负责README/研究记录，产品两文件变化纳入最终统一不可变包验收；不单独重复paid。用户已授权完整修复与PRreview后merge，无额外permission。无runtime依赖/DDL/names/NodeSDKpins/limits改变；本轮诊断与警告修正不解释历史production执行者停止原因。

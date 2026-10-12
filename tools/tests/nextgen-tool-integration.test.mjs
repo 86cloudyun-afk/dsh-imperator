@@ -40,12 +40,13 @@ function fixture(t) {
     tools: { register(definition) { definitions.push(definition); return () => {} } },
   })
   let callSequence = 0
-  async function call(name, args, agent = lead) {
+  async function callRaw(name, args, agent = lead) {
     const definition = definitions.find(d => d.name === name)
     assert.ok(definition, 'missing next-generation model capability: ' + name)
-    return JSON.parse(await definition.execute(args, { agent, token: {}, rootCallId: 'nextgen-tool-call-' + (++callSequence), signal: new AbortController().signal }))
+    return definition.execute(args, { agent, token: {}, rootCallId: 'nextgen-tool-call-' + (++callSequence), signal: new AbortController().signal })
   }
-  return { store, cwd, lead, worker, foreign, reviewer, call }
+  const call = async (...args) => JSON.parse(await callRaw(...args))
+  return { store, cwd, lead, worker, foreign, reviewer, definitions, call, callRaw }
 }
 function coding(extra = {}) {
   return { title: 'bounded coding workflow', objective: 'verify source', scope: ['source.js'],
@@ -226,4 +227,111 @@ test('model root can revise prerequisites after returning an unapproved plan', a
   assert.equal(frozen.ok, false)
   assert.equal(frozen.code, 'E_WORKFLOW_STAGE')
   assert.deepEqual((await f.call('task_workflow_state', { task_id: created.task_id })).dependencies, [prerequisite.task_id])
+})
+
+test('workflow context tool advertises an optional Boolean and forwards only host-scoped arguments', async t => {
+  const f = fixture(t), spec = f.definitions.find(d => d.name === 'task_workflow_state').parameters
+  assert.equal(spec.properties.include_context?.type, 'boolean')
+  assert.equal(spec.required.includes('include_context'), false)
+  assert.deepEqual(Object.keys(spec.properties).sort(), ['include_context', 'task_id'])
+  const input = coding(), created = await f.call('task_workflow_create', input)
+  assert.equal(created.ok, true)
+  const args = { task_id: created.task_id }, compact = await f.call('task_workflow_state', args)
+  assert.equal(Object.hasOwn(compact, 'context'), false)
+  assert.deepEqual(await f.call('task_workflow_state', { ...args, include_context: false }), compact)
+  const db = f.store.open(), changes = db.prepare('SELECT total_changes() AS n').get().n
+  for (const include_context of [null, 0, 1, '', 'true', 'false', [], {}]) {
+    const invalid = await f.call('task_workflow_state', { ...args, include_context })
+    assert.equal(invalid.ok, false)
+    assert.equal(invalid.code, 'E_WORKFLOW_INPUT')
+  }
+  const expanded = await f.call('task_workflow_state', { ...args, include_context: true,
+    run_id: 'forged', actor: { sessionId: 'forged', isRoot: true } }, f.worker)
+  assert.equal(expanded.ok, true)
+  assert.deepEqual(expanded.context, { plan: { objective: input.objective, scope: input.scope,
+    non_goals: input.non_goals, deliverables: input.deliverables }, latest_review: null })
+  const foreign = await f.call('task_workflow_state', { ...args, include_context: true, run_id: RUN,
+    actor: { sessionId: RUN, isRoot: true } }, f.foreign)
+  assert.equal(foreign.ok, false)
+  assert.equal(foreign.code, 'E_CROSS_RUN')
+  assert.equal(JSON.stringify(foreign).includes(input.objective), false)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+})
+
+test('workflow context tool retrieves failed findings and keeps its actual success envelope within 64KiB', async t => {
+  const f = fixture(t)
+  const input = coding({ objective: '界'.repeat(4000), scope: Array(2).fill('界'.repeat(512)), non_goals: [], deliverables: [] })
+  const findings = Array(5).fill('界'.repeat(1024))
+  const created = await f.call('task_workflow_create', input)
+  assert.equal(created.ok, true, JSON.stringify(created))
+  const id = created.task_id, state = () => f.call('task_workflow_state', { task_id: id })
+  const action = async (name, extra = {}, actor = f.lead) => f.call('task_workflow_submit', {
+    task_id: id, action: name, expected_version: (await state()).row_version, request_key: name, ...extra }, actor)
+  assert.equal((await action('approve_plan')).ok, true)
+  assert.equal((await f.call('task_claim', { task_id: id, child_id: CHILD }, f.worker)).ok, true)
+  assert.equal((await f.call('task_verify', { task_id: id, command: 'node source.js' }, f.worker)).ok, true)
+  const artifact = await action('record_artifact', {}, f.worker)
+  assert.equal(artifact.ok, true)
+  const review = await action('record_review', { revision_id: artifact.revision_id,
+    requirements_result: 'fail', quality_result: 'unverified', findings }, f.reviewer)
+  assert.equal(review.ok, true)
+  const db = f.store.open(), longId = 's' + '\u0000'.repeat(199)
+  db.prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run(longId, id)
+  db.prepare('UPDATE workflow_review SET reviewer_session=? WHERE task_id=?').run(longId, id)
+  for (let index = 0; index < 19; index++) {
+    db.prepare('INSERT INTO workflow_artifact(task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at) SELECT task_id,run_id,plan_version,evidence_generation,producer_session,receipt_id,snapshot,logs,created_at FROM workflow_artifact WHERE id=?').run(artifact.revision_id)
+    db.prepare('INSERT INTO workflow_review(task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at) SELECT task_id,run_id,revision_id,plan_version,evidence_generation,reviewer_session,requirements_result,quality_result,findings,created_at FROM workflow_review WHERE id=?').run(review.review_id)
+  }
+  const changes = db.prepare('SELECT total_changes() AS n').get().n
+  const raw = await f.callRaw('task_workflow_state', { task_id: id, include_context: true }, f.worker)
+  const result = JSON.parse(raw)
+  assert.equal(result.ok, true, raw)
+  assert.ok(Buffer.byteLength(raw) <= 65536, 'serialized tool envelope exceeds byte budget')
+  assert.equal(result.history_truncated, true)
+  assert.deepEqual(result.context.plan, { objective: input.objective, scope: input.scope, non_goals: [], deliverables: [] })
+  assert.deepEqual(result.context.latest_review.findings, findings)
+  assert.equal(result.context.latest_review.is_current, true)
+  assert.equal(result.context.latest_review.requirements_result, 'fail')
+  assert.equal(result.context.latest_review.quality_result, 'unverified')
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, changes)
+  t.diagnostic('actual serialized tool response bytes=' + Buffer.byteLength(raw))
+  // Tune only bounded metadata strings to an exact wire boundary. Excluding
+  // ok:true from the budget would allow the subsequent one-byte overflow.
+  db.prepare('UPDATE workflow_artifact SET producer_session=? WHERE task_id=?').run('s', id)
+  db.prepare('UPDATE workflow_review SET reviewer_session=? WHERE task_id=?').run('s', id)
+  const smallRaw = await f.callRaw('task_workflow_state', { task_id: id, include_context: true })
+  assert.equal(JSON.parse(smallRaw).history_truncated, false)
+  let remaining = 65536 - Buffer.byteLength(smallRaw)
+  const latestId = result.context.latest_review.id
+  const candidates = [
+    ...db.prepare('SELECT id FROM workflow_artifact WHERE task_id=? ORDER BY id').all(id).map(row => ({ ...row, table: 'workflow_artifact', column: 'producer_session' })),
+    ...db.prepare('SELECT id FROM workflow_review WHERE task_id=? AND id!=? ORDER BY id').all(id, latestId).map(row => ({ ...row, table: 'workflow_review', column: 'reviewer_session' })),
+  ]
+  for (const row of candidates) {
+    if (remaining === 0) break
+    const addedBytes = Math.min(1164, remaining)
+    const identity = 's' + '\u0000'.repeat(Math.floor(addedBytes / 6)) + 'a'.repeat(addedBytes % 6)
+    assert.ok(identity.length <= 200)
+    db.prepare('UPDATE ' + row.table + ' SET ' + row.column + '=? WHERE id=?').run(identity, row.id)
+    remaining -= addedBytes
+  }
+  assert.equal(remaining, 0)
+  const exactRaw = await f.callRaw('task_workflow_state', { task_id: id, include_context: true })
+  assert.equal(Buffer.byteLength(exactRaw), 65536)
+  assert.equal(JSON.parse(exactRaw).history_truncated, false)
+  const untouched = candidates.at(-1)
+  assert.equal(db.prepare('SELECT ' + untouched.column + ' AS identity FROM ' + untouched.table + ' WHERE id=?').get(untouched.id).identity, 's')
+  db.prepare('UPDATE ' + untouched.table + ' SET ' + untouched.column + '=? WHERE id=?').run('sa', untouched.id)
+  const overflowChanges = db.prepare('SELECT total_changes() AS n').get().n
+  const boundedRaw = await f.callRaw('task_workflow_state', { task_id: id, include_context: true })
+  assert.ok(Buffer.byteLength(boundedRaw) <= 65536)
+  assert.equal(JSON.parse(boundedRaw).history_truncated, true)
+  assert.deepEqual(JSON.parse(boundedRaw).context, JSON.parse(exactRaw).context)
+  assert.equal(db.prepare('SELECT total_changes() AS n').get().n, overflowChanges)
+  t.diagnostic('exact envelope bytes=65536; one-byte overflow pruned to ' + Buffer.byteLength(boundedRaw))
+  db.prepare('UPDATE workflow SET plan=? WHERE task_id=?').run('{PRIVATE_BAD_CONTEXT', id)
+  const invalid = await f.call('task_workflow_state', { task_id: id, include_context: true })
+  assert.equal(invalid.ok, false)
+  assert.equal(invalid.code, 'E_STORE_INTEGRITY')
+  assert.equal(JSON.stringify(invalid).includes('PRIVATE_BAD_CONTEXT'), false)
 })

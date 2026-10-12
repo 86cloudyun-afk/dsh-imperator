@@ -35,6 +35,57 @@ function never(governor, reservation, run = 'run', authority = lead) {
 function ref(r, extra = {}) { return { reservation_id: r.reservation_id, generation: r.generation, ...extra } }
 const code = value => ({ code: value })
 
+for (const action of ['bind', 'settle']) test('Task16 governor ' + action + ' rejects a prefix without changing holds or audit', t => {
+  const { store, governor: g } = setup(t), full = 'worker\0suffix'
+  const id = task(store, 'run', full), args = input(id, 'operation\0suffix', { mode: 'write', resources: ['resource\0suffix'] })
+  const row = g.reserve(args, 'run', lead)
+  const snapshot = () => ({ rows: ['governor_reservation', 'governor_hold', 'governor_audit'].map(table =>
+    store.open().prepare('SELECT * FROM ' + table).all()), exact: store.open().prepare('SELECT json_quote(run_id) AS run, json_quote(owner_session) AS owner, json_quote(session_id) AS session FROM governor_reservation').all() })
+  const before = snapshot()
+  const invoke = sessionId => action === 'bind'
+    ? g.bind(ref(row, { session_id: sessionId }), 'run', { role: 'worker', sessionId })
+    : g.settle(ref(row, { proof: { kind: 'never_started' } }), 'run', { role: 'worker', sessionId })
+  assert.throws(() => invoke('worker'), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(snapshot(), before)
+  assert.equal(g.reserve(args, 'run', { role: 'worker', sessionId: full }).reservation_id, row.reservation_id)
+  assert.equal(invoke(full).state, action === 'bind' ? 'running' : 'settled')
+  if (action === 'bind') assert.equal(invoke(full).session_id, full)
+})
+
+test('Task16 leading NUL bound governor session is not an unbound reservation', t => {
+  const { store, governor: g } = setup(t), sessionId = '\0suffix'
+  const row = g.reserve(input(task(store, 'run', sessionId)), 'run', lead)
+  g.bind(ref(row, { session_id: sessionId }), 'run', { role: 'worker', sessionId })
+  const before = g.snapshot('run')
+  assert.throws(() => never(g, row), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(g.snapshot('run'), before)
+})
+
+for (const side of ['current', 'captured']) test('Task16 governor independently rejects different full ' + side + ' owner', t => {
+  const { store, governor: g } = setup(t), a = 'worker\0first', b = 'worker\0second'
+  const captured = side === 'current' ? b : a, current = side === 'current' ? a : b
+  const id = task(store, 'run', captured), args = input(id)
+  g.reserve(args, 'run', lead)
+  store.submitTask({ task_id: id }, 'run', { sessionId: captured, isRoot: false })
+  store.rejectTask({ task_id: id, reason: 'reassign' }, 'run', { sessionId: 'root', isRoot: true })
+  store.claimTask({ task_id: id, child_id: 'replacement' }, 'run', { sessionId: 'root', isRoot: true }, current)
+  const before = g.snapshot('run')
+  assert.throws(() => g.reserve(args, 'run', { role: 'worker', sessionId: b }), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(g.snapshot('run'), before)
+})
+
+test('Task16 governor SQL resource and operation selectors keep NUL keys distinct', t => {
+  const { store, governor: g } = setup(t), id = task(store)
+  const first = g.reserve(input(id, 'op\0suffix', { mode: 'write', resources: ['resource\0suffix'] }), 'run', lead)
+  const second = g.reserve(input(task(store), 'op', { resources: ['resource'] }), 'run', lead)
+  assert.notEqual(second.reservation_id, first.reservation_id)
+  const third = task(store), before = g.snapshot('run')
+  assert.throws(() => g.reserve(input(third, 'third', { resources: ['resource\0suffix'] }), 'run', lead), code('E_RESOURCE_BUSY'))
+  assert.deepEqual(g.snapshot('run'), before)
+  assert.throws(() => g.reserve(input(id, 'op\0suffix', { resources: ['resource\0suffix'] }), 'run', lead), code('E_GOVERNOR_CONFLICT'))
+  assert.deepEqual(g.snapshot('run'), before)
+})
+
 test('six active across nested callers and reuse does not debit new count', t => {
   const { store, governor: g } = setup(t)
   for (let i = 0; i < 6; i++) {
@@ -457,6 +508,67 @@ test('legacy reservations acquire additive retry accounting without erasing expl
   assert.equal(g2.snapshot('run').retries[id], 3)
 })
 
+for (const hidden of [null, 'task_run', 'evidence_generation']) test('Task16 legacy joined projection preserves legal width and hidden native conversion: ' + hidden, t => {
+  const store = tempStore(t), full = 'root\0suffix', id = store.openTask({ title: 'legacy width' }, full).task_id, db = store.open()
+  // Compatibility characterization: public task plus an old schema with extension columns.
+  // The two original joined columns consume the remaining SQLite result slots.
+  const extra = ['task_run', 'evidence_generation', '', '__proto__', '12', '2', 'odd"列', ...Array.from({ length: 1979 }, (_, i) => 'extra_' + i)]
+  const quote = name => '"' + name.replaceAll('"', '""') + '"'
+  db.exec(`CREATE TABLE governor_reservation (
+    reservation_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, task_id INTEGER NOT NULL,
+    operation_key TEXT NOT NULL, payload TEXT NOT NULL, generation INTEGER NOT NULL,
+    mode TEXT NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL,
+    owner_session TEXT, session_id TEXT, settlement TEXT, ${extra.map(quote).join(',')},
+    UNIQUE(run_id, operation_key), UNIQUE(task_id, generation));
+    CREATE TABLE governor_retry_charge (reservation_id TEXT PRIMARY KEY, rework_generation INTEGER NOT NULL, retry_charge INTEGER NOT NULL, source TEXT NOT NULL)`)
+  db.prepare('INSERT INTO governor_reservation(reservation_id,run_id,task_id,operation_key,payload,generation,mode,kind,state,owner_session,task_run,evidence_generation,"","__proto__","12","2","odd""列") VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
+    .run('legacy', full, id, 'op', JSON.stringify({ resources: [] }), 1, 'read', 'retry', 'settled', 'safe',
+      hidden === 'task_run' ? 9007199254740993n : 'hidden\0old', hidden === 'evidence_generation' ? 9007199254740993n : 73,
+      'empty', 'prototype', 'twelve', 'two', 'quoted')
+  const sql = `SELECT r.*, t.evidence_generation, t.run_id AS task_run
+          FROM governor_reservation r LEFT JOIN task t ON t.id = r.task_id
+          LEFT JOIN governor_retry_charge c USING(reservation_id)
+          WHERE c.reservation_id IS NULL ORDER BY r.task_id, r.generation DESC`
+  const original = db.prepare(sql)
+  assert.equal(original.columns().length, 2000)
+  let native, nativeError
+  try { native = original.all()[0] } catch (error) { nativeError = error }
+  if (hidden) assert.equal(nativeError?.code, 'ERR_OUT_OF_RANGE')
+  else { assert.equal(nativeError, undefined); assert.equal(Object.keys(native).length, 1998) }
+  const prepare = db.prepare.bind(db), calls = { original: { get: 0, all: 0, iterate: 0, run: 0 }, generated: { get: 0, all: 0, iterate: 0, run: 0 } }
+  let returned
+  const preparations = { original: 0, generated: 0 }, names = original.columns().map(column => column.name)
+  db.prepare = query => {
+    const statement = prepare(query)
+    if (query.includes('WHERE c.reservation_id IS NULL ORDER BY r.task_id, r.generation DESC')) {
+      const kind = query.startsWith('SELECT r.*') ? 'original' : 'generated'
+      preparations[kind]++
+      assert.equal(statement.columns().length, 2000)
+      assert.deepEqual(statement.columns().map(column => column.name), names)
+      for (const method of ['get', 'all', 'iterate', 'run']) {
+        const read = statement[method].bind(statement)
+        statement[method] = (...args) => { calls[kind][method]++; const result = read(...args); if (kind === 'generated' && method === 'all') returned = result[0]; return result }
+      }
+    }
+    return statement
+  }
+  const g = new TaskforceGovernor(store)
+  if (hidden) {
+    assert.throws(() => g.snapshot(full), error => error.code === nativeError.code && error.message === nativeError.message)
+    assert.equal(db.prepare('SELECT count(*) AS n FROM governor_retry_charge').get().n, 0)
+    assert.equal(db.isTransaction, false)
+  } else {
+    assert.equal(g.snapshot(full).retries[id], 1)
+    assert.equal(returned.run_id, full); assert.equal(returned.task_run, full); assert.equal(returned.evidence_generation, 0)
+    const descriptors = Object.getOwnPropertyDescriptors(native); descriptors.run_id.value = full; descriptors.task_run.value = full
+    assert.deepEqual(Object.getOwnPropertyDescriptors(returned), descriptors)
+    assert.deepEqual(Object.keys(returned), Object.keys(native)); assert.equal(Object.getPrototypeOf(returned), null)
+    assert.equal(db.prepare('SELECT retry_charge FROM governor_retry_charge').get().retry_charge, 1)
+  }
+  assert.deepEqual(calls, { original: { get: 0, all: 0, iterate: 0, run: 0 }, generated: { get: 0, all: 1, iterate: 0, run: 0 } })
+  assert.deepEqual(preparations, { original: 1, generated: 1 })
+})
+
 test('rejection after reservation fences bind until rework is admitted and charged', t => {
   const { store, governor: g } = setup(t)
   const id = task(store), request = input(id, 'before-rejection', { mode: 'write', resources: ['repo'] })
@@ -546,3 +658,331 @@ test('historical settled replay still requires both current and captured worker 
   assert.equal(JSON.stringify(g.snapshot('run')), before)
   assert.equal(durableGovernorRows(store), rows)
 })
+
+// Task19 P5: public fresh cases; inherited Node24 seed coverage is separate.
+for (const [position, resources, independent] of [
+  ['leading', ['\u0000lock-A', '\u0000lock-B'], ['lock-A', '\u0000lock-C']],
+  ['middle', ['lock\u0000A', 'lock\u0000B'], ['lock', 'lock\u0000C']],
+  ['trailing', ['lock-A\u0000', 'lock-B\u0000'], ['lock-A', 'lock-B']],
+  ['literal', ['Tlock', 'J"lock"', '{"lock":true}', 'lock\\u0000', '锁🔑'], ['ordinary-lock']],
+]) test('Task19 opaque resource hold identities agree with reservation payload: ' + position, t => {
+  const { store, governor: g } = setup(t)
+  const expected = [...resources].sort()
+  const held = g.reserve(input(task(store), 'held', { mode: 'write', resources }), 'run', lead)
+  const independentRow = g.reserve(input(task(store), 'independent', { resources: independent }), 'run', lead)
+  const blocked = input(task(store), 'blocked')
+  const check = (governor, source) => {
+    const stored = source.open().prepare('SELECT json_quote(resource_key) AS value, typeof(resource_key) AS type FROM governor_hold WHERE reservation_id = ?').all(held.reservation_id)
+    assert.deepEqual(stored.map(row => { assert.equal(row.type, 'text'); return JSON.parse(row.value) }).sort(), expected)
+    const snapshot = governor.snapshot('run')
+    const row = snapshot.reservations.find(row => row.reservation_id === held.reservation_id)
+    assert.ok(row)
+    assert.deepEqual(row.resources, expected)
+    assert.deepEqual(snapshot.holds.filter(row => row.reservation_id === held.reservation_id)
+      .map(row => row.resource_key).sort(), expected)
+    assert.equal(snapshot.active_total, 2)
+    assert.equal(snapshot.active_writers, 1)
+    for (const resource of resources) {
+      assert.throws(() => governor.reserve({ ...blocked, resources: [resource] }, 'run', lead), code('E_RESOURCE_BUSY'))
+    }
+    assert.deepEqual(governor.snapshot('run'), snapshot)
+  }
+  check(g, store)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  try {
+    const restored = new TaskforceGovernor(reopened)
+    check(restored, reopened)
+    assert.equal(never(restored, held).state, 'settled')
+    const remaining = restored.snapshot('run').holds
+    assert.ok(remaining.every(row => row.reservation_id === independentRow.reservation_id))
+    assert.deepEqual(remaining.map(row => row.resource_key).sort(), [...independent].sort())
+    const released = restored.reserve({ ...blocked, resources }, 'run', lead)
+    assert.deepEqual(released.resources, expected)
+  } finally { reopened.close() }
+})
+
+for (const [position, fullRun, fullActor] of [
+  ['leading', '\u0000run', '\u0000lead'],
+  ['middle', 'run\u0000tail', 'lead\u0000tail'],
+  ['trailing', 'run\u0000', 'lead\u0000'],
+  ['literal-T', 'Trun', 'Tlead'],
+  ['literal-J', 'J"run"', 'J"lead"'],
+  ['literal-JSON', '{"run":true}', '{"lead":true}'],
+  ['literal-backslash', 'run\\u0000tail', 'lead\\u0000tail'],
+  ['Unicode', '运行🔑', '负责人🔑'],
+]) for (const selected of ['run', 'actor', 'both']) {
+  test('Task19 governor snapshot preserves full audit run and actor: ' + position + '/' + selected, t => {
+    const { store, governor: g } = setup(t)
+    const scope = selected === 'actor' ? 'run' : fullRun
+    const actor = { role: 'lead', sessionId: selected === 'run' ? 'lead' : fullActor }
+    const limits = g.extendBudget({ reason: 'audit', max_active: 7 }, scope, actor)
+    g.extendBudget({ reason: 'other audit', max_active: 8 }, 'other-run', lead)
+    const check = (governor, source) => {
+      const stored = source.open().prepare("SELECT json_quote(run_id) AS run, typeof(run_id) AS run_type, json_quote(session_id) AS actor, typeof(session_id) AS actor_type FROM governor_audit WHERE run_id = ? AND action = 'extendBudget'").all(scope)
+      assert.deepEqual(stored.map(row => [JSON.parse(row.run), row.run_type, JSON.parse(row.actor), row.actor_type]),
+        [[scope, 'text', actor.sessionId, 'text']])
+      const snapshot = governor.snapshot(scope)
+      assert.equal(snapshot.run_id, scope)
+      assert.deepEqual(snapshot.limits, limits)
+      assert.equal(snapshot.audit.length, 1)
+      assert.equal(snapshot.audit[0].run_id, scope)
+      assert.equal(snapshot.audit[0].session_id, actor.sessionId)
+      assert.equal(snapshot.audit[0].action, 'extendBudget')
+      assert.equal(snapshot.audit[0].reservation_id, null)
+      assert.equal(snapshot.audit[0].details.reason, 'audit')
+      assert.equal(snapshot.audit[0].details.after.max_active, 7)
+      assert.deepEqual(snapshot.reservations, [])
+      assert.deepEqual(snapshot.holds, [])
+      assert.equal(governor.snapshot('other-run').audit.length, 1)
+      assert.equal(governor.snapshot('missing-run').audit.length, 0)
+    }
+    check(g, store)
+    store.close()
+    const reopened = new TaskforceStore(store.root)
+    try {
+      check(new TaskforceGovernor(reopened), reopened)
+    } finally { reopened.close() }
+  })
+}
+
+for (const [position, scope, owner] of [
+  ['leading', '\u0000run', '\u0000worker'],
+  ['middle', 'run\u0000tail', 'worker\u0000tail'],
+  ['trailing', 'run\u0000', 'worker\u0000'],
+  ['literal', 'J"run"\\u0000', 'Tworker\\u0000'],
+]) test('Task19 post16 governor full-run results survive creation, transitions and reopen: ' + position, t => {
+  const { store, governor: g } = setup(t), actor = { role: 'worker', sessionId: owner }
+  const args = input(task(store, scope, owner), 'bound')
+  const row = g.reserve(args, scope, actor)
+  const checkStored = (source, reservation, session) => {
+    const stored = source.open().prepare('SELECT json_quote(run_id) AS run, typeof(run_id) AS run_type, json_quote(owner_session) AS owner, typeof(owner_session) AS owner_type, json_quote(session_id) AS session, typeof(session_id) AS session_type FROM governor_reservation WHERE reservation_id = ?').get(reservation.reservation_id)
+    assert.deepEqual([JSON.parse(stored.run), stored.run_type, JSON.parse(stored.owner), stored.owner_type, JSON.parse(stored.session), stored.session_type],
+      [scope, 'text', owner, 'text', session, session === null ? 'null' : 'text'])
+  }
+  checkStored(store, row, null)
+  assert.equal(row.run_id, scope)
+  assert.equal(row.session_id, null)
+  assert.equal(row.generation, 1)
+  assert.deepEqual(g.reserve(args, scope, actor), row)
+  const bound = g.bind(ref(row, { session_id: owner }), scope, actor)
+  checkStored(store, bound, owner)
+  assert.equal(bound.run_id, scope)
+  assert.equal(bound.session_id, owner)
+  assert.equal(bound.state, 'running')
+  assert.deepEqual(g.bind(ref(row, { session_id: owner }), scope, actor), bound)
+  assert.deepEqual(g.reserve(args, scope, actor), bound)
+  assert.deepEqual(g.snapshot(scope).reservations, [bound])
+  const unknown = g.markUnknown(ref(row, { reason: 'delivery unknown' }), scope, actor)
+  assert.equal(unknown.run_id, scope)
+  assert.equal(unknown.session_id, owner)
+  assert.equal(unknown.state, 'unknown')
+  assert.deepEqual(g.markUnknown(ref(row, { reason: 'delivery unknown' }), scope, actor), unknown)
+
+  // A separate unbound reservation exercises never_started without inventing a terminal proof.
+  const unboundArgs = input(task(store, scope, owner), 'unbound', { resources: ['unbound-resource'] })
+  const unbound = g.reserve(unboundArgs, scope, actor)
+  assert.equal(unbound.run_id, scope)
+  assert.equal(unbound.session_id, null)
+  const settled = never(g, unbound, scope, actor)
+  assert.equal(settled.run_id, scope)
+  assert.equal(settled.session_id, null)
+  assert.equal(settled.state, 'settled')
+  assert.deepEqual(never(g, unbound, scope, actor), settled)
+  const check = (governor, source) => {
+    checkStored(source, unknown, owner)
+    checkStored(source, settled, null)
+    const snapshot = governor.snapshot(scope)
+    assert.deepEqual(snapshot.reservations, [unknown, settled])
+    assert.equal(snapshot.active_total, 1)
+    assert.equal(snapshot.unknown_total, 1)
+    assert.equal(snapshot.retry_charges.length, 2)
+    assert.ok(snapshot.retry_charges.every(row => row.source === 'admission' && row.retry_charge === 0))
+    assert.deepEqual(snapshot.holds, [])
+    assert.deepEqual(governor.reserve(args, scope, actor), unknown)
+    assert.deepEqual(governor.reserve(unboundArgs, scope, actor), settled)
+    assert.deepEqual(never(governor, unbound, scope, actor), settled)
+  }
+  check(g, store)
+  store.close()
+  const reopened = new TaskforceStore(store.root)
+  try {
+    const restored = new TaskforceGovernor(reopened)
+    check(restored, reopened)
+    const before = reopened.open().prepare('SELECT total_changes() AS n').get().n
+    check(restored, reopened)
+    assert.equal(reopened.open().prepare('SELECT total_changes() AS n').get().n, before)
+  } finally { reopened.close() }
+})
+
+// Task19 public reader instrumentation: fixed caller suffixes, no helper import.
+const task19ReaderSites = {
+  G1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ?', ['owner_session', 'session_id', 'run_id']],
+  G2: ['*', ' FROM governor_reservation WHERE run_id = ? AND operation_key = ?', ['owner_session', 'run_id', 'session_id']],
+  G3: ['*', ' FROM governor_reservation WHERE reservation_id = ?', ['run_id']],
+  G4: ['*', ' FROM governor_reservation WHERE run_id = ? ORDER BY rowid', ['run_id', 'session_id']],
+  G5: ['h.*', ' FROM governor_hold h JOIN governor_reservation r USING(reservation_id) WHERE r.run_id = ? ORDER BY h.reservation_id, h.resource_key', ['resource_key']],
+  G6: ['*', ' FROM governor_audit WHERE run_id = ? ORDER BY id', ['run_id', 'session_id']],
+  Q1: ['*', ' FROM governor_reservation WHERE reservation_id = ? AND run_id = ? AND task_id = ?', ['session_id']],
+  Q2: ['*', ' FROM scheduler_request WHERE request_id = ?', ['run_id']],
+}
+function task19Transport(values) {
+  return Object.fromEntries(Object.entries(values).map(([key, value]) => [key,
+    typeof value === 'string' ? (value.includes('\0') ? 'J' + JSON.stringify(value) : 'T' + value) : value]))
+}
+function task19Observe(t, store, action, onRow) {
+  const db = store.open(), originalPrepare = db.prepare
+  const trace = { events: [], allPrepares: [], unrelatedPrepares: [], value: undefined }
+  db.prepare = sql => {
+    trace.allPrepares.push(sql)
+    const statement = originalPrepare.call(db, sql)
+    const match = Object.entries(task19ReaderSites).find(([, [, suffix]]) => sql.startsWith('SELECT ') && sql.endsWith(suffix))
+    if (!match) { trace.unrelatedPrepares.push(sql); return statement }
+    const [site, [projection, suffix, fields]] = match
+    const kind = sql === 'SELECT ' + projection + suffix ? 'original' : 'generated'
+    const event = { site, kind, sql, prepare: 1, columns: 0, get: 0, all: 0, iterate: 0, run: 0, bindings: [], rows: [], transport: [] }
+    trace.events.push(event)
+    const columns = statement.columns.bind(statement)
+    statement.columns = (...args) => { event.columns++; return columns(...args) }
+    for (const method of ['get', 'all', 'iterate', 'run']) {
+      const read = statement[method].bind(statement)
+      statement[method] = (...args) => {
+        event[method]++; event.bindings.push({ method, args: [...args] })
+        const result = read(...args)
+        if (kind === 'generated' && (method === 'get' || method === 'all')) {
+          const rows = method === 'all' ? result : result === undefined ? [] : [result]
+          event.rows.push(rows.length)
+          for (const row of rows) {
+            assert.equal(Object.getPrototypeOf(row), null)
+            event.transport.push(Object.fromEntries(fields.map(field => [field, row[field]])))
+          }
+          onRow?.({ site, method, args, rows, db })
+        }
+        return result
+      }
+    }
+    return statement
+  }
+  try { trace.value = action() } finally {
+    db.prepare = originalPrepare
+    t.diagnostic('Task19 public reader lifecycle ' + JSON.stringify({
+      prepares: trace.allPrepares.length, unrelatedPrepares: trace.unrelatedPrepares.length,
+      events: trace.events.map(event => ({ site: event.site, kind: event.kind,
+        ...(event.kind === 'original' ? { sql: event.sql } : { sqlBytes: Buffer.byteLength(event.sql) }),
+        prepare: event.prepare, columns: event.columns, get: event.get, all: event.all,
+        iterate: event.iterate, run: event.run, bindings: event.bindings, rows: event.rows })),
+    }))
+  }
+  return trace
+}
+function task19AssertTrace(trace, expected) {
+  assert.equal(trace.events.length, expected.length * 2, 'every invocation has exactly one original/generated pair')
+  assert.equal(trace.allPrepares.length, trace.events.length + trace.unrelatedPrepares.length)
+  expected.forEach(([site, method, args, rows, values], index) => {
+    for (const [offset, kind] of [[0, 'original'], [1, 'generated']]) {
+      const event = trace.events[index * 2 + offset]
+      assert.equal(event.site, site); assert.equal(event.kind, kind)
+      assert.deepEqual(Object.fromEntries(['prepare', 'columns', 'get', 'all', 'iterate', 'run'].map(key => [key, event[key]])),
+        { prepare: 1, columns: 1, get: Number(kind === 'generated' && method === 'get'),
+          all: Number(kind === 'generated' && method === 'all'), iterate: 0, run: 0 })
+      assert.deepEqual(event.bindings, kind === 'original' ? [] : [{ method, args }])
+      assert.deepEqual(event.rows, kind === 'original' ? [] : [rows])
+      if (kind === 'generated' && values) assert.deepEqual(event.transport, values.map(task19Transport))
+    }
+  })
+}
+function task19LosslessRows(store) {
+  const db = store.open(), quote = value => '"' + value.replaceAll('"', '""') + '"'
+  return db.prepare("SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name").all().map(({ name }) => {
+    const columns = db.prepare('PRAGMA table_info(' + quote(name) + ')').all().map(row => row.name)
+    const pairs = columns.flatMap(column => ["'" + column.replaceAll("'", "''") + "'", quote(column)]).join(',')
+    return [name, db.prepare('SELECT json_object(' + pairs + ') AS row_json FROM ' + quote(name) + ' ORDER BY rowid').all()
+      .map(row => JSON.parse(row.row_json))]
+  })
+}
+
+test('Task19 G1-G6 public lifecycle counts metadata and real reads for empty, absent, single and multiple rows', t => {
+  const { store, governor: g } = setup(t), scope = 'counts\0run', owner = 'counts\0worker'
+  const actor = { role: 'worker', sessionId: owner }
+  g.snapshot(scope) // Initialize lazy services before measured invocations.
+  let trace = task19Observe(t, store, () => g.snapshot(scope))
+  task19AssertTrace(trace, [['G4', 'all', [scope], 0, []], ['G5', 'all', [scope], 0, []], ['G6', 'all', [scope], 0, []]])
+  assert.deepEqual(trace.value.reservations, []); assert.deepEqual(trace.value.holds, []); assert.deepEqual(trace.value.audit, [])
+  trace = task19Observe(t, store, () => assert.throws(() => g.bind({ reservation_id: 'absent-reservation', generation: 1, session_id: owner }, scope, actor), code('E_GOVERNOR_CONFLICT')))
+  task19AssertTrace(trace, [['G1', 'get', ['absent-reservation', scope], 0, []]])
+  const firstArgs = input(task(store, scope, owner), 'count-first', { resources: ['resource\0first'] })
+  trace = task19Observe(t, store, () => g.reserve(firstArgs, scope, actor))
+  const first = trace.value
+  assert.equal(first.run_id, scope); assert.equal(first.session_id, null)
+  task19AssertTrace(trace, [['G2', 'get', [scope, firstArgs.operation_key], 0, []], ['G3', 'get', [first.reservation_id], 1, [{ run_id: scope }]]])
+  trace = task19Observe(t, store, () => g.snapshot(scope))
+  task19AssertTrace(trace, [['G4', 'all', [scope], 1, [{ run_id: scope, session_id: null }]],
+    ['G5', 'all', [scope], 1, [{ resource_key: 'resource\0first' }]], ['G6', 'all', [scope], 1, [{ run_id: scope, session_id: owner }]]])
+  assert.equal(trace.value.reservations[0].session_id, null)
+  trace = task19Observe(t, store, () => g.bind(ref(first, { session_id: owner }), scope, actor))
+  task19AssertTrace(trace, [['G1', 'get', [first.reservation_id, scope], 1, [{ owner_session: owner, session_id: null, run_id: scope }]]])
+  const bound = trace.value
+  assert.equal(bound.session_id, owner); assert.equal(bound.run_id, scope)
+  trace = task19Observe(t, store, () => g.reserve(firstArgs, scope, actor))
+  task19AssertTrace(trace, [['G2', 'get', [scope, firstArgs.operation_key], 1, [{ owner_session: owner, run_id: scope, session_id: owner }]]])
+  assert.deepEqual(trace.value, bound)
+  const secondArgs = input(task(store, scope, owner), 'count-second', { resources: ['resource\0second'] })
+  trace = task19Observe(t, store, () => g.reserve(secondArgs, scope, actor))
+  const second = trace.value
+  task19AssertTrace(trace, [['G2', 'get', [scope, secondArgs.operation_key], 0, []], ['G3', 'get', [second.reservation_id], 1, [{ run_id: scope }]]])
+  trace = task19Observe(t, store, () => g.snapshot(scope))
+  // Holds sort by generated reservation ID, so derive only their documented ordering.
+  const held = [[first.reservation_id, 'resource\0first'], [second.reservation_id, 'resource\0second']]
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0).map(([, resource_key]) => ({ resource_key }))
+  task19AssertTrace(trace, [['G4', 'all', [scope], 2, [{ run_id: scope, session_id: owner }, { run_id: scope, session_id: null }]],
+    ['G5', 'all', [scope], 2, held], ['G6', 'all', [scope], 3, Array(3).fill({ run_id: scope, session_id: owner })]])
+  assert.deepEqual(trace.value.reservations, [bound, second])
+})
+
+for (const site of ['G1', 'G2', 'G3', 'G4', 'G5', 'G6']) {
+  test('Task19 ' + site + ' faults exactly one generated public row without returning or persisting partial state', t => {
+    const { store, governor: g } = setup(t), scope = 'fault\0run', owner = 'fault\0worker'
+    const actor = { role: 'worker', sessionId: owner }
+    const args = input(task(store, scope, owner), 'fault-existing', { resources: ['resource\0held'] })
+    const reserved = g.reserve(args, scope, actor), bound = g.bind(ref(reserved, { session_id: owner }), scope, actor)
+    const freshArgs = input(task(store, scope, owner), 'fault-new', { kind: 'retry', resources: ['resource\0new'] })
+    g.snapshot(scope)
+    const before = task19LosslessRows(store), db = store.open()
+    const beforeChanges = db.prepare('SELECT total_changes() AS n').get().n
+    const expectedValues = {
+      G1: { owner_session: owner, session_id: owner, run_id: scope },
+      G2: { owner_session: owner, run_id: scope, session_id: owner }, G3: { run_id: scope },
+      G4: { run_id: scope, session_id: owner }, G5: { resource_key: 'resource\0held' },
+      G6: { run_id: scope, session_id: owner },
+    }
+    const field = { G1: 'run_id', G2: 'session_id', G3: 'run_id', G4: 'session_id', G5: 'resource_key', G6: 'session_id' }[site]
+    const invoke = () => site === 'G1' ? g.markUnknown(ref(bound, { reason: 'delivery unknown' }), scope, actor)
+      : site === 'G2' ? g.reserve(args, scope, actor) : site === 'G3' ? g.reserve(freshArgs, scope, actor) : g.snapshot(scope)
+    const unreturned = Symbol('no partial public result'); let result = unreturned, injections = 0, insertedId
+    const trace = task19Observe(t, store, () => assert.throws(() => { result = invoke() },
+      { code: 'E_STORE_INTEGRITY', message: 'SQLite 文本读取证据无效' }), event => {
+      if (event.site !== site) return
+      assert.equal(event.rows.length, site === 'G6' ? 2 : 1)
+      const row = event.rows[0]
+      for (const [key, value] of Object.entries(task19Transport(expectedValues[site]))) assert.equal(row[key], value)
+      if (site === 'G3') { assert.equal(row.task_id, freshArgs.task_id); assert.equal(row.state, 'reserved'); insertedId = row.reservation_id }
+      else if (site !== 'G6') assert.equal(row.reservation_id, reserved.reservation_id)
+      assert.equal(event.db.isTransaction, true)
+      row[field] = 'J"invalid transport without NUL"'; injections++
+    })
+    assert.equal(result, unreturned); assert.equal(injections, 1); assert.equal(db.isTransaction, false)
+    const g4 = ['G4', 'all', [scope], 1], g5 = ['G5', 'all', [scope], 1], g6 = ['G6', 'all', [scope], 2]
+    const expected = site === 'G1' ? [['G1', 'get', [reserved.reservation_id, scope], 1]]
+      : site === 'G2' ? [['G2', 'get', [scope, args.operation_key], 1]]
+      : site === 'G3' ? [['G2', 'get', [scope, freshArgs.operation_key], 0], ['G3', 'get', [insertedId], 1]]
+      : site === 'G4' ? [g4] : site === 'G5' ? [g4, g5] : [g4, g5, g6]
+    task19AssertTrace(trace, expected)
+    assert.deepEqual(task19LosslessRows(store), before)
+    // SQLite total_changes includes rolled-back writes; only assert equality for paths that wrote nothing.
+    if (site !== 'G3') assert.equal(db.prepare('SELECT total_changes() AS n').get().n, beforeChanges)
+    if (site === 'G3') {
+      assert.equal(db.prepare('SELECT COUNT(*) AS n FROM governor_reservation WHERE reservation_id = ?').get(insertedId).n, 0)
+      assert.equal(g.reserve(freshArgs, scope, actor).state, 'reserved')
+    }
+  })
+}

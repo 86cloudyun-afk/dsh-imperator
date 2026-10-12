@@ -27,10 +27,35 @@ new milestone, task label, or arbitrary child root.
   changed rework generations and stale admission generations refuse that
   request, so the next call can progress. Only a trusted lead admits.
 - Admission decision keys are durable and distinct from enqueue keys. Replaying
-  any decision returns its historical outcome with `replay:true`, including
+  an admission decision returns its historical outcome with `replay:true`, including
   blocked or empty decisions. Use a new decision key for a new scheduling
   evaluation. An admitted decision or replay is **never delivery permission**;
   it may describe a reservation already running, unknown or settled.
+- `withdraw({request_id,request_key},runId,authority)` changes only a queued
+  request with no reservation to `withdrawn`. Returns
+  `{status:'withdrawn',request,replay}` using the existing public request view.
+  A trusted lead in the same run may withdraw; a worker must match both the
+  task's current owner and the queue's captured owner. A worker who claims a
+  previously unowned task cannot withdraw its lead-queued intent while the
+  captured owner is null. Withdrawal does not capture or replace that owner.
+  The business task, queue sequence and payload, governor budgets, retry
+  charges, reservations and resource holds remain unchanged. No task is
+  cancelled, no budget is refunded, and no external effect is dispatched.
+- Withdrawal shares the admission decision-key namespace and binds each key
+  to its action and target request. Reuse for another action or target fails
+  with `E_SCHEDULER_CONFLICT`. The exact withdrawal key and target replay with
+  `replay:true` and no row writes, including after reopening or backup/restore.
+  Run and current/captured worker ownership are checked before replay: neither
+  a former owner nor a replacement worker can replay the former owner's
+  intent after reassignment. A same-run lead can recover a worker's decision.
+  A new key on an already withdrawn intent fails; admitted/reserved, running,
+  unknown, settled and refused requests cannot be newly withdrawn. `state`
+  and the original exact `enqueue` replay show the withdrawn state.
+- A temporarily blocked head continues to preserve FIFO. When a head cannot
+  proceed, including exhausted cumulative `new` or task retry budgets, the
+  authorized host may explicitly withdraw that intent, then call `admitNext`
+  with a fresh decision key to evaluate the next queued request. Replaying a
+  prior blocked decision still returns its historical blocked outcome.
 - `bind({request_id,generation,session_id},runId,authority)`,
   `markUnknown({request_id,generation,reason},runId,authority)`, and
   `settle({request_id,generation,proof},runId,authority)` delegate to the
@@ -64,6 +89,16 @@ store-owned database. Initialization is lazy and rollback-aware. Reopening
 performs no external effects. Direct governor settlement is reflected by state
 readback. Unknown reservations retain slots, writers, locks and retry charges.
 Do not dispatch before the outermost transaction has committed.
+
+Withdrawal uses the existing tables without a schema migration. Its internal
+decision JSON is `{action:'withdraw',request_id,result}`; this envelope is not
+part of the public result. Older untagged admission decisions remain readable.
+Target and ownership checks, the queued/unreserved compare-and-set, and the
+decision insert share one write transaction; any persistence failure rolls
+them back together. Doctor and backup/restore preserve these rows and decision
+values. Coordinate scheduler readers and writers on the same upgraded version:
+zero DDL does not make an older binary understand withdrawal envelopes. Mixed
+old/new scheduler writers against one database are unsupported.
 
 ## Evidence helpers, not an execution adapter
 

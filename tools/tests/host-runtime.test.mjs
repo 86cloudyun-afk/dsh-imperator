@@ -96,27 +96,42 @@ test('each original teardown promise retains callbacks through a timed-out earli
 
 test('controlled fixture creation owns the environment before its first await and old disposal is inert',
   { skip: !process.env.DSH_INSTALL_ANCHOR && 'requires DSH_INSTALL_ANCHOR' }, async () => {
-    const beforeHome = process.env.DSH_HOME, beforeTelemetry = process.env.DSH_TELEMETRY_DISABLED
-    const pending = runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
-    const ownedHome = process.env.DSH_HOME
-    const homes = () => readdirSync(tmpdir()).filter(name => name.startsWith('taskforce-host-')).sort()
-    const beforeHomes = homes(), beforeListeners = listeners(process)
-    let competitor
+    const previousTemp = new Map(['TMPDIR', 'TMP', 'TEMP'].map(name => [name, process.env[name]]))
+    const fixtureTmp = mkdtempSync(join(tmpdir(), 'taskforce-profile-owner-test-'))
     try {
-      await assert.rejects(async () => {
-        competitor = await runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
-      }, /active controlled profile/)
-      assert.equal(process.env.DSH_HOME, ownedHome)
-      assert.deepEqual(homes(), beforeHomes)
-      assert.deepEqual(listeners(process), beforeListeners)
-    } finally { competitor?.dispose(); (await pending).dispose() }
-    const old = await runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
-    old.dispose()
-    const current = await runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
-    try { old.dispose(); assert.equal(process.env.DSH_HOME, join(current.root, 'home')) }
-    finally { current.dispose() }
-    assert.equal(process.env.DSH_HOME, beforeHome)
-    assert.equal(process.env.DSH_TELEMETRY_DISABLED, beforeTelemetry)
+      for (const name of previousTemp.keys()) process.env[name] = fixtureTmp
+      const beforeHome = process.env.DSH_HOME, beforeTelemetry = process.env.DSH_TELEMETRY_DISABLED
+      const pending = runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
+      const ownedHome = process.env.DSH_HOME
+      const homes = () => readdirSync(fixtureTmp).filter(name => name.startsWith('taskforce-host-')).sort()
+      const beforeHomes = homes(), beforeListeners = listeners(process)
+      let competitor
+      try {
+        assert.equal(beforeHomes.length, 1, 'the private fixture parent must contain exactly one active home')
+        assert.equal(join(fixtureTmp, beforeHomes[0], 'home'), ownedHome,
+          'the private fixture home must belong to the active profile')
+        await assert.rejects(async () => {
+          competitor = await runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
+        }, /active controlled profile/)
+        assert.equal(process.env.DSH_HOME, ownedHome)
+        assert.deepEqual(homes(), beforeHomes)
+        assert.deepEqual(listeners(process), beforeListeners)
+      } finally { competitor?.dispose(); (await pending).dispose() }
+      const old = await runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
+      old.dispose()
+      const current = await runtime.controlledProfile(process.env.DSH_INSTALL_ANCHOR, new URL('../..', import.meta.url).pathname)
+      try { old.dispose(); assert.equal(process.env.DSH_HOME, join(current.root, 'home')) }
+      finally { current.dispose() }
+      assert.equal(process.env.DSH_HOME, beforeHome)
+      assert.equal(process.env.DSH_TELEMETRY_DISABLED, beforeTelemetry)
+      assert.deepEqual(homes(), [], 'controlled fixtures must remove their owned temporary homes')
+    } finally {
+      for (const [name, value] of previousTemp) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+      rmSync(fixtureTmp, { recursive: true, force: true })
+    }
   })
 
 test('actual failed native profile boot restores the raw listener baseline',
